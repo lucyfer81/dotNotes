@@ -113,6 +113,9 @@ export default function Home() {
 	const [isArchivingNote, setIsArchivingNote] = useState(false);
 	const [isRestoringNote, setIsRestoringNote] = useState(false);
 	const [isDeletingNote, setIsDeletingNote] = useState(false);
+	const [linkInsertQuery, setLinkInsertQuery] = useState("");
+	const [linkInsertResults, setLinkInsertResults] = useState<NoteItem[]>([]);
+	const [isLinkInsertLoading, setIsLinkInsertLoading] = useState(false);
 	const [commandOpen, setCommandOpen] = useState(false);
 	const [commandQuery, setCommandQuery] = useState("");
 	const [commandResults, setCommandResults] = useState<NoteItem[]>([]);
@@ -625,6 +628,58 @@ export default function Home() {
 		};
 	}, [commandOpen, commandQuery, defaultCommandNotes, noteStatusFilter]);
 
+	useEffect(() => {
+		if (workspaceMode !== "focus" || !activeNote) {
+			setIsLinkInsertLoading(false);
+			setLinkInsertResults([]);
+			return;
+		}
+		const keyword = linkInsertQuery.trim();
+		if (!keyword) {
+			const defaults = noteItems
+				.filter((note) => note.id !== activeNote.id && !note.deletedAt)
+				.slice(0, 12);
+			setIsLinkInsertLoading(false);
+			setLinkInsertResults(defaults);
+			return;
+		}
+
+		let cancelled = false;
+		setIsLinkInsertLoading(true);
+		const timer = window.setTimeout(() => {
+			void listNotes({
+				limit: 20,
+				keyword,
+				status: "all",
+			})
+				.then((notes) => {
+					if (cancelled) {
+						return;
+					}
+					setLinkInsertResults(
+						notes
+							.map((note) => toNoteItem(note))
+							.filter((note) => note.id !== activeNote.id && !note.deletedAt),
+					);
+				})
+				.catch(() => {
+					if (!cancelled) {
+						setLinkInsertResults([]);
+					}
+				})
+				.finally(() => {
+					if (!cancelled) {
+						setIsLinkInsertLoading(false);
+					}
+				});
+		}, 180);
+
+		return () => {
+			cancelled = true;
+			window.clearTimeout(timer);
+		};
+	}, [workspaceMode, activeNote?.id, linkInsertQuery, noteItems]);
+
 	const flushPendingSave = async () => {
 		if (saveInFlightRef.current) {
 			return;
@@ -708,6 +763,17 @@ export default function Home() {
 			),
 		);
 		scheduleAutoSave(activeNoteId, value);
+	};
+
+	const handleInsertWikiLink = (note: NoteItem) => {
+		if (!activeNote || isActiveNoteDeleted) {
+			return;
+		}
+		const nextValue = draft.length === 0
+			? `[[${note.title}]]`
+			: `${draft}${draft.endsWith("\n") ? "" : "\n"}[[${note.title}]]`;
+		handleDraftChange(nextValue);
+		setLinkInsertQuery("");
 	};
 
 	const handleCaptureSend = async () => {
@@ -1516,6 +1582,14 @@ export default function Home() {
 											{isActiveNoteDeleted ? "回收站笔记不可移动" : isMovingNote ? "移动中..." : "切换即移动"}
 										</span>
 									</div>
+									<WikiLinkInsertPanel
+										query={linkInsertQuery}
+										onQueryChange={setLinkInsertQuery}
+										results={linkInsertResults}
+										isLoading={isLinkInsertLoading}
+										disabled={!activeNote || isActiveNoteDeleted}
+										onInsert={handleInsertWikiLink}
+									/>
 								</div>
 
 								{focusEditorMode === "edit" ? (
@@ -1854,6 +1928,14 @@ export default function Home() {
 										{isActiveNoteDeleted ? "回收站笔记不可移动" : isMovingNote ? "移动中" : "切换即移动"}
 									</span>
 								</div>
+								<WikiLinkInsertPanel
+									query={linkInsertQuery}
+									onQueryChange={setLinkInsertQuery}
+									results={linkInsertResults}
+									isLoading={isLinkInsertLoading}
+									disabled={!activeNote || isActiveNoteDeleted}
+									onInsert={handleInsertWikiLink}
+								/>
 								{mobileEditorMode === "edit" ? (
 								<textarea
 									value={draft}
@@ -2064,6 +2146,67 @@ function ModeButton(props: {
 		>
 			{label}
 		</button>
+	);
+}
+
+function WikiLinkInsertPanel(props: {
+	query: string;
+	onQueryChange: (value: string) => void;
+	results: NoteItem[];
+	isLoading: boolean;
+	disabled: boolean;
+	onInsert: (note: NoteItem) => void;
+}) {
+	const { query, onQueryChange, results, isLoading, disabled, onInsert } = props;
+	return (
+		<section className="mt-3 rounded-xl border border-slate-200 bg-slate-50/70 p-2">
+			<div className="flex items-center gap-2">
+				<input
+					type="text"
+					value={query}
+					onChange={(event) => onQueryChange(event.target.value)}
+					onKeyDown={(event) => {
+						if (event.key === "Enter") {
+							event.preventDefault();
+							const first = results[0];
+							if (first && !disabled) {
+								onInsert(first);
+							}
+						}
+					}}
+					disabled={disabled}
+					placeholder={disabled ? "回收站笔记不可插入双链" : "搜索其他笔记并插入 [[双链]]"}
+					className={`min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-700 ${
+						disabled ? "cursor-not-allowed opacity-60" : ""
+					}`}
+				/>
+				<span className="shrink-0 text-[11px] text-slate-400">Enter 插入首项</span>
+			</div>
+			<div className="mt-2 max-h-24 space-y-1 overflow-y-auto pr-1">
+				{isLoading ? (
+					<p className="px-2 py-1 text-xs text-slate-400">搜索中...</p>
+				) : null}
+				{!isLoading && results.length === 0 ? (
+					<p className="px-2 py-1 text-xs text-slate-400">没有可插入的笔记</p>
+				) : null}
+				{!isLoading
+					? results.map((note) => (
+						<button
+							key={`insert-${note.id}`}
+							type="button"
+							onClick={() => onInsert(note)}
+							disabled={disabled}
+							className={`w-full rounded-md border border-slate-200 bg-white px-2 py-1 text-left text-xs ${
+								disabled ? "cursor-not-allowed text-slate-300" : "text-slate-700 hover:bg-slate-100"
+							}`}
+						>
+							<span className="font-medium text-slate-800">{note.title}</span>
+							<span className="ml-2 text-slate-400">→ 插入 [[{note.title}]]</span>
+						</button>
+					))
+					: null}
+			</div>
+		</section>
 	);
 }
 
