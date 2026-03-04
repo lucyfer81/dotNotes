@@ -1,6 +1,6 @@
 import { markdown } from "@codemirror/lang-markdown";
 import CodeMirror from "@uiw/react-codemirror";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -30,9 +30,25 @@ type NoteItem = {
 
 type WorkspaceMode = "capture" | "organize" | "focus";
 type EditorMode = "edit" | "preview" | "split";
+type CommandAction = {
+	id: string;
+	label: string;
+	description: string;
+	keywords: string[];
+	run: () => void;
+};
+type CommandEntry = {
+	id: string;
+	type: "action" | "note";
+	label: string;
+	description: string;
+	onSelect: () => void;
+};
 
 const WORKSPACE_MODE_STORAGE_KEY = "dotnotes.workspace.mode";
 const EDITOR_MODE_STORAGE_KEY = "dotnotes.editor.mode";
+const RECENT_NOTE_IDS_STORAGE_KEY = "dotnotes.command.recent-note-ids";
+const RECENT_NOTE_LIMIT = 12;
 const WIKI_LINK_PATTERN = /\[\[([^\[\]]+)\]\]/g;
 
 const defaultRootFolders: FolderApiItem[] = [
@@ -67,17 +83,50 @@ export default function Home() {
 	const [isCreatingNote, setIsCreatingNote] = useState(false);
 	const [isSavingDraft, setIsSavingDraft] = useState(false);
 	const [isDeletingNote, setIsDeletingNote] = useState(false);
+	const [commandOpen, setCommandOpen] = useState(false);
+	const [commandQuery, setCommandQuery] = useState("");
+	const [commandResults, setCommandResults] = useState<NoteItem[]>([]);
+	const [isCommandLoading, setIsCommandLoading] = useState(false);
+	const [commandActiveIndex, setCommandActiveIndex] = useState(0);
+	const [recentNoteIds, setRecentNoteIds] = useState<string[]>([]);
 
 	const noteItemsRef = useRef<NoteItem[]>([]);
 	const selectedTagIdsRef = useRef<string[]>([]);
 	const saveTimerRef = useRef<number | null>(null);
 	const pendingSaveRef = useRef<{ noteId: string; content: string } | null>(null);
 	const saveInFlightRef = useRef(false);
+	const commandInputRef = useRef<HTMLInputElement | null>(null);
 
 	const activeNote = useMemo(
 		() => noteItems.find((note) => note.id === activeNoteId) ?? noteItems[0] ?? null,
 		[noteItems, activeNoteId],
 	);
+	const recentOpenedNotes = useMemo(() => {
+		const notesById = new Map(noteItems.map((note) => [note.id, note] as const));
+		return recentNoteIds
+			.map((id) => notesById.get(id) ?? null)
+			.filter((item): item is NoteItem => item !== null);
+	}, [noteItems, recentNoteIds]);
+	const defaultCommandNotes = useMemo(() => {
+		const seen = new Set<string>();
+		const merged: NoteItem[] = [];
+		for (const note of recentOpenedNotes) {
+			if (seen.has(note.id)) {
+				continue;
+			}
+			seen.add(note.id);
+			merged.push(note);
+		}
+		for (const note of noteItems) {
+			if (seen.has(note.id)) {
+				continue;
+			}
+			seen.add(note.id);
+			merged.push(note);
+		}
+		return merged.slice(0, RECENT_NOTE_LIMIT);
+	}, [noteItems, recentOpenedNotes]);
+	const recentNoteIdSet = useMemo(() => new Set(recentNoteIds), [recentNoteIds]);
 	const organizeNotes = useMemo(() => {
 		if (!organizeFolderId) {
 			return noteItems;
@@ -174,6 +223,22 @@ export default function Home() {
 		if (storedEditorMode === "edit" || storedEditorMode === "preview" || storedEditorMode === "split") {
 			setEditorMode(storedEditorMode);
 		}
+		const storedRecentIds = window.localStorage.getItem(RECENT_NOTE_IDS_STORAGE_KEY);
+		if (!storedRecentIds) {
+			return;
+		}
+		try {
+			const parsed = JSON.parse(storedRecentIds) as unknown;
+			if (!Array.isArray(parsed)) {
+				return;
+			}
+			const recentIds = parsed
+				.filter((item): item is string => typeof item === "string")
+				.slice(0, RECENT_NOTE_LIMIT);
+			setRecentNoteIds(recentIds);
+		} catch {
+			setRecentNoteIds([]);
+		}
 	}, []);
 
 	useEffect(() => {
@@ -191,12 +256,62 @@ export default function Home() {
 	}, [editorMode]);
 
 	useEffect(() => {
+		if (typeof window === "undefined") {
+			return;
+		}
+		window.localStorage.setItem(RECENT_NOTE_IDS_STORAGE_KEY, JSON.stringify(recentNoteIds));
+	}, [recentNoteIds]);
+
+	useEffect(() => {
+		if (!commandOpen || typeof window === "undefined") {
+			return;
+		}
+		const timer = window.setTimeout(() => {
+			commandInputRef.current?.focus();
+		}, 0);
+		return () => {
+			window.clearTimeout(timer);
+		};
+	}, [commandOpen]);
+
+	useEffect(() => {
+		if (typeof window === "undefined") {
+			return;
+		}
+		const onKeyDown = (event: KeyboardEvent) => {
+			const key = event.key.toLowerCase();
+			if ((event.metaKey || event.ctrlKey) && key === "k") {
+				event.preventDefault();
+				setCommandOpen(true);
+				return;
+			}
+			if (event.key === "Escape") {
+				setCommandOpen(false);
+			}
+		};
+		window.addEventListener("keydown", onKeyDown);
+		return () => {
+			window.removeEventListener("keydown", onKeyDown);
+		};
+	}, []);
+
+	useEffect(() => {
 		noteItemsRef.current = noteItems;
 	}, [noteItems]);
 
 	useEffect(() => {
 		selectedTagIdsRef.current = selectedTagIds;
 	}, [selectedTagIds]);
+
+	useEffect(() => {
+		if (!activeNoteId) {
+			return;
+		}
+		setRecentNoteIds((prev) => {
+			const next = [activeNoteId, ...prev.filter((id) => id !== activeNoteId)];
+			return next.slice(0, RECENT_NOTE_LIMIT);
+		});
+	}, [activeNoteId]);
 
 	useEffect(() => {
 		return () => {
@@ -300,6 +415,49 @@ export default function Home() {
 			cancelled = true;
 		};
 	}, [selectedTagIds]);
+
+	useEffect(() => {
+		if (!commandOpen) {
+			return;
+		}
+		const keyword = commandQuery.trim();
+		if (!keyword) {
+			setIsCommandLoading(false);
+			setCommandResults(defaultCommandNotes);
+			return;
+		}
+
+		let cancelled = false;
+		setIsCommandLoading(true);
+		const timer = window.setTimeout(() => {
+			void listNotes({
+				limit: 20,
+				keyword,
+				tagMode: "any",
+			})
+				.then((notes) => {
+					if (cancelled) {
+						return;
+					}
+					setCommandResults(notes.map((note) => toNoteItem(note)));
+				})
+				.catch(() => {
+					if (!cancelled) {
+						setCommandResults([]);
+					}
+				})
+				.finally(() => {
+					if (!cancelled) {
+						setIsCommandLoading(false);
+					}
+				});
+		}, 180);
+
+		return () => {
+			cancelled = true;
+			window.clearTimeout(timer);
+		};
+	}, [commandOpen, commandQuery, defaultCommandNotes]);
 
 	const flushPendingSave = async () => {
 		if (saveInFlightRef.current) {
@@ -471,6 +629,133 @@ export default function Home() {
 		}
 	};
 
+	const closeCommandPalette = () => {
+		setCommandOpen(false);
+		setCommandQuery("");
+		setCommandActiveIndex(0);
+	};
+
+	const commandActions = useMemo<CommandAction[]>(
+		() => [
+			{
+				id: "action-capture",
+				label: "切换到 Capture",
+				description: "打开快速记录面板",
+				keywords: ["capture", "记录", "收集"],
+				run: () => setWorkspaceMode("capture"),
+			},
+			{
+				id: "action-organize",
+				label: "切换到 Organize",
+				description: "打开整理与筛选面板",
+				keywords: ["organize", "整理", "标签", "目录"],
+				run: () => setWorkspaceMode("organize"),
+			},
+			{
+				id: "action-focus",
+				label: "切换到 Focus",
+				description: "打开当前笔记编辑器",
+				keywords: ["focus", "专注", "编辑", "预览"],
+				run: () => setWorkspaceMode("focus"),
+			},
+			{
+				id: "action-clear-tags",
+				label: "清空标签筛选",
+				description: "移除当前所有标签过滤",
+				keywords: ["tag", "标签", "filter", "筛选", "clear", "清空"],
+				run: () => setSelectedTagIds([]),
+			},
+			{
+				id: "action-toggle-ai",
+				label: aiOpen ? "关闭 AI 面板" : "打开 AI 面板",
+				description: "切换右侧 AI 助手抽屉",
+				keywords: ["ai", "助手", "rag", "panel"],
+				run: () => setAiOpen((v) => !v),
+			},
+		],
+		[aiOpen],
+	);
+
+	const normalizedCommandQuery = commandQuery.trim().toLowerCase();
+	const filteredCommandActions = useMemo(() => {
+		if (!normalizedCommandQuery) {
+			return commandActions;
+		}
+		return commandActions.filter((action) => {
+			const label = action.label.toLowerCase();
+			const description = action.description.toLowerCase();
+			const keywords = action.keywords.some((keyword) => keyword.toLowerCase().includes(normalizedCommandQuery));
+			return label.includes(normalizedCommandQuery) || description.includes(normalizedCommandQuery) || keywords;
+		});
+	}, [commandActions, normalizedCommandQuery]);
+
+	const commandEntries = useMemo<CommandEntry[]>(() => {
+		const actionEntries: CommandEntry[] = filteredCommandActions.map((action) => ({
+			id: action.id,
+			type: "action",
+			label: action.label,
+			description: action.description,
+			onSelect: () => {
+				action.run();
+				closeCommandPalette();
+			},
+		}));
+		const noteEntries: CommandEntry[] = commandResults.map((note) => ({
+			id: `note-${note.id}`,
+			type: "note",
+			label: note.title,
+			description: `${!normalizedCommandQuery && recentNoteIdSet.has(note.id) ? "最近打开 · " : ""}${formatUpdatedAt(note.updatedAt)} · ${note.tags.map((tag) => `#${tag}`).join(" ") || "无标签"}`,
+			onSelect: () => {
+				setNoteItems((prev) => {
+					if (prev.some((item) => item.id === note.id)) {
+						return prev;
+					}
+					return [note, ...prev];
+				});
+				setActiveNoteId(note.id);
+				setWorkspaceMode("focus");
+				closeCommandPalette();
+			},
+		}));
+		return [...actionEntries, ...noteEntries];
+	}, [filteredCommandActions, commandResults, normalizedCommandQuery, recentNoteIdSet]);
+
+	useEffect(() => {
+		setCommandActiveIndex(0);
+	}, [normalizedCommandQuery, commandEntries.length]);
+
+	const handleCommandInputKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+		if (event.key === "ArrowDown") {
+			event.preventDefault();
+			setCommandActiveIndex((prev) => {
+				if (commandEntries.length === 0) {
+					return 0;
+				}
+				return (prev + 1) % commandEntries.length;
+			});
+			return;
+		}
+		if (event.key === "ArrowUp") {
+			event.preventDefault();
+			setCommandActiveIndex((prev) => {
+				if (commandEntries.length === 0) {
+					return 0;
+				}
+				return prev === 0 ? commandEntries.length - 1 : prev - 1;
+			});
+			return;
+		}
+		if (event.key === "Enter") {
+			event.preventDefault();
+			commandEntries[commandActiveIndex]?.onSelect();
+			return;
+		}
+		if (event.key === "Escape") {
+			event.preventDefault();
+			closeCommandPalette();
+		}
+	};
+
 	const activeFolderName = folderItems.find((folder) => folder.id === captureFolderId)?.name ?? "00-Inbox";
 	const saveStateText = isSavingDraft ? "自动保存中..." : "已保存";
 	const hasTagFilters = selectedTagIds.length > 0;
@@ -487,12 +772,13 @@ export default function Home() {
 						<p className="text-sm font-semibold tracking-tight text-slate-900">dotNotes</p>
 						<p className="text-xs text-slate-500">Capture-first + Knowledge Workspace</p>
 					</div>
-					<input
-						type="text"
-						readOnly
-						value="⌘K 搜索/命令"
-						className="hidden h-10 w-full max-w-md rounded-xl border border-slate-200 bg-slate-50 px-3 text-sm text-slate-500 lg:block"
-					/>
+					<button
+						type="button"
+						onClick={() => setCommandOpen(true)}
+						className="hidden h-10 w-full max-w-md rounded-xl border border-slate-200 bg-slate-50 px-3 text-left text-sm text-slate-500 hover:bg-slate-100 lg:block"
+					>
+						⌘K 搜索/命令
+					</button>
 					<div className="hidden rounded-xl border border-slate-200 bg-slate-50 p-1 md:inline-flex">
 						<ModeButton label="Capture" active={workspaceMode === "capture"} onClick={() => setWorkspaceMode("capture")} />
 						<ModeButton label="Organize" active={workspaceMode === "organize"} onClick={() => setWorkspaceMode("organize")} />
@@ -989,6 +1275,57 @@ export default function Home() {
 					</div>
 				</div>
 			</div>
+
+			{commandOpen ? (
+				<button
+					type="button"
+					onClick={closeCommandPalette}
+					className="fixed inset-0 z-50 bg-slate-900/45"
+					aria-label="关闭搜索与命令面板遮罩"
+				/>
+			) : null}
+
+			{commandOpen ? (
+				<section className="fixed inset-x-0 top-[8vh] z-[60] mx-auto w-[min(92vw,52rem)] rounded-2xl border border-slate-200 bg-white shadow-2xl">
+					<div className="border-b border-slate-100 px-4 py-3">
+						<input
+							ref={commandInputRef}
+							type="text"
+							value={commandQuery}
+							onChange={(event) => setCommandQuery(event.target.value)}
+							onKeyDown={handleCommandInputKeyDown}
+							placeholder="搜索笔记或输入命令..."
+							className="w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-800 outline-none focus:ring"
+						/>
+						<p className="mt-2 text-xs text-slate-400">Enter 执行 · ↑↓ 选择 · Esc 关闭</p>
+					</div>
+					<div className="max-h-[62dvh] overflow-y-auto p-2">
+						{isCommandLoading ? (
+							<p className="px-3 py-4 text-sm text-slate-500">搜索中...</p>
+						) : null}
+						{!isCommandLoading && commandEntries.length === 0 ? (
+							<p className="px-3 py-4 text-sm text-slate-500">没有匹配结果</p>
+						) : null}
+							{commandEntries.map((entry, index) => (
+								<button
+									key={entry.id}
+									type="button"
+									onClick={entry.onSelect}
+								className={`mb-1 w-full rounded-xl px-3 py-2 text-left ${
+										index === commandActiveIndex ? "bg-slate-900 text-white" : "hover:bg-slate-100"
+									}`}
+								>
+									<p className="text-sm font-medium">
+										{renderHighlightedText(entry.label, commandQuery, index === commandActiveIndex)}
+									</p>
+									<p className={`mt-1 text-xs ${index === commandActiveIndex ? "text-slate-200" : "text-slate-500"}`}>
+										{renderHighlightedText(entry.description, commandQuery, index === commandActiveIndex)}
+									</p>
+								</button>
+							))}
+						</div>
+					</section>
+			) : null}
 		</div>
 	);
 }
@@ -1114,6 +1451,47 @@ function extractHashTags(content: string): string[] {
 		}
 	}
 	return [...tags].slice(0, 6);
+}
+
+function renderHighlightedText(value: string, query: string, isActiveRow: boolean): ReactNode {
+	const keyword = query.trim();
+	if (!keyword) {
+		return value;
+	}
+	const escaped = escapeRegExp(keyword);
+	if (!escaped) {
+		return value;
+	}
+	const matcher = new RegExp(`(${escaped})`, "ig");
+	const parts = value.split(matcher);
+	if (parts.length <= 1) {
+		return value;
+	}
+	return (
+		<>
+			{parts.map((part, index) => {
+				if (part.toLowerCase() === keyword.toLowerCase()) {
+					return (
+						<mark
+							key={`${part}-${index}`}
+							className={`rounded px-0.5 ${
+								isActiveRow
+									? "bg-white/25 text-white"
+									: "bg-amber-100 text-amber-900"
+							}`}
+						>
+							{part}
+						</mark>
+					);
+				}
+				return <span key={`${part}-${index}`}>{part}</span>;
+			})}
+		</>
+	);
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function formatUpdatedAt(value: string): string {
