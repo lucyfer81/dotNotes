@@ -6,11 +6,14 @@ import remarkGfm from "remark-gfm";
 import {
 	createNote,
 	deleteNote,
+	getNoteLinks,
 	listNotes,
 	listRootFolders,
 	listTags,
 	updateNote,
 	type FolderApiItem,
+	type NoteLinkApiItem,
+	type NoteLinksApiItem,
 	type NoteApiItem,
 	type TagApiItem,
 } from "../lib/api";
@@ -43,6 +46,10 @@ type CommandEntry = {
 	label: string;
 	description: string;
 	onSelect: () => void;
+};
+type WikiLinkCandidate = {
+	label: string;
+	slug: string;
 };
 
 const WORKSPACE_MODE_STORAGE_KEY = "dotnotes.workspace.mode";
@@ -89,6 +96,8 @@ export default function Home() {
 	const [isCommandLoading, setIsCommandLoading] = useState(false);
 	const [commandActiveIndex, setCommandActiveIndex] = useState(0);
 	const [recentNoteIds, setRecentNoteIds] = useState<string[]>([]);
+	const [noteLinks, setNoteLinks] = useState<NoteLinksApiItem | null>(null);
+	const [isLoadingNoteLinks, setIsLoadingNoteLinks] = useState(false);
 
 	const noteItemsRef = useRef<NoteItem[]>([]);
 	const selectedTagIdsRef = useRef<string[]>([]);
@@ -415,6 +424,37 @@ export default function Home() {
 			cancelled = true;
 		};
 	}, [selectedTagIds]);
+
+	useEffect(() => {
+		if (!activeNoteId || !activeNote) {
+			setNoteLinks(null);
+			setIsLoadingNoteLinks(false);
+			return;
+		}
+
+		let cancelled = false;
+		setIsLoadingNoteLinks(true);
+		void getNoteLinks(activeNoteId)
+			.then((links) => {
+				if (!cancelled) {
+					setNoteLinks(links);
+				}
+			})
+			.catch(() => {
+				if (!cancelled) {
+					setNoteLinks(null);
+				}
+			})
+			.finally(() => {
+				if (!cancelled) {
+					setIsLoadingNoteLinks(false);
+				}
+			});
+
+		return () => {
+			cancelled = true;
+		};
+	}, [activeNoteId, activeNote?.updatedAt]);
 
 	useEffect(() => {
 		if (!commandOpen) {
@@ -759,6 +799,17 @@ export default function Home() {
 	const activeFolderName = folderItems.find((folder) => folder.id === captureFolderId)?.name ?? "00-Inbox";
 	const saveStateText = isSavingDraft ? "自动保存中..." : "已保存";
 	const hasTagFilters = selectedTagIds.length > 0;
+	const outboundLinks = noteLinks?.outbound ?? [];
+	const inboundLinks = noteLinks?.inbound ?? [];
+	const unresolvedWikiLinks = useMemo(() => {
+		if (!activeNote) {
+			return [];
+		}
+		const outboundSlugSet = new Set(outboundLinks.map((item) => item.slug));
+		return extractWikiLinkCandidates(draft).filter(
+			(item) => item.slug !== activeNote.slug && !outboundSlugSet.has(item.slug),
+		);
+	}, [activeNote, draft, outboundLinks]);
 
 	return (
 		<div className="min-h-screen bg-[#f4f6f8] text-slate-900">
@@ -1025,6 +1076,16 @@ export default function Home() {
 									</div>
 								</div>
 							) : null}
+
+							<div className="mt-3">
+								<LinkSummaryPanel
+									isLoading={isLoadingNoteLinks}
+									outbound={outboundLinks}
+									inbound={inboundLinks}
+									unresolved={unresolvedWikiLinks}
+									onOpenNote={focusNote}
+								/>
+							</div>
 						</section>
 					) : null}
 				</div>
@@ -1205,6 +1266,15 @@ export default function Home() {
 									</ReactMarkdown>
 								</div>
 							)}
+							<div className="mt-3">
+								<LinkSummaryPanel
+									isLoading={isLoadingNoteLinks}
+									outbound={outboundLinks}
+									inbound={inboundLinks}
+									unresolved={unresolvedWikiLinks}
+									onOpenNote={focusNote}
+								/>
+							</div>
 						</section>
 					) : null}
 				</div>
@@ -1353,6 +1423,75 @@ function ModeButton(props: {
 	);
 }
 
+function LinkSummaryPanel(props: {
+	isLoading: boolean;
+	outbound: NoteLinkApiItem[];
+	inbound: NoteLinkApiItem[];
+	unresolved: WikiLinkCandidate[];
+	onOpenNote: (noteId: string) => void;
+}) {
+	const { isLoading, outbound, inbound, unresolved, onOpenNote } = props;
+
+	return (
+		<section className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+			<div className="mb-2 flex items-center justify-between">
+				<p className="text-xs font-semibold uppercase tracking-wide text-slate-500">链接概览</p>
+				{isLoading ? <span className="text-xs text-slate-400">更新中...</span> : null}
+			</div>
+			<div className="grid gap-3 lg:grid-cols-3">
+				<LinkNoteList title="出链" items={outbound} emptyText="暂无出链" onOpenNote={onOpenNote} />
+				<LinkNoteList title="反链" items={inbound} emptyText="暂无反链" onOpenNote={onOpenNote} />
+				<div className="rounded-lg border border-amber-200 bg-amber-50/70 p-2">
+					<p className="text-xs font-medium text-amber-800">未解析</p>
+					<div className="mt-2 max-h-28 space-y-1 overflow-y-auto pr-1">
+						{unresolved.length === 0 ? (
+							<p className="text-xs text-amber-600/70">全部可解析</p>
+						) : (
+							unresolved.map((item) => (
+								<p key={item.slug} className="truncate rounded bg-white/80 px-2 py-1 text-xs text-amber-900">
+									[[{item.label}]]
+								</p>
+							))
+						)}
+					</div>
+				</div>
+			</div>
+		</section>
+	);
+}
+
+function LinkNoteList(props: {
+	title: string;
+	items: NoteLinkApiItem[];
+	emptyText: string;
+	onOpenNote: (noteId: string) => void;
+}) {
+	const { title, items, emptyText, onOpenNote } = props;
+
+	return (
+		<div className="rounded-lg border border-slate-200 bg-white p-2">
+			<p className="text-xs font-medium text-slate-600">{title}</p>
+			<div className="mt-2 max-h-28 space-y-1 overflow-y-auto pr-1">
+				{items.length === 0 ? (
+					<p className="text-xs text-slate-400">{emptyText}</p>
+				) : (
+					items.map((item) => (
+						<button
+							key={`${title}-${item.noteId}`}
+							type="button"
+							onClick={() => onOpenNote(item.noteId)}
+							className="w-full rounded-md px-2 py-1 text-left text-xs text-slate-700 hover:bg-slate-100"
+						>
+							<p className="truncate font-medium text-slate-800">{item.title}</p>
+							<p className="mt-0.5 truncate text-[11px] text-slate-500">{formatUpdatedAt(item.updatedAt)}</p>
+						</button>
+					))
+				)}
+			</div>
+		</div>
+	);
+}
+
 function AiPanel() {
 	return (
 		<div>
@@ -1400,6 +1539,21 @@ function matchesTagFilter(note: NoteItem, selectedTagIds: string[]): boolean {
 	}
 	const idSet = new Set(note.tagIds);
 	return selectedTagIds.some((tagId) => idSet.has(tagId));
+}
+
+function extractWikiLinkCandidates(content: string): WikiLinkCandidate[] {
+	const items = new Map<string, WikiLinkCandidate>();
+	for (const match of content.matchAll(WIKI_LINK_PATTERN)) {
+		const label = match[1]?.trim();
+		if (!label) {
+			continue;
+		}
+		const slug = toWikiSlug(label);
+		if (!items.has(slug)) {
+			items.set(slug, { label, slug });
+		}
+	}
+	return [...items.values()];
 }
 
 function toMarkdownWithWikiLinks(content: string): string {

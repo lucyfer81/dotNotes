@@ -24,6 +24,20 @@ export type NoteApiItem = {
 	tags: TagApiItem[];
 };
 
+export type NoteLinkApiItem = {
+	noteId: string;
+	slug: string;
+	title: string;
+	updatedAt: string;
+	anchorText: string | null;
+};
+
+export type NoteLinksApiItem = {
+	noteId: string;
+	outbound: NoteLinkApiItem[];
+	inbound: NoteLinkApiItem[];
+};
+
 type ListNotesOptions = {
 	limit?: number;
 	offset?: number;
@@ -138,6 +152,15 @@ export async function deleteNote(noteId: string): Promise<void> {
 	});
 }
 
+export async function getNoteLinks(noteId: string): Promise<NoteLinksApiItem> {
+	const data = await requestApiData<unknown>(`/api/notes/${encodeURIComponent(noteId)}/links`);
+	const parsed = toNoteLinksApiItem(data);
+	if (!parsed) {
+		throw new Error("Invalid note links response");
+	}
+	return parsed;
+}
+
 async function requestApiData<T>(url: string, init?: RequestInit): Promise<T> {
 	const headers = new Headers(init?.headers);
 	headers.set("Accept", "application/json");
@@ -236,6 +259,51 @@ function toNoteApiItem(value: unknown): NoteApiItem | null {
 		excerpt: value.excerpt,
 		updatedAt: value.updatedAt,
 		tags,
+	};
+}
+
+function toNoteLinksApiItem(value: unknown): NoteLinksApiItem | null {
+	if (!isRecord(value) || typeof value.noteId !== "string") {
+		return null;
+	}
+	const outbound = Array.isArray(value.outbound)
+		? value.outbound
+				.map((item) => toNoteLinkApiItem(item))
+				.filter((item): item is NoteLinkApiItem => item !== null)
+		: [];
+	const inbound = Array.isArray(value.inbound)
+		? value.inbound
+				.map((item) => toNoteLinkApiItem(item))
+				.filter((item): item is NoteLinkApiItem => item !== null)
+		: [];
+	return {
+		noteId: value.noteId,
+		outbound,
+		inbound,
+	};
+}
+
+function toNoteLinkApiItem(value: unknown): NoteLinkApiItem | null {
+	if (!isRecord(value)) {
+		return null;
+	}
+	if (
+		typeof value.noteId !== "string" ||
+		typeof value.slug !== "string" ||
+		typeof value.title !== "string" ||
+		typeof value.updatedAt !== "string"
+	) {
+		return null;
+	}
+	if (typeof value.anchorText !== "string" && value.anchorText !== null && value.anchorText !== undefined) {
+		return null;
+	}
+	return {
+		noteId: value.noteId,
+		slug: value.slug,
+		title: value.title,
+		updatedAt: value.updatedAt,
+		anchorText: typeof value.anchorText === "string" ? value.anchorText : null,
 	};
 }
 
