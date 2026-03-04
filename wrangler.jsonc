@@ -14,6 +14,13 @@
 	"vars": {
 		"VALUE_FROM_CLOUDFLARE": "Hello from Hono/CF"
 	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "dotnotes-db",
+			"database_id": "b6b9ba36-9f9e-4e43-942e-d6d4ff5e15df"
+		}
+	],
 	"observability": {
 		"enabled": true
 	},

@@ -201,3 +201,7 @@ dist
 ### React Router ###
 .react-router/
 /build/
+
+### Local QA Artifacts ###
+.playwright-cli/
+/output/

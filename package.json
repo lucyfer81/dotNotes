@@ -1,6 +1,6 @@
 {
-	"name": "react-router-hono-fullstack-template",
-	"description": "A modern full-stack template powered by Cloudflare Workers, using Hono for backend APIs, React Router for frontend routing, and shadcn/ui for beautiful, accessible components styled with Tailwind CSS",
+	"name": "dotnotes",
+	"description": "dotNotes personal note app built with Cloudflare Workers, Hono, React Router, and shadcn/ui",
 	"cloudflare": {
 		"label": "React Router + Hono Fullstack App",
 		"products": [
@@ -15,11 +15,15 @@
 		"publish": true
 	},
 	"dependencies": {
+		"@codemirror/lang-markdown": "^6.5.0",
+		"@uiw/react-codemirror": "^4.25.7",
 		"hono": "4.11.1",
 		"isbot": "5.1.32",
 		"react": "19.2.1",
 		"react-dom": "19.2.1",
-		"react-router": "7.9.6"
+		"react-markdown": "^10.1.0",
+		"react-router": "7.9.6",
+		"remark-gfm": "^4.0.1"
 	},
 	"devDependencies": {
 		"@cloudflare/vite-plugin": "1.15.3",
