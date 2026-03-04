@@ -113,6 +113,7 @@ export default function Home() {
 	const [isArchivingNote, setIsArchivingNote] = useState(false);
 	const [isRestoringNote, setIsRestoringNote] = useState(false);
 	const [isDeletingNote, setIsDeletingNote] = useState(false);
+	const [linkInsertOpen, setLinkInsertOpen] = useState(false);
 	const [linkInsertQuery, setLinkInsertQuery] = useState("");
 	const [linkInsertResults, setLinkInsertResults] = useState<NoteItem[]>([]);
 	const [isLinkInsertLoading, setIsLinkInsertLoading] = useState(false);
@@ -388,6 +389,40 @@ export default function Home() {
 	}, [commandOpen]);
 
 	useEffect(() => {
+		if (workspaceMode === "focus") {
+			return;
+		}
+		setLinkInsertOpen(false);
+		setLinkInsertQuery("");
+	}, [workspaceMode]);
+
+	useEffect(() => {
+		setLinkInsertOpen(false);
+		setLinkInsertQuery("");
+	}, [activeNoteId]);
+
+	useEffect(() => {
+		if (!linkInsertOpen || typeof window === "undefined") {
+			return;
+		}
+		const onMouseDown = (event: MouseEvent) => {
+			const target = event.target;
+			if (!(target instanceof HTMLElement)) {
+				return;
+			}
+			if (target.closest("[data-link-panel='true']") || target.closest("[data-link-toggle='true']")) {
+				return;
+			}
+			setLinkInsertOpen(false);
+			setLinkInsertQuery("");
+		};
+		window.addEventListener("mousedown", onMouseDown);
+		return () => {
+			window.removeEventListener("mousedown", onMouseDown);
+		};
+	}, [linkInsertOpen]);
+
+	useEffect(() => {
 		if (typeof window === "undefined") {
 			return;
 		}
@@ -629,7 +664,7 @@ export default function Home() {
 	}, [commandOpen, commandQuery, defaultCommandNotes, noteStatusFilter]);
 
 	useEffect(() => {
-		if (workspaceMode !== "focus" || !activeNote) {
+		if (workspaceMode !== "focus" || !activeNote || !linkInsertOpen) {
 			setIsLinkInsertLoading(false);
 			setLinkInsertResults([]);
 			return;
@@ -678,7 +713,7 @@ export default function Home() {
 			cancelled = true;
 			window.clearTimeout(timer);
 		};
-	}, [workspaceMode, activeNote?.id, linkInsertQuery, noteItems]);
+	}, [workspaceMode, activeNote?.id, linkInsertQuery, noteItems, linkInsertOpen]);
 
 	const flushPendingSave = async () => {
 		if (saveInFlightRef.current) {
@@ -773,7 +808,21 @@ export default function Home() {
 			? `[[${note.title}]]`
 			: `${draft}${draft.endsWith("\n") ? "" : "\n"}[[${note.title}]]`;
 		handleDraftChange(nextValue);
+		setLinkInsertOpen(false);
 		setLinkInsertQuery("");
+	};
+
+	const closeLinkInsertPanel = () => {
+		setLinkInsertOpen(false);
+		setLinkInsertQuery("");
+	};
+
+	const toggleLinkInsertPanel = () => {
+		if (linkInsertOpen) {
+			closeLinkInsertPanel();
+			return;
+		}
+		setLinkInsertOpen(true);
 	};
 
 	const handleCaptureSend = async () => {
@@ -1581,15 +1630,33 @@ export default function Home() {
 										<span className="text-xs text-slate-400">
 											{isActiveNoteDeleted ? "回收站笔记不可移动" : isMovingNote ? "移动中..." : "切换即移动"}
 										</span>
+										<button
+											type="button"
+											data-link-toggle="true"
+											onClick={toggleLinkInsertPanel}
+											disabled={!activeNote || isActiveNoteDeleted}
+											className={`rounded-lg border px-3 py-2 text-xs font-medium ${
+												!activeNote || isActiveNoteDeleted
+													? "cursor-not-allowed border-slate-200 text-slate-300"
+													: "border-sky-200 text-sky-700 hover:bg-sky-50"
+											}`}
+										>
+											{linkInsertOpen ? "收起双链" : "添加双链"}
+										</button>
 									</div>
-									<WikiLinkInsertPanel
-										query={linkInsertQuery}
-										onQueryChange={setLinkInsertQuery}
-										results={linkInsertResults}
-										isLoading={isLinkInsertLoading}
-										disabled={!activeNote || isActiveNoteDeleted}
-										onInsert={handleInsertWikiLink}
-									/>
+									{linkInsertOpen ? (
+										<div data-link-panel="true">
+											<WikiLinkInsertPanel
+												query={linkInsertQuery}
+												onQueryChange={setLinkInsertQuery}
+												results={linkInsertResults}
+												isLoading={isLinkInsertLoading}
+												disabled={!activeNote || isActiveNoteDeleted}
+												onInsert={handleInsertWikiLink}
+												onClose={closeLinkInsertPanel}
+											/>
+										</div>
+									) : null}
 								</div>
 
 								{focusEditorMode === "edit" ? (
@@ -1927,15 +1994,33 @@ export default function Home() {
 									<span className="text-xs text-slate-400">
 										{isActiveNoteDeleted ? "回收站笔记不可移动" : isMovingNote ? "移动中" : "切换即移动"}
 									</span>
+									<button
+										type="button"
+										data-link-toggle="true"
+										onClick={toggleLinkInsertPanel}
+										disabled={!activeNote || isActiveNoteDeleted}
+										className={`rounded-lg border px-2 py-1 text-xs ${
+											!activeNote || isActiveNoteDeleted
+												? "cursor-not-allowed border-slate-200 text-slate-300"
+												: "border-sky-200 text-sky-700"
+										}`}
+									>
+										{linkInsertOpen ? "收起双链" : "添加双链"}
+									</button>
 								</div>
-								<WikiLinkInsertPanel
-									query={linkInsertQuery}
-									onQueryChange={setLinkInsertQuery}
-									results={linkInsertResults}
-									isLoading={isLinkInsertLoading}
-									disabled={!activeNote || isActiveNoteDeleted}
-									onInsert={handleInsertWikiLink}
-								/>
+								{linkInsertOpen ? (
+									<div data-link-panel="true">
+										<WikiLinkInsertPanel
+											query={linkInsertQuery}
+											onQueryChange={setLinkInsertQuery}
+											results={linkInsertResults}
+											isLoading={isLinkInsertLoading}
+											disabled={!activeNote || isActiveNoteDeleted}
+											onInsert={handleInsertWikiLink}
+											onClose={closeLinkInsertPanel}
+										/>
+									</div>
+								) : null}
 								{mobileEditorMode === "edit" ? (
 								<textarea
 									value={draft}
@@ -2156,16 +2241,32 @@ function WikiLinkInsertPanel(props: {
 	isLoading: boolean;
 	disabled: boolean;
 	onInsert: (note: NoteItem) => void;
+	onClose: () => void;
 }) {
-	const { query, onQueryChange, results, isLoading, disabled, onInsert } = props;
+	const { query, onQueryChange, results, isLoading, disabled, onInsert, onClose } = props;
 	return (
 		<section className="mt-3 rounded-xl border border-slate-200 bg-slate-50/70 p-2">
+			<div className="mb-2 flex items-center justify-between">
+				<p className="text-xs font-medium text-slate-600">双链插入</p>
+				<button
+					type="button"
+					onClick={onClose}
+					className="rounded-md border border-slate-200 px-2 py-1 text-[11px] text-slate-500 hover:bg-slate-100"
+				>
+					收起
+				</button>
+			</div>
 			<div className="flex items-center gap-2">
 				<input
 					type="text"
 					value={query}
 					onChange={(event) => onQueryChange(event.target.value)}
 					onKeyDown={(event) => {
+						if (event.key === "Escape") {
+							event.preventDefault();
+							onClose();
+							return;
+						}
 						if (event.key === "Enter") {
 							event.preventDefault();
 							const first = results[0];
@@ -2182,6 +2283,7 @@ function WikiLinkInsertPanel(props: {
 				/>
 				<span className="shrink-0 text-[11px] text-slate-400">Enter 插入首项</span>
 			</div>
+			<p className="mt-2 px-1 text-[11px] text-slate-400">删除链接：直接删掉正文里的 `[[笔记名]]`。</p>
 			<div className="mt-2 max-h-24 space-y-1 overflow-y-auto pr-1">
 				{isLoading ? (
 					<p className="px-2 py-1 text-xs text-slate-400">搜索中...</p>
