@@ -63,7 +63,21 @@ type CreateNoteInput = {
 	tagNames?: string[];
 };
 
-export async function listRootFolders(): Promise<FolderApiItem[]> {
+type CreateFolderInput = {
+	name: string;
+	parentId: string;
+	sortOrder?: number;
+	slug?: string;
+};
+
+type UpdateFolderInput = {
+	name?: string;
+	parentId?: string;
+	sortOrder?: number;
+	slug?: string;
+};
+
+export async function listFolders(): Promise<FolderApiItem[]> {
 	const data = await requestApiData<unknown>("/api/folders");
 	if (!Array.isArray(data)) {
 		throw new Error("Invalid folders response");
@@ -71,8 +85,54 @@ export async function listRootFolders(): Promise<FolderApiItem[]> {
 	return data
 		.map((item) => toFolderApiItem(item))
 		.filter((item): item is FolderApiItem => item !== null)
+		.sort((a, b) => {
+			if (a.parentId === b.parentId) {
+				return a.sortOrder - b.sortOrder || a.name.localeCompare(b.name, "zh-CN");
+			}
+			if (a.parentId === null) {
+				return -1;
+			}
+			if (b.parentId === null) {
+				return 1;
+			}
+			return a.parentId.localeCompare(b.parentId, "zh-CN");
+		});
+}
+
+export async function listRootFolders(): Promise<FolderApiItem[]> {
+	const folders = await listFolders();
+	return folders
 		.filter((item) => item.parentId === null)
 		.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name, "zh-CN"));
+}
+
+export async function createFolder(input: CreateFolderInput): Promise<FolderApiItem> {
+	const data = await requestApiData<unknown>("/api/folders", {
+		method: "POST",
+		body: JSON.stringify({
+			name: input.name,
+			parentId: input.parentId,
+			sortOrder: input.sortOrder,
+			slug: input.slug,
+		}),
+	});
+	const folder = toFolderApiItem(data);
+	if (!folder) {
+		throw new Error("Invalid create folder response");
+	}
+	return folder;
+}
+
+export async function updateFolder(folderId: string, input: UpdateFolderInput): Promise<FolderApiItem> {
+	const data = await requestApiData<unknown>(`/api/folders/${encodeURIComponent(folderId)}`, {
+		method: "PATCH",
+		body: JSON.stringify(input),
+	});
+	const folder = toFolderApiItem(data);
+	if (!folder) {
+		throw new Error("Invalid update folder response");
+	}
+	return folder;
 }
 
 export async function listTags(): Promise<TagApiItem[]> {

@@ -1,15 +1,15 @@
-import { markdown } from "@codemirror/lang-markdown";
-import CodeMirror from "@uiw/react-codemirror";
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
+	createFolder,
 	createNote,
 	deleteNote,
 	getNoteLinks,
+	listFolders,
 	listNotes,
-	listRootFolders,
 	listTags,
+	updateFolder,
 	updateNote,
 	type FolderApiItem,
 	type NoteLinkApiItem,
@@ -65,6 +65,12 @@ const defaultRootFolders: FolderApiItem[] = [
 	{ id: "folder-30-resource", parentId: null, name: "30-Resource", sortOrder: 30 },
 	{ id: "folder-40-archive", parentId: null, name: "40-Archive", sortOrder: 40 },
 ];
+const PARA_MAIN_ROOT_IDS = new Set([
+	"folder-10-projects",
+	"folder-20-areas",
+	"folder-30-resource",
+	"folder-40-archive",
+]);
 
 export function meta({}: Route.MetaArgs) {
 	return [
@@ -81,6 +87,14 @@ export default function Home() {
 	const [folderItems, setFolderItems] = useState<FolderApiItem[]>(defaultRootFolders);
 	const [organizeFolderId, setOrganizeFolderId] = useState<string | null>(null);
 	const [captureFolderId, setCaptureFolderId] = useState<string>(defaultRootFolders[0].id);
+	const [newFolderName, setNewFolderName] = useState("");
+	const [newFolderParentId, setNewFolderParentId] = useState("folder-10-projects");
+	const [isCreatingFolder, setIsCreatingFolder] = useState(false);
+	const [editingFolderId, setEditingFolderId] = useState<string | null>(null);
+	const [editingFolderName, setEditingFolderName] = useState("");
+	const [isUpdatingFolder, setIsUpdatingFolder] = useState(false);
+	const [isMovingNote, setIsMovingNote] = useState(false);
+	const [folderErrorMessage, setFolderErrorMessage] = useState("");
 	const [captureInput, setCaptureInput] = useState("");
 	const [noteItems, setNoteItems] = useState<NoteItem[]>([]);
 	const [tagItems, setTagItems] = useState<TagApiItem[]>([]);
@@ -98,6 +112,14 @@ export default function Home() {
 	const [recentNoteIds, setRecentNoteIds] = useState<string[]>([]);
 	const [noteLinks, setNoteLinks] = useState<NoteLinksApiItem | null>(null);
 	const [isLoadingNoteLinks, setIsLoadingNoteLinks] = useState(false);
+	const [isClientReady, setIsClientReady] = useState(false);
+	const [markdownEditorComponent, setMarkdownEditorComponent] =
+		useState<ComponentType<{
+			value: string;
+			onChange: (value: string) => void;
+			height?: string;
+			className?: string;
+		}> | null>(null);
 
 	const noteItemsRef = useRef<NoteItem[]>([]);
 	const selectedTagIdsRef = useRef<string[]>([]);
@@ -136,18 +158,60 @@ export default function Home() {
 		return merged.slice(0, RECENT_NOTE_LIMIT);
 	}, [noteItems, recentOpenedNotes]);
 	const recentNoteIdSet = useMemo(() => new Set(recentNoteIds), [recentNoteIds]);
-	const organizeNotes = useMemo(() => {
+	const rootFolderItems = useMemo(
+		() =>
+			folderItems
+				.filter((folder) => folder.parentId === null)
+				.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name, "zh-CN")),
+		[folderItems],
+	);
+	const folderChildrenByParent = useMemo(() => {
+		const mapping = new Map<string, FolderApiItem[]>();
+		for (const folder of folderItems) {
+			if (!folder.parentId) {
+				continue;
+			}
+			const list = mapping.get(folder.parentId) ?? [];
+			list.push(folder);
+			mapping.set(folder.parentId, list);
+		}
+		for (const list of mapping.values()) {
+			list.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name, "zh-CN"));
+		}
+		return mapping;
+	}, [folderItems]);
+	const folderFilterItems = useMemo(() => {
+		const rows: Array<{ folder: FolderApiItem; level: 0 | 1 }> = [];
+		for (const root of rootFolderItems) {
+			rows.push({ folder: root, level: 0 });
+			const children = folderChildrenByParent.get(root.id) ?? [];
+			for (const child of children) {
+				rows.push({ folder: child, level: 1 });
+			}
+		}
+		return rows;
+	}, [rootFolderItems, folderChildrenByParent]);
+	const createFolderParentOptions = useMemo(
+		() => rootFolderItems.filter((folder) => PARA_MAIN_ROOT_IDS.has(folder.id)),
+		[rootFolderItems],
+	);
+	const organizeFolderIdSet = useMemo(() => {
 		if (!organizeFolderId) {
+			return null;
+		}
+		return collectDescendantFolderIds(organizeFolderId, folderChildrenByParent);
+	}, [organizeFolderId, folderChildrenByParent]);
+	const organizeNotes = useMemo(() => {
+		if (!organizeFolderIdSet) {
 			return noteItems;
 		}
-		return noteItems.filter((note) => note.folderId === organizeFolderId);
-	}, [noteItems, organizeFolderId]);
+		return noteItems.filter((note) => organizeFolderIdSet.has(note.folderId));
+	}, [noteItems, organizeFolderIdSet]);
 	const noteIdBySlug = useMemo(
 		() => new Map(noteItems.map((note) => [note.slug, note.id] as const)),
 		[noteItems],
 	);
 	const previewMarkdown = useMemo(() => toMarkdownWithWikiLinks(draft), [draft]);
-	const editorExtensions = useMemo(() => [markdown()], []);
 	const canUseSplit = viewportWidth >= 1280;
 	const useHorizontalSplit = viewportWidth >= 1600;
 	const effectiveEditorMode = editorMode === "split" && !canUseSplit ? "edit" : editorMode;
@@ -207,7 +271,7 @@ export default function Home() {
 	}, [activeNote]);
 
 	useEffect(() => {
-		if (typeof window === "undefined") {
+		if (import.meta.env.SSR || typeof window === "undefined") {
 			return;
 		}
 		const updateViewportWidth = () => {
@@ -217,6 +281,25 @@ export default function Home() {
 		window.addEventListener("resize", updateViewportWidth);
 		return () => {
 			window.removeEventListener("resize", updateViewportWidth);
+		};
+	}, []);
+
+	useEffect(() => {
+		setIsClientReady(true);
+		let cancelled = false;
+		if (typeof window !== "undefined") {
+			void import("../components/markdown-editor.client")
+				.then((module) => {
+					if (!cancelled) {
+						setMarkdownEditorComponent(() => module.default);
+					}
+				})
+				.catch((error) => {
+					console.error("Failed to load markdown editor component", error);
+				});
+		}
+		return () => {
+			cancelled = true;
 		};
 	}, []);
 
@@ -337,6 +420,29 @@ export default function Home() {
 	}, [folderItems, captureFolderId]);
 
 	useEffect(() => {
+		if (
+			newFolderParentId &&
+			createFolderParentOptions.some((folder) => folder.id === newFolderParentId)
+		) {
+			return;
+		}
+		setNewFolderParentId(createFolderParentOptions[0]?.id ?? "folder-10-projects");
+	}, [createFolderParentOptions, newFolderParentId]);
+
+	useEffect(() => {
+		if (organizeFolderId && !folderItems.some((folder) => folder.id === organizeFolderId)) {
+			setOrganizeFolderId(null);
+		}
+	}, [folderItems, organizeFolderId]);
+
+	useEffect(() => {
+		if (editingFolderId && !folderItems.some((folder) => folder.id === editingFolderId)) {
+			setEditingFolderId(null);
+			setEditingFolderName("");
+		}
+	}, [folderItems, editingFolderId]);
+
+	useEffect(() => {
 		if (noteItems.length === 0) {
 			if (activeNoteId) {
 				setActiveNoteId("");
@@ -364,11 +470,11 @@ export default function Home() {
 	useEffect(() => {
 		let cancelled = false;
 		const loadFolders = async () => {
-			const roots = await listRootFolders().catch(() => null);
-			if (!roots || cancelled || roots.length === 0) {
+			const folders = await listFolders().catch(() => null);
+			if (!folders || cancelled || folders.length === 0) {
 				return;
 			}
-			setFolderItems(roots);
+			setFolderItems(sortFolderItems(folders));
 		};
 
 		void loadFolders();
@@ -619,9 +725,89 @@ export default function Home() {
 		setSelectedTagIds([]);
 	};
 
+	const handleCreateFolder = async () => {
+		const name = newFolderName.trim();
+		if (!name || isCreatingFolder) {
+			return;
+		}
+		setIsCreatingFolder(true);
+		setFolderErrorMessage("");
+		try {
+			const created = await createFolder({
+				name,
+				parentId: newFolderParentId,
+			});
+			setFolderItems((prev) => sortFolderItems([...prev.filter((folder) => folder.id !== created.id), created]));
+			setCaptureFolderId(created.id);
+			setOrganizeFolderId(created.id);
+			setNewFolderName("");
+		} catch (error) {
+			setFolderErrorMessage(readErrorMessage(error));
+		} finally {
+			setIsCreatingFolder(false);
+		}
+	};
+
+	const startRenameFolder = (folder: FolderApiItem) => {
+		if (folder.parentId === null) {
+			return;
+		}
+		setEditingFolderId(folder.id);
+		setEditingFolderName(folder.name);
+		setFolderErrorMessage("");
+	};
+
+	const cancelRenameFolder = () => {
+		setEditingFolderId(null);
+		setEditingFolderName("");
+	};
+
+	const handleRenameFolder = async () => {
+		const folderId = editingFolderId;
+		const name = editingFolderName.trim();
+		if (!folderId || !name || isUpdatingFolder) {
+			return;
+		}
+		setIsUpdatingFolder(true);
+		setFolderErrorMessage("");
+		try {
+			const updated = await updateFolder(folderId, { name });
+			setFolderItems((prev) => sortFolderItems(prev.map((folder) => (folder.id === updated.id ? updated : folder))));
+			setEditingFolderId(null);
+			setEditingFolderName("");
+		} catch (error) {
+			setFolderErrorMessage(readErrorMessage(error));
+		} finally {
+			setIsUpdatingFolder(false);
+		}
+	};
+
 	const focusNote = (noteId: string) => {
 		setActiveNoteId(noteId);
 		setWorkspaceMode("focus");
+	};
+
+	const handleMoveActiveNote = async (folderId: string) => {
+		if (!activeNote || !folderId || folderId === activeNote.folderId || isMovingNote) {
+			return;
+		}
+		setIsMovingNote(true);
+		try {
+			const updated = await updateNote(activeNote.id, { folderId });
+			const next = toNoteItem(updated);
+			setNoteItems((prev) => {
+				const updatedList = prev.map((note) => (note.id === next.id ? { ...note, ...next } : note));
+				const currentTagFilter = selectedTagIdsRef.current;
+				if (currentTagFilter.length === 0 || matchesTagFilter(next, currentTagFilter)) {
+					return updatedList;
+				}
+				return updatedList.filter((note) => note.id !== next.id);
+			});
+		} catch (error) {
+			console.error("Failed to move note", error);
+		} finally {
+			setIsMovingNote(false);
+		}
 	};
 
 	const handleDeleteActiveNote = async () => {
@@ -797,6 +983,8 @@ export default function Home() {
 	};
 
 	const activeFolderName = folderItems.find((folder) => folder.id === captureFolderId)?.name ?? "00-Inbox";
+	const activeNoteFolderId = activeNote?.folderId ?? "";
+	const MarkdownEditorComponent = markdownEditorComponent;
 	const saveStateText = isSavingDraft ? "自动保存中..." : "已保存";
 	const hasTagFilters = selectedTagIds.length > 0;
 	const outboundLinks = noteLinks?.outbound ?? [];
@@ -857,18 +1045,18 @@ export default function Home() {
 									placeholder="随手记一条，支持 [[note]] 和 #tag"
 									className="h-28 w-full resize-none rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm outline-none focus:ring"
 								/>
-								<div className="mt-3 flex items-center justify-between">
-									<select
-										value={captureFolderId}
-										onChange={(e) => setCaptureFolderId(e.target.value)}
-										className="rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-600"
-									>
-										{folderItems.map((folder) => (
-											<option key={folder.id} value={folder.id}>
-												{folder.name}
-											</option>
-										))}
-									</select>
+									<div className="mt-3 flex items-center justify-between">
+										<select
+											value={captureFolderId}
+											onChange={(e) => setCaptureFolderId(e.target.value)}
+											className="rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-600"
+										>
+											{folderFilterItems.map((item) => (
+												<option key={item.folder.id} value={item.folder.id}>
+													{formatFolderOptionLabel(item.folder.name, item.level)}
+												</option>
+											))}
+										</select>
 									<button
 										onClick={handleCaptureSend}
 										disabled={isCreatingNote}
@@ -940,31 +1128,126 @@ export default function Home() {
 										)}
 									</div>
 								</div>
-								<p className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-500">目录</p>
-								<div className="min-h-0 flex-1 space-y-1 overflow-y-auto">
-									<button
-										onClick={() => setOrganizeFolderId(null)}
-										className={`w-full rounded-lg px-2 py-2 text-left text-sm ${
-											organizeFolderId === null ? "bg-slate-900 text-white" : "text-slate-700 hover:bg-slate-100"
-										}`}
-									>
-										全部目录
-									</button>
-									{folderItems.map((folder) => (
+									<p className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-500">目录</p>
+									<div className="min-h-0 flex-1 space-y-1 overflow-y-auto">
 										<button
-											key={folder.id}
-											onClick={() => setOrganizeFolderId(folder.id)}
+											onClick={() => setOrganizeFolderId(null)}
 											className={`w-full rounded-lg px-2 py-2 text-left text-sm ${
-												organizeFolderId === folder.id
-													? "bg-slate-900 text-white"
-													: "text-slate-700 hover:bg-slate-100"
+												organizeFolderId === null ? "bg-slate-900 text-white" : "text-slate-700 hover:bg-slate-100"
 											}`}
 										>
-											{folder.name}
+											全部目录
 										</button>
-									))}
-								</div>
-							</aside>
+										{folderFilterItems.map((item) => {
+											const active = organizeFolderId === item.folder.id;
+											const isEditing = editingFolderId === item.folder.id;
+											const editable = item.folder.parentId !== null;
+											return (
+												<div
+													key={item.folder.id}
+													className={`rounded-lg border ${
+														active ? "border-slate-900 bg-slate-900" : "border-slate-200 bg-white"
+													}`}
+												>
+													{isEditing ? (
+														<div className="space-y-2 p-2">
+															<input
+																type="text"
+																value={editingFolderName}
+																onChange={(event) => setEditingFolderName(event.target.value)}
+																className="w-full rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-800"
+															/>
+															<div className="flex gap-2">
+																<button
+																	type="button"
+																	onClick={handleRenameFolder}
+																	disabled={isUpdatingFolder}
+																	className={`rounded-md px-2 py-1 text-xs ${
+																		isUpdatingFolder
+																			? "cursor-not-allowed bg-slate-200 text-slate-400"
+																			: "bg-slate-900 text-white"
+																	}`}
+																>
+																	保存
+																</button>
+																<button
+																	type="button"
+																	onClick={cancelRenameFolder}
+																	className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-600"
+																>
+																	取消
+																</button>
+															</div>
+														</div>
+													) : (
+														<div className="flex items-center gap-2 px-1 py-1">
+															<button
+																type="button"
+																onClick={() => setOrganizeFolderId(item.folder.id)}
+																className={`min-w-0 flex-1 rounded-md px-2 py-1 text-left text-sm ${
+																	active ? "text-white" : "text-slate-700 hover:bg-slate-100"
+																}`}
+															>
+																{formatFolderOptionLabel(item.folder.name, item.level)}
+															</button>
+															{editable ? (
+																<button
+																	type="button"
+																	onClick={() => startRenameFolder(item.folder)}
+																	className={`rounded-md px-2 py-1 text-xs ${
+																		active
+																			? "text-slate-200 hover:bg-white/15"
+																			: "text-slate-500 hover:bg-slate-100"
+																	}`}
+																>
+																	重命名
+																</button>
+															) : null}
+														</div>
+													)}
+												</div>
+											);
+										})}
+									</div>
+									<div className="mt-3 space-y-2 border-t border-slate-100 pt-3">
+										<p className="text-xs font-semibold uppercase tracking-wide text-slate-500">新建子目录</p>
+										<select
+											value={newFolderParentId}
+											onChange={(event) => setNewFolderParentId(event.target.value)}
+											className="w-full rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-600"
+										>
+											{createFolderParentOptions.map((folder) => (
+												<option key={folder.id} value={folder.id}>
+													{folder.name}
+												</option>
+											))}
+										</select>
+										<div className="flex gap-2">
+											<input
+												type="text"
+												value={newFolderName}
+												onChange={(event) => setNewFolderName(event.target.value)}
+												placeholder="输入子目录名称"
+												className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-700"
+											/>
+											<button
+												type="button"
+												onClick={handleCreateFolder}
+												disabled={isCreatingFolder}
+												className={`rounded-lg px-3 py-2 text-xs font-medium ${
+													isCreatingFolder
+														? "cursor-not-allowed bg-slate-200 text-slate-400"
+														: "bg-slate-900 text-white"
+												}`}
+											>
+												{isCreatingFolder ? "创建中" : "创建"}
+											</button>
+										</div>
+										{folderErrorMessage ? (
+											<p className="text-xs text-rose-600">{folderErrorMessage}</p>
+										) : null}
+									</div>
+								</aside>
 
 							<section className="flex min-h-0 flex-col rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
 								<div className="mb-3 flex items-center justify-between">
@@ -1023,26 +1306,48 @@ export default function Home() {
 										</button>
 									</div>
 								</div>
-								<div className="mt-2 flex flex-wrap gap-2">
-									{(activeNote?.tags ?? []).map((tag) => (
-										<span key={tag} className="rounded-md bg-slate-100 px-2 py-1 text-xs text-slate-600">
-											{tag}
-										</span>
-									))}
+									<div className="mt-2 flex flex-wrap gap-2">
+										{(activeNote?.tags ?? []).map((tag) => (
+											<span key={tag} className="rounded-md bg-slate-100 px-2 py-1 text-xs text-slate-600">
+												{tag}
+											</span>
+										))}
+									</div>
+									<div className="mt-3 flex items-center gap-2">
+										<select
+											value={activeNoteFolderId}
+											onChange={(event) => void handleMoveActiveNote(event.target.value)}
+											disabled={!activeNote || isMovingNote}
+											className="max-w-[18rem] rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-600"
+										>
+											{folderFilterItems.map((item) => (
+												<option key={item.folder.id} value={item.folder.id}>
+													{formatFolderOptionLabel(item.folder.name, item.level)}
+												</option>
+											))}
+										</select>
+										<span className="text-xs text-slate-400">{isMovingNote ? "移动中..." : "切换即移动"}</span>
+									</div>
 								</div>
-							</div>
 
-							{effectiveEditorMode === "edit" ? (
-								<div className="min-h-0 flex-1 overflow-hidden rounded-xl border border-slate-200 bg-white [&_.cm-editor]:h-full [&_.cm-scroller]:overflow-auto [&_.cm-theme]:h-full">
-									<CodeMirror
-										value={draft}
-										height="100%"
-										extensions={editorExtensions}
-										onChange={handleDraftChange}
-										className="h-full text-sm"
-									/>
-								</div>
-							) : null}
+								{effectiveEditorMode === "edit" ? (
+									isClientReady && MarkdownEditorComponent ? (
+										<div className="min-h-0 flex-1 overflow-hidden rounded-xl border border-slate-200 bg-white [&_.cm-editor]:h-full [&_.cm-scroller]:overflow-auto [&_.cm-theme]:h-full">
+											<MarkdownEditorComponent
+												value={draft}
+												height="100%"
+												onChange={(value) => handleDraftChange(value)}
+												className="h-full text-sm"
+											/>
+										</div>
+									) : (
+										<textarea
+											value={draft}
+											onChange={(event) => handleDraftChange(event.target.value)}
+											className="min-h-0 h-full flex-1 resize-none rounded-xl border border-slate-200 bg-white p-3 text-sm"
+										/>
+									)
+								) : null}
 
 							{effectiveEditorMode === "preview" ? (
 								<div className="min-h-0 flex-1 overflow-y-auto rounded-xl border border-slate-200 bg-slate-50 p-4">
@@ -1052,26 +1357,33 @@ export default function Home() {
 								</div>
 							) : null}
 
-							{effectiveEditorMode === "split" ? (
-								<div
-									className={`grid min-h-0 flex-1 gap-3 ${
-										useHorizontalSplit
-											? "grid-cols-[minmax(0,3fr)_minmax(0,2fr)]"
-											: "grid-rows-[minmax(0,1fr)_minmax(0,1fr)]"
-									}`}
-								>
-									<div className="min-h-0 overflow-hidden rounded-xl border border-slate-200 bg-white [&_.cm-editor]:h-full [&_.cm-scroller]:overflow-auto [&_.cm-theme]:h-full">
-										<CodeMirror
-											value={draft}
-											height="100%"
-											extensions={editorExtensions}
-											onChange={handleDraftChange}
-											className="h-full text-sm"
-										/>
-									</div>
-									<div className="min-h-0 overflow-y-auto rounded-xl border border-slate-200 bg-slate-50 p-4">
-										<ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-											{previewMarkdown || "*（空白笔记）*"}
+								{effectiveEditorMode === "split" ? (
+									<div
+										className={`grid min-h-0 flex-1 gap-3 ${
+											useHorizontalSplit
+												? "grid-cols-[minmax(0,3fr)_minmax(0,2fr)]"
+												: "grid-rows-[minmax(0,1fr)_minmax(0,1fr)]"
+										}`}
+									>
+										{isClientReady && MarkdownEditorComponent ? (
+											<div className="min-h-0 overflow-hidden rounded-xl border border-slate-200 bg-white [&_.cm-editor]:h-full [&_.cm-scroller]:overflow-auto [&_.cm-theme]:h-full">
+												<MarkdownEditorComponent
+													value={draft}
+													height="100%"
+													onChange={(value) => handleDraftChange(value)}
+													className="h-full text-sm"
+												/>
+											</div>
+										) : (
+											<textarea
+												value={draft}
+												onChange={(event) => handleDraftChange(event.target.value)}
+												className="min-h-0 h-full w-full resize-none rounded-xl border border-slate-200 bg-white p-3 text-sm"
+											/>
+										)}
+										<div className="min-h-0 overflow-y-auto rounded-xl border border-slate-200 bg-slate-50 p-4">
+											<ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+												{previewMarkdown || "*（空白笔记）*"}
 										</ReactMarkdown>
 									</div>
 								</div>
@@ -1108,18 +1420,18 @@ export default function Home() {
 									placeholder="快速记录..."
 									className="h-24 w-full resize-none rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm"
 								/>
-								<div className="mt-2 flex items-center justify-between">
-									<select
-										value={captureFolderId}
-										onChange={(e) => setCaptureFolderId(e.target.value)}
-										className="rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-600"
-									>
-										{folderItems.map((folder) => (
-											<option key={folder.id} value={folder.id}>
-												{folder.name}
-											</option>
-										))}
-									</select>
+									<div className="mt-2 flex items-center justify-between">
+										<select
+											value={captureFolderId}
+											onChange={(e) => setCaptureFolderId(e.target.value)}
+											className="rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-600"
+										>
+											{folderFilterItems.map((item) => (
+												<option key={item.folder.id} value={item.folder.id}>
+													{formatFolderOptionLabel(item.folder.name, item.level)}
+												</option>
+											))}
+										</select>
 									<button
 										onClick={handleCaptureSend}
 										disabled={isCreatingNote}
@@ -1151,8 +1463,8 @@ export default function Home() {
 
 					{workspaceMode === "organize" ? (
 						<div className="space-y-3">
-							<section className="overflow-x-auto rounded-2xl border border-slate-200 bg-white p-2 shadow-sm">
-								<div className="flex gap-2">
+								<section className="overflow-x-auto rounded-2xl border border-slate-200 bg-white p-2 shadow-sm">
+									<div className="flex gap-2">
 									<button
 										onClick={() => setOrganizeFolderId(null)}
 										className={`shrink-0 rounded-lg px-3 py-2 text-xs ${
@@ -1161,22 +1473,22 @@ export default function Home() {
 									>
 										全部
 									</button>
-									{folderItems.map((folder) => (
-										<button
-											key={folder.id}
-											onClick={() => setOrganizeFolderId(folder.id)}
-											className={`shrink-0 rounded-lg px-3 py-2 text-xs ${
-												organizeFolderId === folder.id ? "bg-slate-900 text-white" : "bg-slate-100 text-slate-600"
-											}`}
-										>
-											{folder.name}
-										</button>
-									))}
-								</div>
-							</section>
+										{folderFilterItems.map((item) => (
+											<button
+												key={item.folder.id}
+												onClick={() => setOrganizeFolderId(item.folder.id)}
+												className={`shrink-0 rounded-lg px-3 py-2 text-xs ${
+													organizeFolderId === item.folder.id ? "bg-slate-900 text-white" : "bg-slate-100 text-slate-600"
+												}`}
+											>
+												{formatFolderOptionLabel(item.folder.name, item.level)}
+											</button>
+										))}
+									</div>
+								</section>
 
-							<section className="overflow-x-auto rounded-2xl border border-slate-200 bg-white p-2 shadow-sm">
-								<div className="mb-2 flex items-center justify-between px-1">
+								<section className="overflow-x-auto rounded-2xl border border-slate-200 bg-white p-2 shadow-sm">
+									<div className="mb-2 flex items-center justify-between px-1">
 									<p className="text-xs font-semibold uppercase tracking-wide text-slate-500">标签</p>
 									<button
 										type="button"
@@ -1209,10 +1521,47 @@ export default function Home() {
 											);
 										})
 									)}
-								</div>
-							</section>
+									</div>
+								</section>
 
-							<section className="max-h-[62dvh] overflow-y-auto rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
+								<section className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
+									<p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">新建子目录</p>
+									<select
+										value={newFolderParentId}
+										onChange={(event) => setNewFolderParentId(event.target.value)}
+										className="w-full rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-600"
+									>
+										{createFolderParentOptions.map((folder) => (
+											<option key={folder.id} value={folder.id}>
+												{folder.name}
+											</option>
+										))}
+									</select>
+									<div className="mt-2 flex gap-2">
+										<input
+											type="text"
+											value={newFolderName}
+											onChange={(event) => setNewFolderName(event.target.value)}
+											placeholder="输入子目录名称"
+											className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-700"
+										/>
+										<button
+											type="button"
+											onClick={handleCreateFolder}
+											disabled={isCreatingFolder}
+											className={`rounded-lg px-3 py-2 text-xs font-medium ${
+												isCreatingFolder
+													? "cursor-not-allowed bg-slate-200 text-slate-400"
+													: "bg-slate-900 text-white"
+											}`}
+										>
+											{isCreatingFolder ? "创建中" : "创建"}
+										</button>
+									</div>
+									{folderErrorMessage ? <p className="mt-2 text-xs text-rose-600">{folderErrorMessage}</p> : null}
+								</section>
+
+								<section className="max-h-[62dvh] overflow-y-auto rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
 								<div className="space-y-2">
 									{organizeNotes.map((note) => (
 										<button
@@ -1230,9 +1579,9 @@ export default function Home() {
 						</div>
 					) : null}
 
-					{workspaceMode === "focus" ? (
-						<section className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
-							<div className="mb-2 flex items-center justify-between gap-2">
+						{workspaceMode === "focus" ? (
+							<section className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
+								<div className="mb-2 flex items-center justify-between gap-2">
 								<p className="text-sm font-semibold">{activeNote?.title ?? "未选择笔记"}</p>
 								<div className="flex items-center gap-2">
 									<div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1">
@@ -1250,10 +1599,25 @@ export default function Home() {
 										}`}
 									>
 										{isDeletingNote ? "删除中" : "删除"}
-									</button>
+										</button>
+									</div>
 								</div>
-							</div>
-							{mobileEditorMode === "edit" ? (
+								<div className="mb-2 flex items-center gap-2">
+									<select
+										value={activeNoteFolderId}
+										onChange={(event) => void handleMoveActiveNote(event.target.value)}
+										disabled={!activeNote || isMovingNote}
+										className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-600"
+									>
+										{folderFilterItems.map((item) => (
+											<option key={item.folder.id} value={item.folder.id}>
+												{formatFolderOptionLabel(item.folder.name, item.level)}
+											</option>
+										))}
+									</select>
+									<span className="text-xs text-slate-400">{isMovingNote ? "移动中" : "切换即移动"}</span>
+								</div>
+								{mobileEditorMode === "edit" ? (
 								<textarea
 									value={draft}
 									onChange={(e) => handleDraftChange(e.target.value)}
@@ -1398,6 +1762,49 @@ export default function Home() {
 			) : null}
 		</div>
 	);
+}
+
+function sortFolderItems(folders: FolderApiItem[]): FolderApiItem[] {
+	return [...folders].sort((a, b) => {
+		if (a.parentId === b.parentId) {
+			return a.sortOrder - b.sortOrder || a.name.localeCompare(b.name, "zh-CN");
+		}
+		if (a.parentId === null) {
+			return -1;
+		}
+		if (b.parentId === null) {
+			return 1;
+		}
+		return a.parentId.localeCompare(b.parentId, "zh-CN");
+	});
+}
+
+function collectDescendantFolderIds(rootId: string, childrenByParent: Map<string, FolderApiItem[]>): Set<string> {
+	const result = new Set<string>();
+	const queue = [rootId];
+	while (queue.length > 0) {
+		const current = queue.shift();
+		if (!current || result.has(current)) {
+			continue;
+		}
+		result.add(current);
+		const children = childrenByParent.get(current) ?? [];
+		for (const child of children) {
+			queue.push(child.id);
+		}
+	}
+	return result;
+}
+
+function formatFolderOptionLabel(name: string, level: number): string {
+	return level > 0 ? `${"  ".repeat(level)}- ${name}` : name;
+}
+
+function readErrorMessage(error: unknown): string {
+	if (error instanceof Error && error.message) {
+		return error.message;
+	}
+	return "操作失败，请稍后重试";
 }
 
 function ModeButton(props: {
