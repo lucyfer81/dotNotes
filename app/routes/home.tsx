@@ -2,19 +2,23 @@ import { useEffect, useMemo, useRef, useState, type ComponentType, type ReactNod
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
+	archiveNote,
 	createFolder,
 	createNote,
 	deleteNote,
 	getNoteLinks,
+	hardDeleteNote,
 	listFolders,
 	listNotes,
 	listTags,
+	restoreNote,
 	updateFolder,
 	updateNote,
 	type FolderApiItem,
 	type NoteLinkApiItem,
 	type NoteLinksApiItem,
 	type NoteApiItem,
+	type NoteStatus,
 	type TagApiItem,
 } from "../lib/api";
 import type { Route } from "./+types/home";
@@ -29,6 +33,8 @@ type NoteItem = {
 	summary: string;
 	content: string;
 	folderId: string;
+	isArchived: boolean;
+	deletedAt: string | null;
 };
 
 type WorkspaceMode = "capture" | "organize" | "focus";
@@ -97,12 +103,15 @@ export default function Home() {
 	const [folderErrorMessage, setFolderErrorMessage] = useState("");
 	const [captureInput, setCaptureInput] = useState("");
 	const [noteItems, setNoteItems] = useState<NoteItem[]>([]);
+	const [noteStatusFilter, setNoteStatusFilter] = useState<NoteStatus>("active");
 	const [tagItems, setTagItems] = useState<TagApiItem[]>([]);
 	const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
 	const [activeNoteId, setActiveNoteId] = useState("");
 	const [draft, setDraft] = useState("");
 	const [isCreatingNote, setIsCreatingNote] = useState(false);
 	const [isSavingDraft, setIsSavingDraft] = useState(false);
+	const [isArchivingNote, setIsArchivingNote] = useState(false);
+	const [isRestoringNote, setIsRestoringNote] = useState(false);
 	const [isDeletingNote, setIsDeletingNote] = useState(false);
 	const [commandOpen, setCommandOpen] = useState(false);
 	const [commandQuery, setCommandQuery] = useState("");
@@ -215,7 +224,9 @@ export default function Home() {
 	const canUseSplit = viewportWidth >= 1280;
 	const useHorizontalSplit = viewportWidth >= 1600;
 	const effectiveEditorMode = editorMode === "split" && !canUseSplit ? "edit" : editorMode;
-	const mobileEditorMode = effectiveEditorMode === "split" ? "edit" : effectiveEditorMode;
+	const isActiveNoteDeleted = Boolean(activeNote?.deletedAt);
+	const focusEditorMode = isActiveNoteDeleted ? "preview" : effectiveEditorMode;
+	const mobileEditorMode = focusEditorMode === "split" ? "edit" : focusEditorMode;
 
 	const markdownComponents: Components = useMemo(
 		() => ({
@@ -341,6 +352,13 @@ export default function Home() {
 	}, [workspaceMode]);
 
 	useEffect(() => {
+		if (workspaceMode !== "capture" || noteStatusFilter === "active") {
+			return;
+		}
+		setNoteStatusFilter("active");
+	}, [workspaceMode, noteStatusFilter]);
+
+	useEffect(() => {
 		if (typeof window === "undefined") {
 			return;
 		}
@@ -455,7 +473,7 @@ export default function Home() {
 	}, [noteItems, activeNoteId]);
 
 	const refreshTags = async () => {
-		const tags = await listTags().catch(() => null);
+		const tags = await listTags({ status: noteStatusFilter }).catch(() => null);
 		if (!tags) {
 			return;
 		}
@@ -486,7 +504,7 @@ export default function Home() {
 	useEffect(() => {
 		let cancelled = false;
 		const loadTags = async () => {
-			const tags = await listTags().catch(() => null);
+			const tags = await listTags({ status: noteStatusFilter }).catch(() => null);
 			if (!tags || cancelled) {
 				return;
 			}
@@ -502,7 +520,7 @@ export default function Home() {
 		return () => {
 			cancelled = true;
 		};
-	}, []);
+	}, [noteStatusFilter]);
 
 	useEffect(() => {
 		let cancelled = false;
@@ -511,6 +529,7 @@ export default function Home() {
 				limit: 100,
 				tagIds: selectedTagIds,
 				tagMode: "any",
+				status: noteStatusFilter,
 			}).catch(() => null);
 			if (!notes || cancelled) {
 				return;
@@ -529,7 +548,7 @@ export default function Home() {
 		return () => {
 			cancelled = true;
 		};
-	}, [selectedTagIds]);
+	}, [selectedTagIds, noteStatusFilter]);
 
 	useEffect(() => {
 		if (!activeNoteId || !activeNote) {
@@ -540,7 +559,7 @@ export default function Home() {
 
 		let cancelled = false;
 		setIsLoadingNoteLinks(true);
-		void getNoteLinks(activeNoteId)
+		void getNoteLinks(activeNoteId, noteStatusFilter)
 			.then((links) => {
 				if (!cancelled) {
 					setNoteLinks(links);
@@ -560,7 +579,7 @@ export default function Home() {
 		return () => {
 			cancelled = true;
 		};
-	}, [activeNoteId, activeNote?.updatedAt]);
+	}, [activeNoteId, activeNote?.updatedAt, noteStatusFilter]);
 
 	useEffect(() => {
 		if (!commandOpen) {
@@ -580,6 +599,7 @@ export default function Home() {
 				limit: 20,
 				keyword,
 				tagMode: "any",
+				status: noteStatusFilter,
 			})
 				.then((notes) => {
 					if (cancelled) {
@@ -603,7 +623,7 @@ export default function Home() {
 			cancelled = true;
 			window.clearTimeout(timer);
 		};
-	}, [commandOpen, commandQuery, defaultCommandNotes]);
+	}, [commandOpen, commandQuery, defaultCommandNotes, noteStatusFilter]);
 
 	const flushPendingSave = async () => {
 		if (saveInFlightRef.current) {
@@ -635,7 +655,10 @@ export default function Home() {
 			setNoteItems((prev) => {
 				const updatedList = prev.map((note) => (note.id === next.id ? { ...note, ...next } : note));
 				const currentTagFilter = selectedTagIdsRef.current;
-				if (currentTagFilter.length === 0 || matchesTagFilter(next, currentTagFilter)) {
+				const matchesFilters =
+					(currentTagFilter.length === 0 || matchesTagFilter(next, currentTagFilter)) &&
+					matchesStatusFilter(next, noteStatusFilter);
+				if (matchesFilters) {
 					return updatedList;
 				}
 				return updatedList.filter((note) => note.id !== next.id);
@@ -666,6 +689,9 @@ export default function Home() {
 	};
 
 	const handleDraftChange = (value: string) => {
+		if (isActiveNoteDeleted) {
+			return;
+		}
 		setDraft(value);
 		if (!activeNoteId) {
 			return;
@@ -700,7 +726,10 @@ export default function Home() {
 			void refreshTags();
 			const next = toNoteItem(created);
 			const currentTagFilter = selectedTagIdsRef.current;
-			if (currentTagFilter.length === 0 || matchesTagFilter(next, currentTagFilter)) {
+			const matchesFilters =
+				(currentTagFilter.length === 0 || matchesTagFilter(next, currentTagFilter)) &&
+				matchesStatusFilter(next, noteStatusFilter);
+			if (matchesFilters) {
 				setNoteItems((prev) => [next, ...prev.filter((note) => note.id !== next.id)]);
 				setActiveNoteId(next.id);
 				setDraft(next.content);
@@ -798,7 +827,10 @@ export default function Home() {
 			setNoteItems((prev) => {
 				const updatedList = prev.map((note) => (note.id === next.id ? { ...note, ...next } : note));
 				const currentTagFilter = selectedTagIdsRef.current;
-				if (currentTagFilter.length === 0 || matchesTagFilter(next, currentTagFilter)) {
+				const matchesFilters =
+					(currentTagFilter.length === 0 || matchesTagFilter(next, currentTagFilter)) &&
+					matchesStatusFilter(next, noteStatusFilter);
+				if (matchesFilters) {
 					return updatedList;
 				}
 				return updatedList.filter((note) => note.id !== next.id);
@@ -810,12 +842,98 @@ export default function Home() {
 		}
 	};
 
+	const removeNoteFromListById = (noteId: string) => {
+		const previous = noteItemsRef.current;
+		const removedIndex = previous.findIndex((note) => note.id === noteId);
+		const next = previous.filter((note) => note.id !== noteId);
+		const fallbackId = removedIndex >= 0
+			? (next[removedIndex]?.id ?? next[removedIndex - 1]?.id ?? next[0]?.id ?? "")
+			: (next[0]?.id ?? "");
+
+		setNoteItems(next);
+		setActiveNoteId(fallbackId);
+		if (!fallbackId) {
+			setDraft("");
+			setWorkspaceMode("organize");
+		}
+	};
+
+	const upsertNoteByFilters = (next: NoteItem) => {
+		setNoteItems((prev) => {
+			const merged = prev.some((note) => note.id === next.id)
+				? prev.map((note) => (note.id === next.id ? { ...note, ...next } : note))
+				: [next, ...prev];
+			const currentTagFilter = selectedTagIdsRef.current;
+			const matchesFilters =
+				(currentTagFilter.length === 0 || matchesTagFilter(next, currentTagFilter)) &&
+				matchesStatusFilter(next, noteStatusFilter);
+			if (matchesFilters) {
+				return merged;
+			}
+			return merged.filter((note) => note.id !== next.id);
+		});
+	};
+
+	const handleToggleArchiveActiveNote = async () => {
+		if (!activeNote || activeNote.deletedAt || isArchivingNote) {
+			return;
+		}
+		const nextArchived = !activeNote.isArchived;
+		if (typeof window !== "undefined") {
+			const confirmed = window.confirm(
+				nextArchived
+					? `确定归档「${activeNote.title}」吗？`
+					: `确定取消归档「${activeNote.title}」吗？`,
+			);
+			if (!confirmed) {
+				return;
+			}
+		}
+		setIsArchivingNote(true);
+		try {
+			const updated = await archiveNote(activeNote.id, nextArchived);
+			upsertNoteByFilters(toNoteItem(updated));
+			await refreshTags();
+		} catch (error) {
+			console.error("Failed to toggle archive note", error);
+		} finally {
+			setIsArchivingNote(false);
+		}
+	};
+
+	const handleRestoreActiveNote = async () => {
+		if (!activeNote || !activeNote.deletedAt || isRestoringNote) {
+			return;
+		}
+		if (typeof window !== "undefined") {
+			const confirmed = window.confirm(`确定恢复「${activeNote.title}」吗？`);
+			if (!confirmed) {
+				return;
+			}
+		}
+		setIsRestoringNote(true);
+		try {
+			const restored = await restoreNote(activeNote.id);
+			upsertNoteByFilters(toNoteItem(restored));
+			await refreshTags();
+		} catch (error) {
+			console.error("Failed to restore note", error);
+		} finally {
+			setIsRestoringNote(false);
+		}
+	};
+
 	const handleDeleteActiveNote = async () => {
 		if (!activeNote || isDeletingNote) {
 			return;
 		}
+		const isHardDelete = Boolean(activeNote.deletedAt);
 		if (typeof window !== "undefined") {
-			const confirmed = window.confirm(`确定删除「${activeNote.title}」吗？`);
+			const confirmed = window.confirm(
+				isHardDelete
+					? `确定永久删除「${activeNote.title}」吗？此操作不可恢复。`
+					: `确定将「${activeNote.title}」移入回收站吗？`,
+			);
 			if (!confirmed) {
 				return;
 			}
@@ -833,20 +951,12 @@ export default function Home() {
 
 		setIsDeletingNote(true);
 		try {
-			await deleteNote(deletingId);
-			const previous = noteItemsRef.current;
-			const removedIndex = previous.findIndex((note) => note.id === deletingId);
-			const next = previous.filter((note) => note.id !== deletingId);
-			const fallbackId = removedIndex >= 0
-				? (next[removedIndex]?.id ?? next[removedIndex - 1]?.id ?? next[0]?.id ?? "")
-				: (next[0]?.id ?? "");
-
-			setNoteItems(next);
-			setActiveNoteId(fallbackId);
-			if (!fallbackId) {
-				setDraft("");
-				setWorkspaceMode("organize");
+			if (isHardDelete) {
+				await hardDeleteNote(deletingId);
+			} else {
+				await deleteNote(deletingId);
 			}
+			removeNoteFromListById(deletingId);
 			await refreshTags();
 		} catch (error) {
 			console.error("Failed to delete note", error);
@@ -890,6 +1000,27 @@ export default function Home() {
 				description: "移除当前所有标签过滤",
 				keywords: ["tag", "标签", "filter", "筛选", "clear", "清空"],
 				run: () => setSelectedTagIds([]),
+			},
+			{
+				id: "action-status-active",
+				label: "查看活跃笔记",
+				description: "仅显示未归档且未删除笔记",
+				keywords: ["status", "active", "活跃", "状态", "回收站", "归档"],
+				run: () => setNoteStatusFilter("active"),
+			},
+			{
+				id: "action-status-archived",
+				label: "查看归档笔记",
+				description: "仅显示归档笔记",
+				keywords: ["status", "archived", "归档", "状态"],
+				run: () => setNoteStatusFilter("archived"),
+			},
+			{
+				id: "action-status-deleted",
+				label: "查看回收站",
+				description: "仅显示已删除笔记",
+				keywords: ["status", "deleted", "trash", "回收站", "删除", "状态"],
+				run: () => setNoteStatusFilter("deleted"),
 			},
 			{
 				id: "action-toggle-ai",
@@ -987,6 +1118,15 @@ export default function Home() {
 	const MarkdownEditorComponent = markdownEditorComponent;
 	const saveStateText = isSavingDraft ? "自动保存中..." : "已保存";
 	const hasTagFilters = selectedTagIds.length > 0;
+	const noteStatusLabel = noteStatusFilter === "active"
+		? "活跃"
+		: noteStatusFilter === "archived"
+			? "归档"
+			: noteStatusFilter === "deleted"
+				? "回收站"
+				: "全部";
+	const canArchiveActiveNote = Boolean(activeNote && !activeNote.deletedAt);
+	const canRestoreActiveNote = Boolean(activeNote?.deletedAt);
 	const outboundLinks = noteLinks?.outbound ?? [];
 	const inboundLinks = noteLinks?.inbound ?? [];
 	const unresolvedWikiLinks = useMemo(() => {
@@ -1092,6 +1232,14 @@ export default function Home() {
 					{workspaceMode === "organize" ? (
 						<div className="grid h-full grid-cols-[260px_minmax(0,1fr)] gap-4">
 							<aside className="flex min-h-0 flex-col rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+								<div className="mb-4">
+									<p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">状态</p>
+									<div className="grid grid-cols-3 gap-1 rounded-lg border border-slate-200 bg-slate-50 p-1">
+										<ModeButton label="活跃" active={noteStatusFilter === "active"} onClick={() => setNoteStatusFilter("active")} />
+										<ModeButton label="归档" active={noteStatusFilter === "archived"} onClick={() => setNoteStatusFilter("archived")} />
+										<ModeButton label="回收站" active={noteStatusFilter === "deleted"} onClick={() => setNoteStatusFilter("deleted")} />
+									</div>
+								</div>
 								<div className="mb-4">
 									<div className="mb-2 flex items-center justify-between">
 										<p className="text-xs font-semibold uppercase tracking-wide text-slate-500">标签</p>
@@ -1251,7 +1399,7 @@ export default function Home() {
 
 							<section className="flex min-h-0 flex-col rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
 								<div className="mb-3 flex items-center justify-between">
-									<p className="text-sm font-semibold">笔记列表</p>
+									<p className="text-sm font-semibold">笔记列表 · {noteStatusLabel}</p>
 									<span className="text-xs text-slate-500">{organizeNotes.length} 条</span>
 								</div>
 								<div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
@@ -1278,34 +1426,72 @@ export default function Home() {
 									<div>
 										<p className="text-lg font-semibold tracking-tight">{activeNote?.title ?? "未选择笔记"}</p>
 										<p className="mt-1 text-xs text-slate-500">
-											{activeNote?.updatedAt ? formatUpdatedAt(activeNote.updatedAt) : ""} · {saveStateText}
+											{activeNote?.updatedAt ? formatUpdatedAt(activeNote.updatedAt) : ""} · {saveStateText} · {noteStatusLabel}
 										</p>
 									</div>
 									<div className="flex items-center gap-2">
 										<div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1">
-											<ModeButton label="编辑" active={effectiveEditorMode === "edit"} onClick={() => setEditorMode("edit")} />
-											<ModeButton label="预览" active={effectiveEditorMode === "preview"} onClick={() => setEditorMode("preview")} />
+											<ModeButton
+												label="编辑"
+												active={focusEditorMode === "edit"}
+												disabled={isActiveNoteDeleted}
+												onClick={() => setEditorMode("edit")}
+											/>
+											<ModeButton label="预览" active={focusEditorMode === "preview"} onClick={() => setEditorMode("preview")} />
 											<ModeButton
 												label="分屏"
-												active={effectiveEditorMode === "split"}
-												disabled={!canUseSplit}
+												active={focusEditorMode === "split"}
+												disabled={!canUseSplit || isActiveNoteDeleted}
 												onClick={() => setEditorMode("split")}
 											/>
 										</div>
+										{canArchiveActiveNote ? (
+											<button
+												type="button"
+												onClick={handleToggleArchiveActiveNote}
+												disabled={!activeNote || isArchivingNote || isDeletingNote || isRestoringNote}
+												className={`rounded-lg border px-3 py-2 text-xs font-medium ${
+													!activeNote || isArchivingNote || isDeletingNote || isRestoringNote
+														? "cursor-not-allowed border-slate-200 text-slate-300"
+														: "border-amber-200 text-amber-700 hover:bg-amber-50"
+												}`}
+											>
+												{isArchivingNote ? "处理中..." : activeNote?.isArchived ? "取消归档" : "归档"}
+											</button>
+										) : null}
+										{canRestoreActiveNote ? (
+											<button
+												type="button"
+												onClick={handleRestoreActiveNote}
+												disabled={!activeNote || isRestoringNote || isDeletingNote}
+												className={`rounded-lg border px-3 py-2 text-xs font-medium ${
+													!activeNote || isRestoringNote || isDeletingNote
+														? "cursor-not-allowed border-slate-200 text-slate-300"
+														: "border-emerald-200 text-emerald-700 hover:bg-emerald-50"
+												}`}
+											>
+												{isRestoringNote ? "恢复中..." : "恢复"}
+											</button>
+										) : null}
 										<button
 											type="button"
 											onClick={handleDeleteActiveNote}
-											disabled={!activeNote || isDeletingNote}
+											disabled={!activeNote || isDeletingNote || isArchivingNote || isRestoringNote}
 											className={`rounded-lg border px-3 py-2 text-xs font-medium ${
-												!activeNote || isDeletingNote
+												!activeNote || isDeletingNote || isArchivingNote || isRestoringNote
 													? "cursor-not-allowed border-slate-200 text-slate-300"
 													: "border-rose-200 text-rose-600 hover:bg-rose-50"
 											}`}
 										>
-											{isDeletingNote ? "删除中..." : "删除"}
+											{isDeletingNote ? "处理中..." : activeNote?.deletedAt ? "永久删除" : "移入回收站"}
 										</button>
 									</div>
 								</div>
+									<div className="mt-2 inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1">
+										<ModeButton label="活跃" active={noteStatusFilter === "active"} onClick={() => setNoteStatusFilter("active")} />
+										<ModeButton label="归档" active={noteStatusFilter === "archived"} onClick={() => setNoteStatusFilter("archived")} />
+										<ModeButton label="回收站" active={noteStatusFilter === "deleted"} onClick={() => setNoteStatusFilter("deleted")} />
+									</div>
 									<div className="mt-2 flex flex-wrap gap-2">
 										{(activeNote?.tags ?? []).map((tag) => (
 											<span key={tag} className="rounded-md bg-slate-100 px-2 py-1 text-xs text-slate-600">
@@ -1317,7 +1503,7 @@ export default function Home() {
 										<select
 											value={activeNoteFolderId}
 											onChange={(event) => void handleMoveActiveNote(event.target.value)}
-											disabled={!activeNote || isMovingNote}
+											disabled={!activeNote || isMovingNote || isActiveNoteDeleted}
 											className="max-w-[18rem] rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-600"
 										>
 											{folderFilterItems.map((item) => (
@@ -1326,11 +1512,13 @@ export default function Home() {
 												</option>
 											))}
 										</select>
-										<span className="text-xs text-slate-400">{isMovingNote ? "移动中..." : "切换即移动"}</span>
+										<span className="text-xs text-slate-400">
+											{isActiveNoteDeleted ? "回收站笔记不可移动" : isMovingNote ? "移动中..." : "切换即移动"}
+										</span>
 									</div>
 								</div>
 
-								{effectiveEditorMode === "edit" ? (
+								{focusEditorMode === "edit" ? (
 									isClientReady && MarkdownEditorComponent ? (
 										<div className="min-h-0 flex-1 overflow-hidden rounded-xl border border-slate-200 bg-white [&_.cm-editor]:h-full [&_.cm-scroller]:overflow-auto [&_.cm-theme]:h-full">
 											<MarkdownEditorComponent
@@ -1349,7 +1537,7 @@ export default function Home() {
 									)
 								) : null}
 
-							{effectiveEditorMode === "preview" ? (
+							{focusEditorMode === "preview" ? (
 								<div className="min-h-0 flex-1 overflow-y-auto rounded-xl border border-slate-200 bg-slate-50 p-4">
 									<ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
 										{previewMarkdown || "*（空白笔记）*"}
@@ -1357,7 +1545,7 @@ export default function Home() {
 								</div>
 							) : null}
 
-								{effectiveEditorMode === "split" ? (
+								{focusEditorMode === "split" ? (
 									<div
 										className={`grid min-h-0 flex-1 gap-3 ${
 											useHorizontalSplit
@@ -1463,6 +1651,13 @@ export default function Home() {
 
 					{workspaceMode === "organize" ? (
 						<div className="space-y-3">
+								<section className="rounded-2xl border border-slate-200 bg-white p-2 shadow-sm">
+									<div className="grid grid-cols-3 gap-2">
+										<ModeButton label="活跃" active={noteStatusFilter === "active"} onClick={() => setNoteStatusFilter("active")} />
+										<ModeButton label="归档" active={noteStatusFilter === "archived"} onClick={() => setNoteStatusFilter("archived")} />
+										<ModeButton label="回收站" active={noteStatusFilter === "deleted"} onClick={() => setNoteStatusFilter("deleted")} />
+									</div>
+								</section>
 								<section className="overflow-x-auto rounded-2xl border border-slate-200 bg-white p-2 shadow-sm">
 									<div className="flex gap-2">
 									<button
@@ -1562,6 +1757,7 @@ export default function Home() {
 								</section>
 
 								<section className="max-h-[62dvh] overflow-y-auto rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
+								<p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">笔记列表 · {noteStatusLabel}</p>
 								<div className="space-y-2">
 									{organizeNotes.map((note) => (
 										<button
@@ -1585,28 +1781,67 @@ export default function Home() {
 								<p className="text-sm font-semibold">{activeNote?.title ?? "未选择笔记"}</p>
 								<div className="flex items-center gap-2">
 									<div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1">
-										<ModeButton label="编辑" active={mobileEditorMode === "edit"} onClick={() => setEditorMode("edit")} />
+										<ModeButton
+											label="编辑"
+											active={mobileEditorMode === "edit"}
+											disabled={isActiveNoteDeleted}
+											onClick={() => setEditorMode("edit")}
+										/>
 										<ModeButton label="预览" active={mobileEditorMode === "preview"} onClick={() => setEditorMode("preview")} />
 									</div>
+									{canArchiveActiveNote ? (
+										<button
+											type="button"
+											onClick={handleToggleArchiveActiveNote}
+											disabled={!activeNote || isArchivingNote || isDeletingNote || isRestoringNote}
+											className={`rounded-lg border px-2 py-1 text-xs ${
+												!activeNote || isArchivingNote || isDeletingNote || isRestoringNote
+													? "cursor-not-allowed border-slate-200 text-slate-300"
+													: "border-amber-200 text-amber-700"
+											}`}
+										>
+											{isArchivingNote ? "处理中" : activeNote?.isArchived ? "取消归档" : "归档"}
+										</button>
+									) : null}
+									{canRestoreActiveNote ? (
+										<button
+											type="button"
+											onClick={handleRestoreActiveNote}
+											disabled={!activeNote || isRestoringNote || isDeletingNote}
+											className={`rounded-lg border px-2 py-1 text-xs ${
+												!activeNote || isRestoringNote || isDeletingNote
+													? "cursor-not-allowed border-slate-200 text-slate-300"
+													: "border-emerald-200 text-emerald-700"
+											}`}
+										>
+											{isRestoringNote ? "恢复中" : "恢复"}
+										</button>
+									) : null}
 									<button
 										type="button"
 										onClick={handleDeleteActiveNote}
-										disabled={!activeNote || isDeletingNote}
+										disabled={!activeNote || isDeletingNote || isArchivingNote || isRestoringNote}
 										className={`rounded-lg border px-2 py-1 text-xs ${
-											!activeNote || isDeletingNote
+											!activeNote || isDeletingNote || isArchivingNote || isRestoringNote
 												? "cursor-not-allowed border-slate-200 text-slate-300"
 												: "border-rose-200 text-rose-600"
 										}`}
 									>
-										{isDeletingNote ? "删除中" : "删除"}
+										{isDeletingNote ? "处理中" : activeNote?.deletedAt ? "永久删除" : "移入回收站"}
 										</button>
 									</div>
+								</div>
+								<p className="mb-2 text-xs text-slate-500">当前状态筛选：{noteStatusLabel}</p>
+								<div className="mb-2 grid grid-cols-3 gap-2">
+									<ModeButton label="活跃" active={noteStatusFilter === "active"} onClick={() => setNoteStatusFilter("active")} />
+									<ModeButton label="归档" active={noteStatusFilter === "archived"} onClick={() => setNoteStatusFilter("archived")} />
+									<ModeButton label="回收站" active={noteStatusFilter === "deleted"} onClick={() => setNoteStatusFilter("deleted")} />
 								</div>
 								<div className="mb-2 flex items-center gap-2">
 									<select
 										value={activeNoteFolderId}
 										onChange={(event) => void handleMoveActiveNote(event.target.value)}
-										disabled={!activeNote || isMovingNote}
+										disabled={!activeNote || isMovingNote || isActiveNoteDeleted}
 										className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-600"
 									>
 										{folderFilterItems.map((item) => (
@@ -1615,7 +1850,9 @@ export default function Home() {
 											</option>
 										))}
 									</select>
-									<span className="text-xs text-slate-400">{isMovingNote ? "移动中" : "切换即移动"}</span>
+									<span className="text-xs text-slate-400">
+										{isActiveNoteDeleted ? "回收站笔记不可移动" : isMovingNote ? "移动中" : "切换即移动"}
+									</span>
 								</div>
 								{mobileEditorMode === "edit" ? (
 								<textarea
@@ -1937,7 +2174,22 @@ function toNoteItem(note: NoteApiItem): NoteItem {
 		summary: note.excerpt || buildSummary(content),
 		content,
 		folderId: note.folderId,
+		isArchived: note.isArchived,
+		deletedAt: note.deletedAt,
 	};
+}
+
+function matchesStatusFilter(note: NoteItem, status: NoteStatus): boolean {
+	if (status === "all") {
+		return true;
+	}
+	if (status === "deleted") {
+		return Boolean(note.deletedAt);
+	}
+	if (status === "archived") {
+		return !note.deletedAt && note.isArchived;
+	}
+	return !note.deletedAt && !note.isArchived;
 }
 
 function matchesTagFilter(note: NoteItem, selectedTagIds: string[]): boolean {

@@ -20,9 +20,13 @@ export type NoteApiItem = {
 	storageType: "d1" | "r2";
 	bodyText: string | null;
 	excerpt: string;
+	isArchived: boolean;
+	deletedAt: string | null;
 	updatedAt: string;
 	tags: TagApiItem[];
 };
+
+export type NoteStatus = "active" | "archived" | "deleted" | "all";
 
 export type NoteLinkApiItem = {
 	noteId: string;
@@ -45,7 +49,10 @@ type ListNotesOptions = {
 	tagIds?: string[];
 	tagMode?: "any" | "all";
 	keyword?: string;
-	includeArchived?: boolean;
+	status?: NoteStatus;
+};
+type ListTagsOptions = {
+	status?: NoteStatus;
 };
 
 type UpdateNoteInput = {
@@ -135,8 +142,13 @@ export async function updateFolder(folderId: string, input: UpdateFolderInput): 
 	return folder;
 }
 
-export async function listTags(): Promise<TagApiItem[]> {
-	const data = await requestApiData<unknown>("/api/tags");
+export async function listTags(options: ListTagsOptions = {}): Promise<TagApiItem[]> {
+	const query = new URLSearchParams();
+	if (options.status) {
+		query.set("status", options.status);
+	}
+	const suffix = query.toString();
+	const data = await requestApiData<unknown>(`/api/tags${suffix ? `?${suffix}` : ""}`);
 	if (!Array.isArray(data)) {
 		throw new Error("Invalid tags response");
 	}
@@ -163,8 +175,8 @@ export async function listNotes(options: ListNotesOptions = {}): Promise<NoteApi
 	if (options.keyword?.trim()) {
 		query.set("q", options.keyword.trim());
 	}
-	if (typeof options.includeArchived === "boolean") {
-		query.set("includeArchived", options.includeArchived ? "1" : "0");
+	if (options.status) {
+		query.set("status", options.status);
 	}
 
 	const data = await requestApiData<unknown>(`/api/notes?${query.toString()}`);
@@ -212,8 +224,45 @@ export async function deleteNote(noteId: string): Promise<void> {
 	});
 }
 
-export async function getNoteLinks(noteId: string): Promise<NoteLinksApiItem> {
-	const data = await requestApiData<unknown>(`/api/notes/${encodeURIComponent(noteId)}/links`);
+export async function archiveNote(noteId: string, archived?: boolean): Promise<NoteApiItem> {
+	const body = typeof archived === "boolean" ? { archived } : {};
+	const data = await requestApiData<unknown>(`/api/notes/${encodeURIComponent(noteId)}/archive`, {
+		method: "PATCH",
+		body: JSON.stringify(body),
+	});
+	const note = toNoteApiItem(data);
+	if (!note) {
+		throw new Error("Invalid archive note response");
+	}
+	return note;
+}
+
+export async function restoreNote(noteId: string): Promise<NoteApiItem> {
+	const data = await requestApiData<unknown>(`/api/notes/${encodeURIComponent(noteId)}/restore`, {
+		method: "PATCH",
+	});
+	const note = toNoteApiItem(data);
+	if (!note) {
+		throw new Error("Invalid restore note response");
+	}
+	return note;
+}
+
+export async function hardDeleteNote(noteId: string): Promise<void> {
+	await requestApiData<unknown>(`/api/notes/${encodeURIComponent(noteId)}/hard`, {
+		method: "DELETE",
+	});
+}
+
+export async function getNoteLinks(noteId: string, status?: NoteStatus): Promise<NoteLinksApiItem> {
+	const query = new URLSearchParams();
+	if (status) {
+		query.set("status", status);
+	}
+	const suffix = query.toString();
+	const data = await requestApiData<unknown>(
+		`/api/notes/${encodeURIComponent(noteId)}/links${suffix ? `?${suffix}` : ""}`,
+	);
 	const parsed = toNoteLinksApiItem(data);
 	if (!parsed) {
 		throw new Error("Invalid note links response");
@@ -298,8 +347,13 @@ function toNoteApiItem(value: unknown): NoteApiItem | null {
 		(value.storageType !== "d1" && value.storageType !== "r2") ||
 		(typeof value.bodyText !== "string" && value.bodyText !== null) ||
 		typeof value.excerpt !== "string" ||
+		(typeof value.deletedAt !== "string" && value.deletedAt !== null) ||
 		typeof value.updatedAt !== "string"
 	) {
+		return null;
+	}
+	const isArchived = toBooleanLike(value.isArchived);
+	if (isArchived === null) {
 		return null;
 	}
 
@@ -317,6 +371,8 @@ function toNoteApiItem(value: unknown): NoteApiItem | null {
 		storageType: value.storageType,
 		bodyText: value.bodyText,
 		excerpt: value.excerpt,
+		isArchived,
+		deletedAt: value.deletedAt,
 		updatedAt: value.updatedAt,
 		tags,
 	};
@@ -369,4 +425,22 @@ function toNoteLinkApiItem(value: unknown): NoteLinkApiItem | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function toBooleanLike(value: unknown): boolean | null {
+	if (typeof value === "boolean") {
+		return value;
+	}
+	if (typeof value === "number") {
+		return value === 1;
+	}
+	if (typeof value === "string") {
+		if (value === "1" || value.toLowerCase() === "true") {
+			return true;
+		}
+		if (value === "0" || value.toLowerCase() === "false") {
+			return false;
+		}
+	}
+	return null;
 }

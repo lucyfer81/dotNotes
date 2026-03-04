@@ -4,6 +4,7 @@ import { createRequestHandler } from "react-router";
 
 type AppContext = Context<{ Bindings: Env }>;
 type TagMode = "any" | "all";
+type NoteStatusFilter = "active" | "archived" | "deleted" | "all";
 
 type FolderRow = {
 	id: string;
@@ -238,6 +239,8 @@ app.patch("/api/folders/:id", async (c) => {
 });
 
 app.get("/api/tags", async (c) => {
+	const status = normalizeNoteStatus(c.req.query("status"), c.req.query("includeArchived"));
+	const noteStatusWhere = buildNoteStatusWhere("n", status);
 	const sql = `
 		SELECT
 			t.id,
@@ -249,8 +252,7 @@ app.get("/api/tags", async (c) => {
 		LEFT JOIN note_tags nt ON nt.tag_id = t.id
 		LEFT JOIN notes n
 			ON n.id = nt.note_id
-			AND n.deleted_at IS NULL
-			AND n.is_archived = 0
+			AND ${noteStatusWhere}
 		GROUP BY t.id
 		HAVING COUNT(n.id) > 0
 		ORDER BY t.name ASC
@@ -348,16 +350,14 @@ app.get("/api/notes", async (c) => {
 	const tagIds = parseCsv(c.req.query("tagIds"));
 	const tagMode = normalizeTagMode(c.req.query("tagMode"));
 	const keyword = (c.req.query("q") ?? "").trim();
-	const includeArchived = parseBoolean(c.req.query("includeArchived"));
+	const status = normalizeNoteStatus(c.req.query("status"), c.req.query("includeArchived"));
 	const limit = clampInt(c.req.query("limit"), 20, 1, 100);
 	const offset = clampInt(c.req.query("offset"), 0, 0, 10000);
 
-	const where: string[] = ["n.deleted_at IS NULL"];
+	const where: string[] = [];
 	const params: Array<string | number> = [];
 
-	if (!includeArchived) {
-		where.push("n.is_archived = 0");
-	}
+	where.push(buildNoteStatusWhere("n", status));
 	if (folderId) {
 		where.push("n.folder_id = ?");
 		params.push(folderId);
@@ -409,8 +409,11 @@ app.get("/api/notes", async (c) => {
 			n.created_at AS createdAt,
 			n.updated_at AS updatedAt
 		FROM notes n
-		WHERE ${where.join(" AND ")}
-		ORDER BY n.is_pinned DESC, n.updated_at DESC
+		${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
+		ORDER BY
+			CASE WHEN n.deleted_at IS NULL THEN 0 ELSE 1 END ASC,
+			n.is_pinned DESC,
+			COALESCE(n.deleted_at, n.updated_at) DESC
 		LIMIT ? OFFSET ?
 	`;
 	params.push(limit, offset);
@@ -426,7 +429,7 @@ app.get("/api/notes", async (c) => {
 			tags: tagsByNote.get(note.id) ?? [],
 		})),
 		paging: { limit, offset, count: notes.length },
-		filters: { folderId, tagIds, tagMode, keyword, includeArchived },
+		filters: { folderId, tagIds, tagMode, keyword, status },
 	});
 });
 
@@ -442,23 +445,34 @@ app.get("/api/notes/:id", async (c) => {
 
 app.get("/api/notes/:id/links", async (c) => {
 	const noteId = c.req.param("id");
+	const statusParam = c.req.query("status");
+	const status = normalizeNoteStatus(statusParam, c.req.query("includeArchived"));
 	const note = await getNoteById(c.env.DB, noteId);
-	if (!note || note.deletedAt) {
+	if (!note) {
 		return jsonError(c, 404, "Note not found");
 	}
+	if (!statusParam && note.deletedAt) {
+		return jsonError(c, 404, "Note not found");
+	}
+	if (statusParam && !matchesNoteStatus(note, status)) {
+		return jsonError(c, 404, "Note not found");
+	}
+	const linkNoteWhere = statusParam
+		? buildNoteStatusWhere("n", status)
+		: "n.deleted_at IS NULL";
 
 	const { results: outbound } = await c.env.DB.prepare(
 		`SELECT
 			nl.target_note_id AS noteId,
 			n.slug,
 			n.title,
-			n.updated_at AS updatedAt,
+			COALESCE(n.deleted_at, n.updated_at) AS updatedAt,
 			nl.anchor_text AS anchorText
 		 FROM note_links nl
 		 JOIN notes n ON n.id = nl.target_note_id
 		 WHERE nl.source_note_id = ?
-		   AND n.deleted_at IS NULL
-		 ORDER BY n.updated_at DESC`,
+		   AND ${linkNoteWhere}
+		 ORDER BY COALESCE(n.deleted_at, n.updated_at) DESC`,
 	)
 		.bind(noteId)
 		.all();
@@ -468,13 +482,13 @@ app.get("/api/notes/:id/links", async (c) => {
 			nl.source_note_id AS noteId,
 			n.slug,
 			n.title,
-			n.updated_at AS updatedAt,
+			COALESCE(n.deleted_at, n.updated_at) AS updatedAt,
 			nl.anchor_text AS anchorText
 		 FROM note_links nl
 		 JOIN notes n ON n.id = nl.source_note_id
 		 WHERE nl.target_note_id = ?
-		   AND n.deleted_at IS NULL
-		 ORDER BY n.updated_at DESC`,
+		   AND ${linkNoteWhere}
+		 ORDER BY COALESCE(n.deleted_at, n.updated_at) DESC`,
 	)
 		.bind(noteId)
 		.all();
@@ -742,7 +756,8 @@ app.delete("/api/notes/:id", async (c) => {
 	const noteId = c.req.param("id");
 	const result = await c.env.DB.prepare(
 		`UPDATE notes
-		 SET deleted_at = CURRENT_TIMESTAMP
+		 SET deleted_at = CURRENT_TIMESTAMP,
+			 is_archived = 0
 		 WHERE id = ? AND deleted_at IS NULL`,
 	)
 		.bind(noteId)
@@ -753,6 +768,75 @@ app.delete("/api/notes/:id", async (c) => {
 	}
 
 	return jsonOk(c, { id: noteId, deleted: true });
+});
+
+app.patch("/api/notes/:id/archive", async (c) => {
+	const noteId = c.req.param("id");
+	const payload = await parseObjectBody(c);
+	const existing = await getNoteById(c.env.DB, noteId);
+	if (!existing) {
+		return jsonError(c, 404, "Note not found");
+	}
+	if (existing.deletedAt) {
+		return jsonError(c, 409, "Deleted note cannot be archived");
+	}
+
+	const archived = payload && hasOwn(payload, "archived")
+		? (parseBooleanLike(payload.archived) ? 1 : 0)
+		: (existing.isArchived ? 0 : 1);
+
+	await c.env.DB.prepare(
+		`UPDATE notes
+		 SET is_archived = ?
+		 WHERE id = ? AND deleted_at IS NULL`,
+	)
+		.bind(archived, noteId)
+		.run();
+
+	const updated = await getNoteById(c.env.DB, noteId);
+	const tags = await fetchTagsForSingleNote(c.env.DB, noteId);
+	return jsonOk(c, { ...(updated as NoteRow), tags });
+});
+
+app.patch("/api/notes/:id/restore", async (c) => {
+	const noteId = c.req.param("id");
+	const existing = await getNoteById(c.env.DB, noteId);
+	if (!existing) {
+		return jsonError(c, 404, "Note not found");
+	}
+	if (!existing.deletedAt) {
+		return jsonError(c, 409, "Note is not deleted");
+	}
+
+	await c.env.DB.prepare(
+		`UPDATE notes
+		 SET deleted_at = NULL,
+			 is_archived = 0
+		 WHERE id = ?`,
+	)
+		.bind(noteId)
+		.run();
+
+	const restored = await getNoteById(c.env.DB, noteId);
+	const tags = await fetchTagsForSingleNote(c.env.DB, noteId);
+	return jsonOk(c, { ...(restored as NoteRow), tags });
+});
+
+app.delete("/api/notes/:id/hard", async (c) => {
+	const noteId = c.req.param("id");
+	const existing = await getNoteById(c.env.DB, noteId);
+	if (!existing) {
+		return jsonError(c, 404, "Note not found");
+	}
+	if (!existing.deletedAt) {
+		return jsonError(c, 409, "Only deleted notes can be permanently removed");
+	}
+
+	await c.env.DB.prepare("DELETE FROM notes WHERE id = ?")
+		.bind(noteId)
+		.run();
+
+	return jsonOk(c, { id: noteId, deleted: true, hardDeleted: true });
 });
 
 app.all("/api/*", (c) => jsonError(c, 404, "API route not found"));
@@ -918,6 +1002,45 @@ function clampInt(value: string | undefined, fallback: number, min: number, max:
 
 function normalizeTagMode(value: string | undefined): TagMode {
 	return value === "all" ? "all" : "any";
+}
+
+function normalizeNoteStatus(
+	value: string | undefined,
+	legacyIncludeArchived: string | undefined,
+): NoteStatusFilter {
+	if (value === "active" || value === "archived" || value === "deleted" || value === "all") {
+		return value;
+	}
+	if (parseBoolean(legacyIncludeArchived)) {
+		return "all";
+	}
+	return "active";
+}
+
+function buildNoteStatusWhere(alias: string, status: NoteStatusFilter): string {
+	if (status === "active") {
+		return `${alias}.deleted_at IS NULL AND ${alias}.is_archived = 0`;
+	}
+	if (status === "archived") {
+		return `${alias}.deleted_at IS NULL AND ${alias}.is_archived = 1`;
+	}
+	if (status === "deleted") {
+		return `${alias}.deleted_at IS NOT NULL`;
+	}
+	return "1 = 1";
+}
+
+function matchesNoteStatus(note: Pick<NoteRow, "isArchived" | "deletedAt">, status: NoteStatusFilter): boolean {
+	if (status === "all") {
+		return true;
+	}
+	if (status === "deleted") {
+		return note.deletedAt !== null;
+	}
+	if (status === "archived") {
+		return note.deletedAt === null && note.isArchived === 1;
+	}
+	return note.deletedAt === null && note.isArchived === 0;
 }
 
 function normalizeStorageType(value: unknown): "d1" | "r2" | null {
