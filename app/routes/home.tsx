@@ -1,8 +1,19 @@
 import { markdown } from "@codemirror/lang-markdown";
 import CodeMirror from "@uiw/react-codemirror";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import {
+	createNote,
+	deleteNote,
+	listNotes,
+	listRootFolders,
+	listTags,
+	updateNote,
+	type FolderApiItem,
+	type NoteApiItem,
+	type TagApiItem,
+} from "../lib/api";
 import type { Route } from "./+types/home";
 
 type NoteItem = {
@@ -10,18 +21,11 @@ type NoteItem = {
 	slug: string;
 	title: string;
 	updatedAt: string;
+	tagIds: string[];
 	tags: string[];
 	summary: string;
 	content: string;
 	folderId: string;
-	favorite?: boolean;
-};
-
-type FolderApiItem = {
-	id: string;
-	parentId: string | null;
-	name: string;
-	sortOrder: number;
 };
 
 type WorkspaceMode = "capture" | "organize" | "focus";
@@ -37,43 +41,6 @@ const defaultRootFolders: FolderApiItem[] = [
 	{ id: "folder-20-areas", parentId: null, name: "20-Areas", sortOrder: 20 },
 	{ id: "folder-30-resource", parentId: null, name: "30-Resource", sortOrder: 30 },
 	{ id: "folder-40-archive", parentId: null, name: "40-Archive", sortOrder: 40 },
-];
-
-const seedNotes: NoteItem[] = [
-	{
-		id: "n-001",
-		slug: toWikiSlug("今天的会议记录"),
-		title: "今天的会议记录",
-		updatedAt: "3月4日 10:10",
-		tags: ["产品", "会议"],
-		summary: "确认了 dotNotes 的双速界面：Capture 与 Focus。",
-		content:
-			"# 今天的会议记录\\n\\n- 默认要 capture-first\\n- 深度编辑进入 focus\\n- 相关：[[RAG 方案草稿]]\\n\\n## 待办\\n\\n1. 接入 D1\\n2. 接入 Vectorize\\n3. 接入 SiliconFlow",
-		folderId: "folder-10-projects",
-		favorite: true,
-	},
-	{
-		id: "n-002",
-		slug: toWikiSlug("RAG 方案草稿"),
-		title: "RAG 方案草稿",
-		updatedAt: "3月3日 22:10",
-		tags: ["AI", "架构"],
-		summary: "定义 chunk 策略、召回流程与重排策略。",
-		content:
-			"# RAG 方案草稿\\n\\n- Embedding: SiliconFlow\\n- Vector DB: Cloudflare Vectorize\\n- 参考：[[今天的会议记录]]",
-		folderId: "folder-30-resource",
-	},
-	{
-		id: "n-003",
-		slug: toWikiSlug("周报模板"),
-		title: "周报模板",
-		updatedAt: "3月1日 09:28",
-		tags: ["模板"],
-		summary: "复盘、进展、风险、下周计划四段式模板。",
-		content:
-			"# 周报模板\\n\\n## 本周进展\\n- \\n\\n## 风险与阻塞\\n- \\n\\n## 下周计划\\n- \\n",
-		folderId: "folder-20-areas",
-	},
 ];
 
 export function meta({}: Route.MetaArgs) {
@@ -92,9 +59,20 @@ export default function Home() {
 	const [organizeFolderId, setOrganizeFolderId] = useState<string | null>(null);
 	const [captureFolderId, setCaptureFolderId] = useState<string>(defaultRootFolders[0].id);
 	const [captureInput, setCaptureInput] = useState("");
-	const [noteItems, setNoteItems] = useState<NoteItem[]>(seedNotes);
-	const [activeNoteId, setActiveNoteId] = useState(seedNotes[0]?.id ?? "");
-	const [draft, setDraft] = useState(seedNotes[0]?.content ?? "");
+	const [noteItems, setNoteItems] = useState<NoteItem[]>([]);
+	const [tagItems, setTagItems] = useState<TagApiItem[]>([]);
+	const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
+	const [activeNoteId, setActiveNoteId] = useState("");
+	const [draft, setDraft] = useState("");
+	const [isCreatingNote, setIsCreatingNote] = useState(false);
+	const [isSavingDraft, setIsSavingDraft] = useState(false);
+	const [isDeletingNote, setIsDeletingNote] = useState(false);
+
+	const noteItemsRef = useRef<NoteItem[]>([]);
+	const selectedTagIdsRef = useRef<string[]>([]);
+	const saveTimerRef = useRef<number | null>(null);
+	const pendingSaveRef = useRef<{ noteId: string; content: string } | null>(null);
+	const saveInFlightRef = useRef(false);
 
 	const activeNote = useMemo(
 		() => noteItems.find((note) => note.id === activeNoteId) ?? noteItems[0] ?? null,
@@ -167,9 +145,7 @@ export default function Home() {
 	);
 
 	useEffect(() => {
-		if (activeNote) {
-			setDraft(activeNote.content);
-		}
+		setDraft(activeNote?.content ?? "");
 	}, [activeNote]);
 
 	useEffect(() => {
@@ -215,33 +191,60 @@ export default function Home() {
 	}, [editorMode]);
 
 	useEffect(() => {
+		noteItemsRef.current = noteItems;
+	}, [noteItems]);
+
+	useEffect(() => {
+		selectedTagIdsRef.current = selectedTagIds;
+	}, [selectedTagIds]);
+
+	useEffect(() => {
+		return () => {
+			if (saveTimerRef.current !== null) {
+				window.clearTimeout(saveTimerRef.current);
+			}
+		};
+	}, []);
+
+	useEffect(() => {
 		if (!folderItems.some((folder) => folder.id === captureFolderId)) {
 			setCaptureFolderId(folderItems[0]?.id ?? defaultRootFolders[0].id);
 		}
 	}, [folderItems, captureFolderId]);
 
 	useEffect(() => {
+		if (noteItems.length === 0) {
+			if (activeNoteId) {
+				setActiveNoteId("");
+			}
+			return;
+		}
+		if (!noteItems.some((note) => note.id === activeNoteId)) {
+			setActiveNoteId(noteItems[0].id);
+		}
+	}, [noteItems, activeNoteId]);
+
+	const refreshTags = async () => {
+		const tags = await listTags().catch(() => null);
+		if (!tags) {
+			return;
+		}
+		const validTagIds = new Set(tags.map((tag) => tag.id));
+		setTagItems(tags);
+		setSelectedTagIds((prev) => {
+			const next = prev.filter((id) => validTagIds.has(id));
+			return next.length === prev.length ? prev : next;
+		});
+	};
+
+	useEffect(() => {
 		let cancelled = false;
 		const loadFolders = async () => {
-			const response = await fetch("/api/folders", {
-				headers: { Accept: "application/json" },
-			}).catch(() => null);
-			if (!response?.ok) {
+			const roots = await listRootFolders().catch(() => null);
+			if (!roots || cancelled || roots.length === 0) {
 				return;
 			}
-			const payload = await response.json().catch(() => null);
-			if (!isRecord(payload) || payload.ok !== true || !Array.isArray(payload.data)) {
-				return;
-			}
-
-			const roots = payload.data
-				.filter((item): item is FolderApiItem => isFolderApiItem(item))
-				.filter((item) => !item.parentId)
-				.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name, "zh-CN"));
-
-			if (!cancelled && roots.length > 0) {
-				setFolderItems(roots);
-			}
+			setFolderItems(roots);
 		};
 
 		void loadFolders();
@@ -250,8 +253,119 @@ export default function Home() {
 		};
 	}, []);
 
+	useEffect(() => {
+		let cancelled = false;
+		const loadTags = async () => {
+			const tags = await listTags().catch(() => null);
+			if (!tags || cancelled) {
+				return;
+			}
+			const validTagIds = new Set(tags.map((tag) => tag.id));
+			setTagItems(tags);
+			setSelectedTagIds((prev) => {
+				const next = prev.filter((id) => validTagIds.has(id));
+				return next.length === prev.length ? prev : next;
+			});
+		};
+
+		void loadTags();
+		return () => {
+			cancelled = true;
+		};
+	}, []);
+
+	useEffect(() => {
+		let cancelled = false;
+		const loadNotes = async () => {
+			const notes = await listNotes({
+				limit: 100,
+				tagIds: selectedTagIds,
+				tagMode: "any",
+			}).catch(() => null);
+			if (!notes || cancelled) {
+				return;
+			}
+			const next = notes.map((note) => toNoteItem(note));
+			setNoteItems(next);
+			setActiveNoteId((prev) => {
+				if (next.some((note) => note.id === prev)) {
+					return prev;
+				}
+				return next[0]?.id ?? "";
+			});
+		};
+
+		void loadNotes();
+		return () => {
+			cancelled = true;
+		};
+	}, [selectedTagIds]);
+
+	const flushPendingSave = async () => {
+		if (saveInFlightRef.current) {
+			return;
+		}
+		const pending = pendingSaveRef.current;
+		if (!pending) {
+			setIsSavingDraft(false);
+			return;
+		}
+
+		pendingSaveRef.current = null;
+		saveInFlightRef.current = true;
+		const source = noteItemsRef.current.find((note) => note.id === pending.noteId);
+
+		try {
+			if (!source) {
+				return;
+			}
+			const updated = await updateNote(pending.noteId, {
+				title: source.title,
+				folderId: source.folderId,
+				bodyText: pending.content,
+				excerpt: buildSummary(pending.content),
+				tagNames: extractHashTags(pending.content),
+			});
+			void refreshTags();
+			const next = toNoteItem(updated);
+			setNoteItems((prev) => {
+				const updatedList = prev.map((note) => (note.id === next.id ? { ...note, ...next } : note));
+				const currentTagFilter = selectedTagIdsRef.current;
+				if (currentTagFilter.length === 0 || matchesTagFilter(next, currentTagFilter)) {
+					return updatedList;
+				}
+				return updatedList.filter((note) => note.id !== next.id);
+			});
+		} catch (error) {
+			console.error("Failed to auto-save note", error);
+		} finally {
+			saveInFlightRef.current = false;
+			if (pendingSaveRef.current) {
+				void flushPendingSave();
+			} else {
+				setIsSavingDraft(false);
+			}
+		}
+	};
+
+	const scheduleAutoSave = (noteId: string, content: string) => {
+		pendingSaveRef.current = { noteId, content };
+		setIsSavingDraft(true);
+
+		if (saveTimerRef.current !== null) {
+			window.clearTimeout(saveTimerRef.current);
+		}
+		saveTimerRef.current = window.setTimeout(() => {
+			saveTimerRef.current = null;
+			void flushPendingSave();
+		}, 700);
+	};
+
 	const handleDraftChange = (value: string) => {
 		setDraft(value);
+		if (!activeNoteId) {
+			return;
+		}
 		setNoteItems((prev) =>
 			prev.map((note) =>
 				note.id === activeNoteId
@@ -263,29 +377,48 @@ export default function Home() {
 					: note,
 			),
 		);
+		scheduleAutoSave(activeNoteId, value);
 	};
 
-	const handleCaptureSend = () => {
+	const handleCaptureSend = async () => {
 		const content = captureInput.trim();
-		if (!content) {
+		if (!content || isCreatingNote) {
 			return;
 		}
-		const title = buildTitle(content);
-		const slug = ensureUniqueLocalSlug(toWikiSlug(title), noteItems);
-		const newNote: NoteItem = {
-			id: crypto.randomUUID(),
-			slug,
-			title,
-			updatedAt: formatNow(),
-			tags: extractHashTags(content),
-			summary: buildSummary(content),
-			content,
-			folderId: captureFolderId,
-		};
-		setNoteItems((prev) => [newNote, ...prev]);
-		setActiveNoteId(newNote.id);
-		setDraft(newNote.content);
-		setCaptureInput("");
+		setIsCreatingNote(true);
+		try {
+			const created = await createNote({
+				title: buildTitle(content),
+				folderId: captureFolderId,
+				bodyText: content,
+				tagNames: extractHashTags(content),
+			});
+			void refreshTags();
+			const next = toNoteItem(created);
+			const currentTagFilter = selectedTagIdsRef.current;
+			if (currentTagFilter.length === 0 || matchesTagFilter(next, currentTagFilter)) {
+				setNoteItems((prev) => [next, ...prev.filter((note) => note.id !== next.id)]);
+				setActiveNoteId(next.id);
+				setDraft(next.content);
+			}
+			setCaptureInput("");
+		} catch (error) {
+			console.error("Failed to create note", error);
+		} finally {
+			setIsCreatingNote(false);
+		}
+	};
+
+	const toggleTagFilter = (tagId: string) => {
+		setSelectedTagIds((prev) =>
+			prev.includes(tagId)
+				? prev.filter((id) => id !== tagId)
+				: [...prev, tagId],
+		);
+	};
+
+	const clearTagFilters = () => {
+		setSelectedTagIds([]);
 	};
 
 	const focusNote = (noteId: string) => {
@@ -293,7 +426,54 @@ export default function Home() {
 		setWorkspaceMode("focus");
 	};
 
+	const handleDeleteActiveNote = async () => {
+		if (!activeNote || isDeletingNote) {
+			return;
+		}
+		if (typeof window !== "undefined") {
+			const confirmed = window.confirm(`确定删除「${activeNote.title}」吗？`);
+			if (!confirmed) {
+				return;
+			}
+		}
+
+		const deletingId = activeNote.id;
+		if (saveTimerRef.current !== null) {
+			window.clearTimeout(saveTimerRef.current);
+			saveTimerRef.current = null;
+		}
+		if (pendingSaveRef.current?.noteId === deletingId) {
+			pendingSaveRef.current = null;
+			setIsSavingDraft(false);
+		}
+
+		setIsDeletingNote(true);
+		try {
+			await deleteNote(deletingId);
+			const previous = noteItemsRef.current;
+			const removedIndex = previous.findIndex((note) => note.id === deletingId);
+			const next = previous.filter((note) => note.id !== deletingId);
+			const fallbackId = removedIndex >= 0
+				? (next[removedIndex]?.id ?? next[removedIndex - 1]?.id ?? next[0]?.id ?? "")
+				: (next[0]?.id ?? "");
+
+			setNoteItems(next);
+			setActiveNoteId(fallbackId);
+			if (!fallbackId) {
+				setDraft("");
+				setWorkspaceMode("organize");
+			}
+			await refreshTags();
+		} catch (error) {
+			console.error("Failed to delete note", error);
+		} finally {
+			setIsDeletingNote(false);
+		}
+	};
+
 	const activeFolderName = folderItems.find((folder) => folder.id === captureFolderId)?.name ?? "00-Inbox";
+	const saveStateText = isSavingDraft ? "自动保存中..." : "已保存";
+	const hasTagFilters = selectedTagIds.length > 0;
 
 	return (
 		<div className="min-h-screen bg-[#f4f6f8] text-slate-900">
@@ -354,9 +534,12 @@ export default function Home() {
 									</select>
 									<button
 										onClick={handleCaptureSend}
-										className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700"
+										disabled={isCreatingNote}
+										className={`rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 ${
+											isCreatingNote ? "cursor-not-allowed opacity-60" : ""
+										}`}
 									>
-										发送
+										{isCreatingNote ? "发送中..." : "发送"}
 									</button>
 								</div>
 							</section>
@@ -371,7 +554,7 @@ export default function Home() {
 										>
 											<div className="mb-1 flex items-center justify-between">
 												<p className="text-sm font-medium text-slate-900">{note.title}</p>
-												<span className="text-xs text-slate-500">{note.updatedAt}</span>
+												<span className="text-xs text-slate-500">{formatUpdatedAt(note.updatedAt)}</span>
 											</div>
 											<p className="line-clamp-2 text-xs text-slate-600">{note.summary}</p>
 										</button>
@@ -384,8 +567,44 @@ export default function Home() {
 					{workspaceMode === "organize" ? (
 						<div className="grid h-full grid-cols-[260px_minmax(0,1fr)] gap-4">
 							<aside className="flex min-h-0 flex-col rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+								<div className="mb-4">
+									<div className="mb-2 flex items-center justify-between">
+										<p className="text-xs font-semibold uppercase tracking-wide text-slate-500">标签</p>
+										<button
+											type="button"
+											onClick={clearTagFilters}
+											disabled={!hasTagFilters}
+											className={`text-xs ${
+												hasTagFilters ? "text-slate-600 hover:text-slate-900" : "text-slate-300"
+											}`}
+										>
+											清空
+										</button>
+									</div>
+									<div className="max-h-28 space-y-1 overflow-y-auto pr-1">
+										{tagItems.length === 0 ? (
+											<p className="px-2 py-1 text-xs text-slate-400">暂无标签</p>
+										) : (
+											tagItems.map((tag) => {
+												const active = selectedTagIds.includes(tag.id);
+												return (
+													<button
+														key={tag.id}
+														type="button"
+														onClick={() => toggleTagFilter(tag.id)}
+														className={`w-full rounded-lg px-2 py-2 text-left text-sm ${
+															active ? "bg-slate-900 text-white" : "text-slate-700 hover:bg-slate-100"
+														}`}
+													>
+														#{tag.name}
+													</button>
+												);
+											})
+										)}
+									</div>
+								</div>
 								<p className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-500">目录</p>
-								<div className="space-y-1 overflow-y-auto">
+								<div className="min-h-0 flex-1 space-y-1 overflow-y-auto">
 									<button
 										onClick={() => setOrganizeFolderId(null)}
 										className={`w-full rounded-lg px-2 py-2 text-left text-sm ${
@@ -423,7 +642,7 @@ export default function Home() {
 											className="w-full rounded-xl border border-slate-200 px-3 py-3 text-left hover:border-slate-300 hover:bg-slate-50"
 										>
 											<p className="text-sm font-medium text-slate-900">{note.title}</p>
-											<p className="mt-1 text-xs text-slate-500">{note.updatedAt}</p>
+											<p className="mt-1 text-xs text-slate-500">{formatUpdatedAt(note.updatedAt)}</p>
 											<p className="mt-1 line-clamp-2 text-xs text-slate-600">{note.summary}</p>
 										</button>
 									))}
@@ -438,17 +657,33 @@ export default function Home() {
 								<div className="flex items-center justify-between gap-3">
 									<div>
 										<p className="text-lg font-semibold tracking-tight">{activeNote?.title ?? "未选择笔记"}</p>
-										<p className="mt-1 text-xs text-slate-500">{activeNote?.updatedAt ?? ""} · 自动保存中...</p>
+										<p className="mt-1 text-xs text-slate-500">
+											{activeNote?.updatedAt ? formatUpdatedAt(activeNote.updatedAt) : ""} · {saveStateText}
+										</p>
 									</div>
-									<div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1">
-										<ModeButton label="编辑" active={effectiveEditorMode === "edit"} onClick={() => setEditorMode("edit")} />
-										<ModeButton label="预览" active={effectiveEditorMode === "preview"} onClick={() => setEditorMode("preview")} />
-										<ModeButton
-											label="分屏"
-											active={effectiveEditorMode === "split"}
-											disabled={!canUseSplit}
-											onClick={() => setEditorMode("split")}
-										/>
+									<div className="flex items-center gap-2">
+										<div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1">
+											<ModeButton label="编辑" active={effectiveEditorMode === "edit"} onClick={() => setEditorMode("edit")} />
+											<ModeButton label="预览" active={effectiveEditorMode === "preview"} onClick={() => setEditorMode("preview")} />
+											<ModeButton
+												label="分屏"
+												active={effectiveEditorMode === "split"}
+												disabled={!canUseSplit}
+												onClick={() => setEditorMode("split")}
+											/>
+										</div>
+										<button
+											type="button"
+											onClick={handleDeleteActiveNote}
+											disabled={!activeNote || isDeletingNote}
+											className={`rounded-lg border px-3 py-2 text-xs font-medium ${
+												!activeNote || isDeletingNote
+													? "cursor-not-allowed border-slate-200 text-slate-300"
+													: "border-rose-200 text-rose-600 hover:bg-rose-50"
+											}`}
+										>
+											{isDeletingNote ? "删除中..." : "删除"}
+										</button>
 									</div>
 								</div>
 								<div className="mt-2 flex flex-wrap gap-2">
@@ -540,9 +775,12 @@ export default function Home() {
 									</select>
 									<button
 										onClick={handleCaptureSend}
-										className="rounded-xl bg-slate-900 px-3 py-2 text-sm font-medium text-white"
+										disabled={isCreatingNote}
+										className={`rounded-xl bg-slate-900 px-3 py-2 text-sm font-medium text-white ${
+											isCreatingNote ? "cursor-not-allowed opacity-60" : ""
+										}`}
 									>
-										发送
+										{isCreatingNote ? "发送中..." : "发送"}
 									</button>
 								</div>
 							</section>
@@ -556,7 +794,7 @@ export default function Home() {
 											className="w-full rounded-xl border border-slate-200 px-3 py-3 text-left"
 										>
 											<p className="text-sm font-medium">{note.title}</p>
-											<p className="mt-1 text-xs text-slate-500">{note.updatedAt}</p>
+											<p className="mt-1 text-xs text-slate-500">{formatUpdatedAt(note.updatedAt)}</p>
 										</button>
 									))}
 								</div>
@@ -590,6 +828,43 @@ export default function Home() {
 								</div>
 							</section>
 
+							<section className="overflow-x-auto rounded-2xl border border-slate-200 bg-white p-2 shadow-sm">
+								<div className="mb-2 flex items-center justify-between px-1">
+									<p className="text-xs font-semibold uppercase tracking-wide text-slate-500">标签</p>
+									<button
+										type="button"
+										onClick={clearTagFilters}
+										disabled={!hasTagFilters}
+										className={`text-xs ${
+											hasTagFilters ? "text-slate-600" : "text-slate-300"
+										}`}
+									>
+										清空
+									</button>
+								</div>
+								<div className="flex gap-2">
+									{tagItems.length === 0 ? (
+										<span className="px-2 py-2 text-xs text-slate-400">暂无标签</span>
+									) : (
+										tagItems.map((tag) => {
+											const active = selectedTagIds.includes(tag.id);
+											return (
+												<button
+													key={tag.id}
+													type="button"
+													onClick={() => toggleTagFilter(tag.id)}
+													className={`shrink-0 rounded-lg px-3 py-2 text-xs ${
+														active ? "bg-slate-900 text-white" : "bg-slate-100 text-slate-600"
+													}`}
+												>
+													#{tag.name}
+												</button>
+											);
+										})
+									)}
+								</div>
+							</section>
+
 							<section className="max-h-[62dvh] overflow-y-auto rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
 								<div className="space-y-2">
 									{organizeNotes.map((note) => (
@@ -599,7 +874,7 @@ export default function Home() {
 											className="w-full rounded-xl border border-slate-200 px-3 py-3 text-left"
 										>
 											<p className="text-sm font-medium">{note.title}</p>
-											<p className="mt-1 text-xs text-slate-500">{note.updatedAt}</p>
+											<p className="mt-1 text-xs text-slate-500">{formatUpdatedAt(note.updatedAt)}</p>
 											<p className="mt-1 line-clamp-2 text-xs text-slate-600">{note.summary}</p>
 										</button>
 									))}
@@ -610,11 +885,25 @@ export default function Home() {
 
 					{workspaceMode === "focus" ? (
 						<section className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
-							<div className="mb-2 flex items-center justify-between">
+							<div className="mb-2 flex items-center justify-between gap-2">
 								<p className="text-sm font-semibold">{activeNote?.title ?? "未选择笔记"}</p>
-								<div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1">
-									<ModeButton label="编辑" active={mobileEditorMode === "edit"} onClick={() => setEditorMode("edit")} />
-									<ModeButton label="预览" active={mobileEditorMode === "preview"} onClick={() => setEditorMode("preview")} />
+								<div className="flex items-center gap-2">
+									<div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1">
+										<ModeButton label="编辑" active={mobileEditorMode === "edit"} onClick={() => setEditorMode("edit")} />
+										<ModeButton label="预览" active={mobileEditorMode === "preview"} onClick={() => setEditorMode("preview")} />
+									</div>
+									<button
+										type="button"
+										onClick={handleDeleteActiveNote}
+										disabled={!activeNote || isDeletingNote}
+										className={`rounded-lg border px-2 py-1 text-xs ${
+											!activeNote || isDeletingNote
+												? "cursor-not-allowed border-slate-200 text-slate-300"
+												: "border-rose-200 text-rose-600"
+										}`}
+									>
+										{isDeletingNote ? "删除中" : "删除"}
+									</button>
 								</div>
 							</div>
 							{mobileEditorMode === "edit" ? (
@@ -753,20 +1042,27 @@ function AiPanel() {
 	);
 }
 
-function isFolderApiItem(value: unknown): value is FolderApiItem {
-	if (!isRecord(value)) {
-		return false;
-	}
-	return (
-		typeof value.id === "string" &&
-		typeof value.name === "string" &&
-		(typeof value.parentId === "string" || value.parentId === null) &&
-		typeof value.sortOrder === "number"
-	);
+function toNoteItem(note: NoteApiItem): NoteItem {
+	const content = note.bodyText ?? "";
+	return {
+		id: note.id,
+		slug: note.slug,
+		title: note.title,
+		updatedAt: note.updatedAt,
+		tagIds: note.tags.map((tag) => tag.id),
+		tags: note.tags.map((tag) => tag.name),
+		summary: note.excerpt || buildSummary(content),
+		content,
+		folderId: note.folderId,
+	};
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
+function matchesTagFilter(note: NoteItem, selectedTagIds: string[]): boolean {
+	if (selectedTagIds.length === 0) {
+		return true;
+	}
+	const idSet = new Set(note.tagIds);
+	return selectedTagIds.some((tagId) => idSet.has(tagId));
 }
 
 function toMarkdownWithWikiLinks(content: string): string {
@@ -809,18 +1105,6 @@ function buildTitle(content: string): string {
 	return firstLine.length > 32 ? `${firstLine.slice(0, 32)}...` : firstLine;
 }
 
-function ensureUniqueLocalSlug(slug: string, notes: NoteItem[]): string {
-	const existing = new Set(notes.map((note) => note.slug));
-	if (!existing.has(slug)) {
-		return slug;
-	}
-	let index = 1;
-	while (existing.has(`${slug}-${index}`)) {
-		index += 1;
-	}
-	return `${slug}-${index}`;
-}
-
 function extractHashTags(content: string): string[] {
 	const tags = new Set<string>();
 	for (const match of content.matchAll(/#([^\s#]+)/g)) {
@@ -832,11 +1116,14 @@ function extractHashTags(content: string): string[] {
 	return [...tags].slice(0, 6);
 }
 
-function formatNow(): string {
-	const now = new Date();
-	const month = now.getMonth() + 1;
-	const day = now.getDate();
-	const hours = String(now.getHours()).padStart(2, "0");
-	const minutes = String(now.getMinutes()).padStart(2, "0");
+function formatUpdatedAt(value: string): string {
+	const date = new Date(value);
+	if (Number.isNaN(date.getTime())) {
+		return value;
+	}
+	const month = date.getMonth() + 1;
+	const day = date.getDate();
+	const hours = String(date.getHours()).padStart(2, "0");
+	const minutes = String(date.getMinutes()).padStart(2, "0");
 	return `${month}月${day}日 ${hours}:${minutes}`;
 }

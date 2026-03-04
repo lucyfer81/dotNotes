@@ -244,7 +244,7 @@ app.get("/api/tags", async (c) => {
 			t.name,
 			t.color,
 			t.created_at AS createdAt,
-			COUNT(nt.note_id) AS noteCount
+			COUNT(n.id) AS noteCount
 		FROM tags t
 		LEFT JOIN note_tags nt ON nt.tag_id = t.id
 		LEFT JOIN notes n
@@ -252,6 +252,7 @@ app.get("/api/tags", async (c) => {
 			AND n.deleted_at IS NULL
 			AND n.is_archived = 0
 		GROUP BY t.id
+		HAVING COUNT(n.id) > 0
 		ORDER BY t.name ASC
 	`;
 	const { results } = await c.env.DB.prepare(sql).all<TagRow>();
