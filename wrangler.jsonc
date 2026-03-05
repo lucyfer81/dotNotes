@@ -13,7 +13,15 @@
 	"main": "./workers/app.ts",
 	"vars": {
 		"VALUE_FROM_CLOUDFLARE": "Hello from Hono/CF",
-		"BODY_R2_THRESHOLD_BYTES": "65536"
+		"BODY_R2_THRESHOLD_BYTES": "65536",
+		"INDEX_CHUNK_MAX_CHARS": "900",
+		"INDEX_CHUNK_OVERLAP_CHARS": "120",
+		"INDEX_RETRY_MAX_ATTEMPTS": "5",
+		"INDEX_RETRY_BACKOFF_SECONDS": "30",
+		"INDEX_VECTOR_DIMENSIONS": "64",
+		"INDEX_EMBEDDING_MODEL": "hash-v1",
+		"TAG_NAME_MAX_LENGTH": "48",
+		"TAG_PER_NOTE_LIMIT": "12"
 	},
 	"d1_databases": [
 		{
@@ -26,6 +34,12 @@
 		{
 			"binding": "NOTES_BUCKET",
 			"bucket_name": "dotnotes-assets"
+		}
+	],
+	"vectorize": [
+		{
+			"binding": "NOTES_VECTOR_INDEX",
+			"index_name": "dotnotes-note-index"
 		}
 	],
 	"observability": {

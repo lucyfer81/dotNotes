@@ -134,6 +134,19 @@ CREATE TABLE IF NOT EXISTS note_chunks (
 	UNIQUE (note_id, chunk_index)
 );
 
+CREATE TABLE IF NOT EXISTS note_index_jobs (
+	note_id TEXT PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE,
+	action TEXT NOT NULL DEFAULT 'upsert' CHECK (action IN ('upsert', 'delete')),
+	status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'success', 'failed')),
+	attempt_count INTEGER NOT NULL DEFAULT 0,
+	chunk_count INTEGER NOT NULL DEFAULT 0,
+	last_error TEXT,
+	next_retry_at TEXT,
+	last_indexed_at TEXT,
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_notes_folder_updated
 	ON notes(folder_id, updated_at DESC)
 	WHERE deleted_at IS NULL AND is_archived = 0;
@@ -145,6 +158,8 @@ CREATE INDEX IF NOT EXISTS idx_note_links_target ON note_links(target_note_id);
 CREATE INDEX IF NOT EXISTS idx_note_links_source ON note_links(source_note_id);
 CREATE INDEX IF NOT EXISTS idx_assets_note ON assets(note_id);
 CREATE INDEX IF NOT EXISTS idx_note_chunks_note ON note_chunks(note_id, chunk_index);
+CREATE INDEX IF NOT EXISTS idx_note_index_jobs_status_retry
+	ON note_index_jobs(status, next_retry_at, updated_at);
 
 CREATE TRIGGER IF NOT EXISTS trg_folders_updated_at
 AFTER UPDATE ON folders
@@ -160,6 +175,14 @@ FOR EACH ROW
 WHEN NEW.updated_at = OLD.updated_at
 BEGIN
 	UPDATE notes SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_note_index_jobs_updated_at
+AFTER UPDATE ON note_index_jobs
+FOR EACH ROW
+WHEN NEW.updated_at = OLD.updated_at
+BEGIN
+	UPDATE note_index_jobs SET updated_at = CURRENT_TIMESTAMP WHERE note_id = OLD.note_id;
 END;
 
 CREATE VIEW IF NOT EXISTS note_backlinks AS

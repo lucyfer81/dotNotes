@@ -20,6 +20,7 @@ export type NoteApiItem = {
 	storageType: "d1" | "r2";
 	bodyText: string | null;
 	excerpt: string;
+	searchScore: number | null;
 	isArchived: boolean;
 	deletedAt: string | null;
 	updatedAt: string;
@@ -63,6 +64,10 @@ type ListNotesOptions = {
 };
 type ListTagsOptions = {
 	status?: NoteStatus;
+};
+type CleanupTagsOptions = {
+	dryRun?: boolean;
+	limit?: number;
 };
 
 type UpdateNoteInput = {
@@ -165,6 +170,49 @@ export async function listTags(options: ListTagsOptions = {}): Promise<TagApiIte
 	return data
 		.map((item) => toTagApiItem(item))
 		.filter((item): item is TagApiItem => item !== null);
+}
+
+export async function mergeTags(sourceTagId: string, targetTagId: string): Promise<{
+	sourceTagId: string;
+	targetTagId: string;
+	movedNoteCount: number;
+}> {
+	return requestApiData<{
+		sourceTagId: string;
+		targetTagId: string;
+		movedNoteCount: number;
+	}>("/api/tags/merge", {
+		method: "POST",
+		body: JSON.stringify({ sourceTagId, targetTagId }),
+	});
+}
+
+export async function deleteTag(tagId: string, targetTagId?: string): Promise<void> {
+	const suffix = targetTagId
+		? `?targetTagId=${encodeURIComponent(targetTagId)}`
+		: "";
+	await requestApiData<unknown>(`/api/tags/${encodeURIComponent(tagId)}${suffix}`, {
+		method: "DELETE",
+	});
+}
+
+export async function cleanupTags(options: CleanupTagsOptions = {}): Promise<{
+	dryRun: boolean;
+	orphaned: number;
+	deleted: number;
+}> {
+	const data = await requestApiData<{
+		dryRun: boolean;
+		orphaned: number;
+		deleted: number;
+	}>("/api/tags/cleanup", {
+		method: "POST",
+		body: JSON.stringify({
+			dryRun: options.dryRun ?? true,
+			limit: options.limit,
+		}),
+	});
+	return data;
 }
 
 export async function listNotes(options: ListNotesOptions = {}): Promise<NoteApiItem[]> {
@@ -395,6 +443,7 @@ function toNoteApiItem(value: unknown): NoteApiItem | null {
 		(value.storageType !== "d1" && value.storageType !== "r2") ||
 		(typeof value.bodyText !== "string" && value.bodyText !== null) ||
 		typeof value.excerpt !== "string" ||
+		(typeof value.searchScore !== "number" && value.searchScore !== null) ||
 		(typeof value.deletedAt !== "string" && value.deletedAt !== null) ||
 		typeof value.updatedAt !== "string"
 	) {
@@ -419,6 +468,7 @@ function toNoteApiItem(value: unknown): NoteApiItem | null {
 		storageType: value.storageType,
 		bodyText: value.bodyText,
 		excerpt: value.excerpt,
+		searchScore: value.searchScore,
 		isArchived,
 		deletedAt: value.deletedAt,
 		updatedAt: value.updatedAt,

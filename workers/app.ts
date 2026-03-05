@@ -41,6 +41,7 @@ type NoteRow = {
 	deletedAt: string | null;
 	createdAt: string;
 	updatedAt: string;
+	searchScore: number | null;
 };
 type NoteSearchMode = "none" | "fts" | "like-fallback";
 type ListNotesQueryInput = {
@@ -72,11 +73,51 @@ type NoteBodyStorageResult = {
 	sizeBytes: number;
 	wordCount: number;
 };
+type NoteChunkRow = {
+	id: string;
+	noteId: string;
+	chunkIndex: number;
+	chunkText: string;
+	tokenCount: number;
+	embeddingModel: string | null;
+	vectorId: string | null;
+	createdAt: string;
+};
+type IndexAction = "upsert" | "delete";
+type IndexJobStatus = "pending" | "processing" | "success" | "failed";
+type NoteIndexJobRow = {
+	noteId: string;
+	action: IndexAction;
+	status: IndexJobStatus;
+	attemptCount: number;
+	chunkCount: number;
+	lastError: string | null;
+	nextRetryAt: string | null;
+	lastIndexedAt: string | null;
+	createdAt: string;
+	updatedAt: string;
+};
+type NoteIndexProcessResult = {
+	noteId: string;
+	action: IndexAction;
+	status: "success" | "failed";
+	chunkCount: number;
+	error: string | null;
+	attemptCount: number;
+};
 
 const LINK_PATTERN = /\[\[([^\[\]]+)\]\]/g;
 const DEFAULT_BODY_R2_THRESHOLD_BYTES = 64 * 1024;
 const NOTE_BODY_R2_PREFIX = "note-bodies";
 const ASSET_R2_PREFIX = "assets";
+const DEFAULT_INDEX_MAX_CHARS = 900;
+const DEFAULT_INDEX_OVERLAP_CHARS = 120;
+const DEFAULT_INDEX_RETRY_MAX_ATTEMPTS = 5;
+const DEFAULT_INDEX_RETRY_BACKOFF_SECONDS = 30;
+const DEFAULT_INDEX_VECTOR_DIMENSIONS = 64;
+const DEFAULT_INDEX_EMBEDDING_MODEL = "hash-v1";
+const DEFAULT_TAG_NAME_MAX_LENGTH = 48;
+const DEFAULT_TAG_PER_NOTE_LIMIT = 12;
 type PresetFolder = {
 	id: string;
 	name: string;
@@ -300,9 +341,13 @@ app.post("/api/tags", async (c) => {
 		return jsonError(c, 400, "Invalid JSON body");
 	}
 
-	const name = readRequiredString(payload, "name");
-	if (!name) {
+	const rawName = readRequiredString(payload, "name");
+	if (!rawName) {
 		return jsonError(c, 400, "`name` is required");
+	}
+	const name = normalizeTagName(rawName, getTagNameMaxLength(c.env));
+	if (!name) {
+		return jsonError(c, 400, "Tag name is invalid after normalization");
 	}
 
 	const color = readOptionalString(payload, "color") ?? "#64748b";
@@ -347,10 +392,10 @@ app.patch("/api/tags/:id", async (c) => {
 	}
 
 	const nextName = hasOwn(payload, "name")
-		? readRequiredString(payload, "name")
+		? normalizeTagName(readRequiredString(payload, "name") ?? "", getTagNameMaxLength(c.env))
 		: current.name;
 	if (!nextName) {
-		return jsonError(c, 400, "`name` cannot be empty");
+		return jsonError(c, 400, "Tag name is invalid after normalization");
 	}
 	const nextColor = hasOwn(payload, "color")
 		? (readOptionalString(payload, "color") ?? "#64748b")
@@ -376,6 +421,108 @@ app.patch("/api/tags/:id", async (c) => {
 		.first<TagRow>();
 
 	return jsonOk(c, updated);
+});
+
+app.post("/api/tags/merge", async (c) => {
+	const payload = await parseObjectBody(c);
+	if (!payload) {
+		return jsonError(c, 400, "Invalid JSON body");
+	}
+	const sourceTagId = readRequiredString(payload, "sourceTagId");
+	const targetTagId = readRequiredString(payload, "targetTagId");
+	if (!sourceTagId || !targetTagId) {
+		return jsonError(c, 400, "`sourceTagId` and `targetTagId` are required");
+	}
+	if (sourceTagId === targetTagId) {
+		return jsonError(c, 400, "sourceTagId and targetTagId must be different");
+	}
+
+	const [source, target] = await Promise.all([
+		c.env.DB.prepare("SELECT id, name FROM tags WHERE id = ? LIMIT 1")
+			.bind(sourceTagId)
+			.first<{ id: string; name: string }>(),
+		c.env.DB.prepare("SELECT id, name FROM tags WHERE id = ? LIMIT 1")
+			.bind(targetTagId)
+			.first<{ id: string; name: string }>(),
+	]);
+	if (!source || !target) {
+		return jsonError(c, 404, "Source or target tag not found");
+	}
+
+	const moved = await mergeTags(c.env.DB, sourceTagId, targetTagId);
+	return jsonOk(c, {
+		sourceTagId,
+		targetTagId,
+		sourceName: source.name,
+		targetName: target.name,
+		movedNoteCount: moved,
+		deletedSource: true,
+	});
+});
+
+app.delete("/api/tags/:id", async (c) => {
+	const tagId = c.req.param("id");
+	const targetTagId = (c.req.query("targetTagId") ?? "").trim() || null;
+	const tag = await c.env.DB.prepare("SELECT id, name FROM tags WHERE id = ? LIMIT 1")
+		.bind(tagId)
+		.first<{ id: string; name: string }>();
+	if (!tag) {
+		return jsonError(c, 404, "Tag not found");
+	}
+
+	if (targetTagId) {
+		if (targetTagId === tagId) {
+			return jsonError(c, 400, "targetTagId must be different from tag id");
+		}
+		const target = await c.env.DB.prepare("SELECT id, name FROM tags WHERE id = ? LIMIT 1")
+			.bind(targetTagId)
+			.first<{ id: string; name: string }>();
+		if (!target) {
+			return jsonError(c, 404, "targetTagId not found");
+		}
+		const moved = await mergeTags(c.env.DB, tagId, targetTagId);
+		return jsonOk(c, {
+			id: tagId,
+			deleted: true,
+			migratedToTagId: targetTagId,
+			migratedNoteCount: moved,
+		});
+	}
+
+	const detached = await detachAndDeleteTag(c.env.DB, tagId);
+	return jsonOk(c, {
+		id: tagId,
+		deleted: true,
+		migratedToTagId: null,
+		migratedNoteCount: 0,
+		detachedNoteCount: detached,
+	});
+});
+
+app.post("/api/tags/cleanup", async (c) => {
+	const payload = (await parseObjectBody(c)) ?? {};
+	const dryRun = parseBooleanLike(payload.dryRun);
+	const limit = clampInt(
+		typeof payload.limit === "string" ? payload.limit : String(readOptionalNumber(payload, "limit") ?? 100),
+		100,
+		1,
+		500,
+	);
+
+	const orphanTags = await listOrphanTags(c.env.DB, limit);
+	if (!dryRun && orphanTags.length > 0) {
+		const statements = orphanTags.map((item) =>
+			c.env.DB.prepare("DELETE FROM tags WHERE id = ?").bind(item.id),
+		);
+		await c.env.DB.batch(statements);
+	}
+	return jsonOk(c, {
+		dryRun,
+		limit,
+		orphaned: orphanTags.length,
+		deleted: dryRun ? 0 : orphanTags.length,
+		tags: orphanTags,
+	});
 });
 
 app.get("/api/notes", async (c) => {
@@ -523,9 +670,22 @@ app.post("/api/notes", async (c) => {
 		...toStringArray(payload.tagNames),
 		...extractTagNames(payload.tags),
 	];
-	const { tagIds, missingTagIds } = await resolveTagIds(c.env.DB, tagIdsInput, tagNamesInput);
+	const { tagIds, missingTagIds, ignoredTagNames } = await resolveTagIds(
+		c.env,
+		c.env.DB,
+		tagIdsInput,
+		tagNamesInput,
+	);
 	if (missingTagIds.length > 0) {
 		return jsonError(c, 400, "Some tagIds do not exist", missingTagIds.join(","));
+	}
+	if (ignoredTagNames.length > 0) {
+		return jsonError(
+			c,
+			400,
+			`Too many tag names, max ${getTagPerNoteLimit(c.env)}`,
+			ignoredTagNames.join(","),
+		);
 	}
 
 	const excerpt = readOptionalString(payload, "excerpt") ?? buildExcerpt(resolvedBody.plainBodyText);
@@ -566,6 +726,9 @@ app.post("/api/notes", async (c) => {
 		: null;
 	const desiredLinkSlugs = explicitLinkSlugs ?? extractLinkSlugs(resolvedBody.plainBodyText);
 	const linkResult = await replaceNoteLinks(c.env.DB, noteId, desiredLinkSlugs);
+	const queuedAction: IndexAction = isArchived ? "delete" : "upsert";
+	await enqueueNoteIndexJob(c.env.DB, noteId, queuedAction);
+	scheduleIndexProcessing(c, 1);
 
 	const created = await getNoteById(c.env.DB, noteId);
 	const tags = await fetchTagsForSingleNote(c.env.DB, noteId);
@@ -698,13 +861,22 @@ app.put("/api/notes/:id", async (c) => {
 		? [...toStringArray(payload.tagNames), ...extractTagNames(payload.tags)]
 		: null;
 	if (tagIdsInput || tagNamesInput) {
-		const { tagIds, missingTagIds } = await resolveTagIds(
+		const { tagIds, missingTagIds, ignoredTagNames } = await resolveTagIds(
+			c.env,
 			c.env.DB,
 			tagIdsInput ?? [],
 			tagNamesInput ?? [],
 		);
 		if (missingTagIds.length > 0) {
 			return jsonError(c, 400, "Some tagIds do not exist", missingTagIds.join(","));
+		}
+		if (ignoredTagNames.length > 0) {
+			return jsonError(
+				c,
+				400,
+				`Too many tag names, max ${getTagPerNoteLimit(c.env)}`,
+				ignoredTagNames.join(","),
+			);
 		}
 		await replaceNoteTags(c.env.DB, noteId, tagIds);
 	}
@@ -721,6 +893,9 @@ app.put("/api/notes/:id", async (c) => {
 			extractLinkSlugs(resolvedBody.plainBodyText);
 		linkResult = await replaceNoteLinks(c.env.DB, noteId, desired);
 	}
+	const indexAction: IndexAction = nextIsArchived ? "delete" : "upsert";
+	await enqueueNoteIndexJob(c.env.DB, noteId, indexAction);
+	scheduleIndexProcessing(c, 1);
 
 	const updated = await getNoteById(c.env.DB, noteId);
 	const tags = await fetchTagsForSingleNote(c.env.DB, noteId);
@@ -742,6 +917,8 @@ app.delete("/api/notes/:id", async (c) => {
 	if (!result.success || (result.meta?.changes ?? 0) === 0) {
 		return jsonError(c, 404, "Note not found");
 	}
+	await enqueueNoteIndexJob(c.env.DB, noteId, "delete");
+	scheduleIndexProcessing(c, 1);
 
 	return jsonOk(c, { id: noteId, deleted: true });
 });
@@ -768,6 +945,8 @@ app.patch("/api/notes/:id/archive", async (c) => {
 	)
 		.bind(archived, noteId)
 		.run();
+	await enqueueNoteIndexJob(c.env.DB, noteId, archived ? "delete" : "upsert");
+	scheduleIndexProcessing(c, 1);
 
 	const updated = await getNoteById(c.env.DB, noteId);
 	const tags = await fetchTagsForSingleNote(c.env.DB, noteId);
@@ -792,6 +971,8 @@ app.patch("/api/notes/:id/restore", async (c) => {
 	)
 		.bind(noteId)
 		.run();
+	await enqueueNoteIndexJob(c.env.DB, noteId, "upsert");
+	scheduleIndexProcessing(c, 1);
 
 	const restored = await getNoteById(c.env.DB, noteId);
 	const tags = await fetchTagsForSingleNote(c.env.DB, noteId);
@@ -813,6 +994,7 @@ app.delete("/api/notes/:id/hard", async (c) => {
 		...assetKeys,
 		existing.bodyR2Key,
 	]);
+	await purgeNoteIndexData(c.env, noteId);
 
 	await c.env.DB.prepare("DELETE FROM notes WHERE id = ?")
 		.bind(noteId)
@@ -1073,6 +1255,145 @@ app.post("/api/notes/storage/migrate", async (c) => {
 	});
 });
 
+app.get("/api/index/jobs", async (c) => {
+	await ensureNoteIndexSchema(c.env.DB);
+	const statusInput = c.req.query("status");
+	const limit = clampInt(c.req.query("limit"), 50, 1, 200);
+	const offset = clampInt(c.req.query("offset"), 0, 0, 5000);
+	const statuses = parseCsv(statusInput).filter(
+		(item): item is IndexJobStatus =>
+			item === "pending" || item === "processing" || item === "success" || item === "failed",
+	);
+	const where: string[] = [];
+	const params: Array<string | number> = [];
+	if (statuses.length > 0) {
+		where.push(`j.status IN (${placeholders(statuses.length)})`);
+		params.push(...statuses);
+	}
+
+	const sql = `
+		SELECT
+			j.note_id AS noteId,
+			j.action,
+			j.status,
+			j.attempt_count AS attemptCount,
+			j.chunk_count AS chunkCount,
+			j.last_error AS lastError,
+			j.next_retry_at AS nextRetryAt,
+			j.last_indexed_at AS lastIndexedAt,
+			j.created_at AS createdAt,
+			j.updated_at AS updatedAt,
+			n.title AS noteTitle
+		FROM note_index_jobs j
+		LEFT JOIN notes n ON n.id = j.note_id
+		${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
+		ORDER BY
+			CASE j.status
+				WHEN 'failed' THEN 0
+				WHEN 'pending' THEN 1
+				WHEN 'processing' THEN 2
+				ELSE 3
+			END ASC,
+			j.updated_at DESC
+		LIMIT ? OFFSET ?
+	`;
+	const { results } = await c.env.DB.prepare(sql)
+		.bind(...params, limit, offset)
+		.all<NoteIndexJobRow & { noteTitle: string | null }>();
+	return jsonOk(c, {
+		items: results,
+		paging: { limit, offset, count: results.length },
+	});
+});
+
+app.post("/api/index/process", async (c) => {
+	const payload = (await parseObjectBody(c)) ?? {};
+	const limit = clampInt(
+		typeof payload.limit === "string" ? payload.limit : String(readOptionalNumber(payload, "limit") ?? 5),
+		5,
+		1,
+		50,
+	);
+	const processed = await processPendingIndexJobs(c.env, limit);
+	return jsonOk(c, {
+		limit,
+		processed: processed.length,
+		results: processed,
+	});
+});
+
+app.post("/api/index/rebuild", async (c) => {
+	const payload = (await parseObjectBody(c)) ?? {};
+	const dryRun = parseBooleanLike(payload.dryRun);
+	const includeDeleted = parseBooleanLike(payload.includeDeleted);
+	const includeArchived = parseBooleanLike(payload.includeArchived);
+	const limit = clampInt(
+		typeof payload.limit === "string" ? payload.limit : String(readOptionalNumber(payload, "limit") ?? 500),
+		500,
+		1,
+		2000,
+	);
+	const noteId = readOptionalString(payload, "noteId");
+
+	const where: string[] = [];
+	const params: Array<string | number> = [];
+	if (!includeDeleted) {
+		where.push("deleted_at IS NULL");
+	}
+	if (!includeArchived) {
+		where.push("is_archived = 0");
+	}
+	if (noteId) {
+		where.push("id = ?");
+		params.push(noteId);
+	}
+
+	const sql = `
+		SELECT id, deleted_at AS deletedAt, is_archived AS isArchived
+		FROM notes
+		${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
+		ORDER BY updated_at DESC
+		LIMIT ?
+	`;
+	const { results } = await c.env.DB.prepare(sql)
+		.bind(...params, limit)
+		.all<{ id: string; deletedAt: string | null; isArchived: number }>();
+
+	const pending: Array<{ noteId: string; action: IndexAction }> = results.map((row) => ({
+		noteId: row.id,
+		action: row.deletedAt || row.isArchived ? "delete" : "upsert",
+	}));
+	if (!dryRun) {
+		for (const item of pending) {
+			await enqueueNoteIndexJob(c.env.DB, item.noteId, item.action);
+		}
+		scheduleIndexProcessing(c, Math.min(10, pending.length || 1));
+	}
+
+	return jsonOk(c, {
+		dryRun,
+		limit,
+		enqueued: pending.length,
+		items: pending,
+	});
+});
+
+app.post("/api/notes/:id/index/retry", async (c) => {
+	const noteId = c.req.param("id");
+	const existing = await getNoteById(c.env.DB, noteId);
+	if (!existing) {
+		return jsonError(c, 404, "Note not found");
+	}
+	const action: IndexAction = existing.deletedAt || existing.isArchived ? "delete" : "upsert";
+	await enqueueNoteIndexJob(c.env.DB, noteId, action);
+	const processed = await processPendingIndexJobs(c.env, 1);
+	return jsonOk(c, {
+		noteId,
+		action,
+		processed: processed[0] ?? null,
+	});
+});
+
 app.all("/api/*", (c) => jsonError(c, 404, "API route not found"));
 
 app.get("*", (c) => {
@@ -1244,6 +1565,80 @@ function getBodyR2ThresholdBytes(env: Env): number {
 		return Math.trunc(value);
 	}
 	return DEFAULT_BODY_R2_THRESHOLD_BYTES;
+}
+
+function getTagNameMaxLength(env: Env): number {
+	const ext = env as Env & { TAG_NAME_MAX_LENGTH?: string };
+	const parsed = Number(ext.TAG_NAME_MAX_LENGTH);
+	if (Number.isFinite(parsed) && parsed >= 16 && parsed <= 128) {
+		return Math.trunc(parsed);
+	}
+	return DEFAULT_TAG_NAME_MAX_LENGTH;
+}
+
+function getTagPerNoteLimit(env: Env): number {
+	const ext = env as Env & { TAG_PER_NOTE_LIMIT?: string };
+	const parsed = Number(ext.TAG_PER_NOTE_LIMIT);
+	if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 64) {
+		return Math.trunc(parsed);
+	}
+	return DEFAULT_TAG_PER_NOTE_LIMIT;
+}
+
+function getIndexMaxChars(env: Env): number {
+	const ext = env as Env & { INDEX_CHUNK_MAX_CHARS?: string };
+	const parsed = Number(ext.INDEX_CHUNK_MAX_CHARS);
+	if (Number.isFinite(parsed) && parsed >= 200 && parsed <= 5000) {
+		return Math.trunc(parsed);
+	}
+	return DEFAULT_INDEX_MAX_CHARS;
+}
+
+function getIndexOverlapChars(env: Env): number {
+	const ext = env as Env & { INDEX_CHUNK_OVERLAP_CHARS?: string };
+	const parsed = Number(ext.INDEX_CHUNK_OVERLAP_CHARS);
+	if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 1000) {
+		return Math.trunc(parsed);
+	}
+	return DEFAULT_INDEX_OVERLAP_CHARS;
+}
+
+function getIndexRetryMaxAttempts(env: Env): number {
+	const ext = env as Env & { INDEX_RETRY_MAX_ATTEMPTS?: string };
+	const parsed = Number(ext.INDEX_RETRY_MAX_ATTEMPTS);
+	if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 20) {
+		return Math.trunc(parsed);
+	}
+	return DEFAULT_INDEX_RETRY_MAX_ATTEMPTS;
+}
+
+function getIndexRetryBackoffSeconds(env: Env): number {
+	const ext = env as Env & { INDEX_RETRY_BACKOFF_SECONDS?: string };
+	const parsed = Number(ext.INDEX_RETRY_BACKOFF_SECONDS);
+	if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 600) {
+		return Math.trunc(parsed);
+	}
+	return DEFAULT_INDEX_RETRY_BACKOFF_SECONDS;
+}
+
+function getIndexVectorDimensions(env: Env): number {
+	const ext = env as Env & { INDEX_VECTOR_DIMENSIONS?: string };
+	const parsed = Number(ext.INDEX_VECTOR_DIMENSIONS);
+	if (Number.isFinite(parsed) && parsed >= 8 && parsed <= 2048) {
+		return Math.trunc(parsed);
+	}
+	return DEFAULT_INDEX_VECTOR_DIMENSIONS;
+}
+
+function getIndexEmbeddingModel(env: Env): string {
+	const ext = env as Env & { INDEX_EMBEDDING_MODEL?: string };
+	const candidate = typeof ext.INDEX_EMBEDDING_MODEL === "string" ? ext.INDEX_EMBEDDING_MODEL.trim() : "";
+	return candidate || DEFAULT_INDEX_EMBEDDING_MODEL;
+}
+
+function getNotesVectorIndex(env: Env): (Pick<VectorizeIndex, "upsert" | "deleteByIds"> | Pick<Vectorize, "upsert" | "deleteByIds">) | null {
+	const ext = env as Env & { NOTES_VECTOR_INDEX?: VectorizeIndex | Vectorize };
+	return ext.NOTES_VECTOR_INDEX ?? null;
 }
 
 async function resolveBodyStorageForCreate(
@@ -1506,7 +1901,8 @@ async function queryNotesWithFts(
 			n.is_archived AS isArchived,
 			n.deleted_at AS deletedAt,
 			n.created_at AS createdAt,
-			n.updated_at AS updatedAt
+			n.updated_at AS updatedAt,
+			fh.rank AS searchScore
 		FROM notes n
 		JOIN fts_hits fh ON fh.noteRowId = n.rowid
 		${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
@@ -1563,7 +1959,8 @@ async function queryNotesWithLike(
 			n.is_archived AS isArchived,
 			n.deleted_at AS deletedAt,
 			n.created_at AS createdAt,
-			n.updated_at AS updatedAt
+			n.updated_at AS updatedAt,
+			NULL AS searchScore
 		FROM notes n
 		${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
 		ORDER BY
@@ -1796,7 +2193,8 @@ async function getNoteById(db: D1Database, noteId: string): Promise<NoteRow | nu
 			is_archived AS isArchived,
 			deleted_at AS deletedAt,
 			created_at AS createdAt,
-			updated_at AS updatedAt
+			updated_at AS updatedAt,
+			NULL AS searchScore
 		 FROM notes
 		 WHERE id = ?
 		 LIMIT 1`,
@@ -1888,12 +2286,16 @@ async function fetchTagsByNoteIds(db: D1Database, noteIds: string[]): Promise<Ma
 }
 
 async function resolveTagIds(
+	env: Env,
 	db: D1Database,
 	tagIdsInput: string[],
 	tagNamesInput: string[],
-): Promise<{ tagIds: string[]; missingTagIds: string[] }> {
+): Promise<{ tagIds: string[]; missingTagIds: string[]; ignoredTagNames: string[] }> {
 	const uniqueTagIds = [...new Set(tagIdsInput)];
-	const uniqueTagNames = [...new Set(tagNamesInput.map((name) => name.trim()).filter(Boolean))];
+	const uniqueTagNames = normalizeTagNames(tagNamesInput, getTagNameMaxLength(env));
+	const tagNameLimit = getTagPerNoteLimit(env);
+	const acceptedTagNames = uniqueTagNames.slice(0, tagNameLimit);
+	const ignoredTagNames = uniqueTagNames.slice(tagNameLimit);
 
 	const resolvedIds = new Set<string>();
 	let missingTagIds: string[] = [];
@@ -1911,7 +2313,7 @@ async function resolveTagIds(
 		}
 	}
 
-	for (const name of uniqueTagNames) {
+	for (const name of acceptedTagNames) {
 		const found = await db
 			.prepare("SELECT id FROM tags WHERE name = ? COLLATE NOCASE LIMIT 1")
 			.bind(name)
@@ -1927,7 +2329,458 @@ async function resolveTagIds(
 		resolvedIds.add(newId);
 	}
 
-	return { tagIds: [...resolvedIds], missingTagIds };
+	return { tagIds: [...resolvedIds], missingTagIds, ignoredTagNames };
+}
+
+function normalizeTagNames(values: string[], maxLength: number): string[] {
+	const unique = new Set<string>();
+	for (const value of values) {
+		const normalized = normalizeTagName(value, maxLength);
+		if (normalized) {
+			unique.add(normalized);
+		}
+	}
+	return [...unique];
+}
+
+function normalizeTagName(value: string, maxLength = DEFAULT_TAG_NAME_MAX_LENGTH): string {
+	const trimmed = value.trim().toLowerCase();
+	if (!trimmed) {
+		return "";
+	}
+	const normalized = trimmed
+		.replace(/\s+/g, "-")
+		.replace(/[^\p{L}\p{N}_-]+/gu, "-")
+		.replace(/-+/g, "-")
+		.replace(/^[-_]+|[-_]+$/g, "")
+		.slice(0, maxLength);
+	return normalized;
+}
+
+async function listOrphanTags(
+	db: D1Database,
+	limit: number,
+): Promise<Array<{ id: string; name: string; color: string; createdAt: string }>> {
+	const { results } = await db.prepare(
+		`SELECT
+			t.id,
+			t.name,
+			t.color,
+			t.created_at AS createdAt
+		 FROM tags t
+		 LEFT JOIN note_tags nt ON nt.tag_id = t.id
+		 WHERE nt.note_id IS NULL
+		 ORDER BY t.created_at ASC
+		 LIMIT ?`,
+	)
+		.bind(limit)
+		.all<{ id: string; name: string; color: string; createdAt: string }>();
+	return results;
+}
+
+async function mergeTags(db: D1Database, sourceTagId: string, targetTagId: string): Promise<number> {
+	const movedCount = await db.prepare(
+		"SELECT COUNT(DISTINCT note_id) AS count FROM note_tags WHERE tag_id = ?",
+	)
+		.bind(sourceTagId)
+		.first<number>("count");
+	await db.prepare(
+		`INSERT OR IGNORE INTO note_tags (note_id, tag_id)
+		 SELECT note_id, ?
+		 FROM note_tags
+		 WHERE tag_id = ?`,
+	)
+		.bind(targetTagId, sourceTagId)
+		.run();
+	await db.prepare("DELETE FROM note_tags WHERE tag_id = ?")
+		.bind(sourceTagId)
+		.run();
+	await db.prepare("DELETE FROM tags WHERE id = ?")
+		.bind(sourceTagId)
+		.run();
+	return movedCount ?? 0;
+}
+
+async function detachAndDeleteTag(db: D1Database, tagId: string): Promise<number> {
+	const detached = await db.prepare("SELECT COUNT(*) AS count FROM note_tags WHERE tag_id = ?")
+		.bind(tagId)
+		.first<number>("count");
+	await db.prepare("DELETE FROM note_tags WHERE tag_id = ?")
+		.bind(tagId)
+		.run();
+	await db.prepare("DELETE FROM tags WHERE id = ?")
+		.bind(tagId)
+		.run();
+	return detached ?? 0;
+}
+
+function scheduleIndexProcessing(c: AppContext, limit: number): void {
+	if (!c.executionCtx || typeof c.executionCtx.waitUntil !== "function") {
+		return;
+	}
+	c.executionCtx.waitUntil(
+		processPendingIndexJobs(c.env, limit).catch((error) => {
+			console.error("Background note index processing failed", error);
+		}),
+	);
+}
+
+async function ensureNoteIndexSchema(db: D1Database): Promise<void> {
+	await db.exec(`
+		CREATE TABLE IF NOT EXISTS note_index_jobs (
+			note_id TEXT PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE,
+			action TEXT NOT NULL DEFAULT 'upsert' CHECK (action IN ('upsert', 'delete')),
+			status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'success', 'failed')),
+			attempt_count INTEGER NOT NULL DEFAULT 0,
+			chunk_count INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT,
+			next_retry_at TEXT,
+			last_indexed_at TEXT,
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_note_index_jobs_status_retry
+			ON note_index_jobs(status, next_retry_at, updated_at);
+		CREATE TRIGGER IF NOT EXISTS trg_note_index_jobs_updated_at
+		AFTER UPDATE ON note_index_jobs
+		FOR EACH ROW
+		WHEN NEW.updated_at = OLD.updated_at
+		BEGIN
+			UPDATE note_index_jobs SET updated_at = CURRENT_TIMESTAMP WHERE note_id = OLD.note_id;
+		END;
+	`);
+}
+
+async function enqueueNoteIndexJob(db: D1Database, noteId: string, action: IndexAction): Promise<void> {
+	await ensureNoteIndexSchema(db);
+	await db.prepare(
+		`INSERT INTO note_index_jobs (
+			note_id, action, status, attempt_count, chunk_count, last_error, next_retry_at, last_indexed_at
+		) VALUES (?, ?, 'pending', 0, 0, NULL, NULL, NULL)
+		ON CONFLICT(note_id) DO UPDATE SET
+			action = excluded.action,
+			status = 'pending',
+			last_error = NULL,
+			next_retry_at = NULL,
+			updated_at = CURRENT_TIMESTAMP`,
+	)
+		.bind(noteId, action)
+		.run();
+}
+
+async function processPendingIndexJobs(env: Env, limit: number): Promise<NoteIndexProcessResult[]> {
+	await ensureNoteIndexSchema(env.DB);
+	const { results } = await env.DB.prepare(
+		`SELECT
+			note_id AS noteId,
+			action,
+			status,
+			attempt_count AS attemptCount
+		 FROM note_index_jobs
+		 WHERE status IN ('pending', 'failed')
+		   AND (next_retry_at IS NULL OR next_retry_at <= datetime('now'))
+		 ORDER BY
+			CASE status
+				WHEN 'failed' THEN 0
+				ELSE 1
+			END ASC,
+			updated_at ASC
+		 LIMIT ?`,
+	)
+		.bind(limit)
+		.all<{ noteId: string; action: IndexAction; status: IndexJobStatus; attemptCount: number }>();
+
+	const output: NoteIndexProcessResult[] = [];
+	for (const job of results) {
+		await env.DB.prepare(
+			`UPDATE note_index_jobs
+			 SET status = 'processing',
+				 updated_at = CURRENT_TIMESTAMP
+			 WHERE note_id = ?`,
+		)
+			.bind(job.noteId)
+			.run();
+
+		try {
+			const chunkCount = await processSingleNoteIndexJob(env, job.noteId, job.action);
+			await env.DB.prepare(
+				`UPDATE note_index_jobs
+				 SET status = 'success',
+					 chunk_count = ?,
+					 attempt_count = ?,
+					 last_error = NULL,
+					 next_retry_at = NULL,
+					 last_indexed_at = CURRENT_TIMESTAMP,
+					 updated_at = CURRENT_TIMESTAMP
+				 WHERE note_id = ?`,
+			)
+				.bind(chunkCount, job.attemptCount + 1, job.noteId)
+				.run();
+			output.push({
+				noteId: job.noteId,
+				action: job.action,
+				status: "success",
+				chunkCount,
+				error: null,
+				attemptCount: job.attemptCount + 1,
+			});
+		} catch (error) {
+			const attempts = job.attemptCount + 1;
+			const maxAttempts = getIndexRetryMaxAttempts(env);
+			const backoffSeconds = getIndexRetryBackoffSeconds(env) * Math.max(1, 2 ** (attempts - 1));
+			const boundedBackoff = Math.min(backoffSeconds, 3600);
+			const nextRetry = attempts >= maxAttempts ? null : toSqliteDatetime(Date.now() + boundedBackoff * 1000);
+			await env.DB.prepare(
+				`UPDATE note_index_jobs
+				 SET status = 'failed',
+					 attempt_count = ?,
+					 last_error = ?,
+					 next_retry_at = ?,
+					 updated_at = CURRENT_TIMESTAMP
+				 WHERE note_id = ?`,
+			)
+				.bind(attempts, String(error), nextRetry, job.noteId)
+				.run();
+			output.push({
+				noteId: job.noteId,
+				action: job.action,
+				status: "failed",
+				chunkCount: 0,
+				error: String(error),
+				attemptCount: attempts,
+			});
+		}
+	}
+
+	return output;
+}
+
+async function processSingleNoteIndexJob(env: Env, noteId: string, action: IndexAction): Promise<number> {
+	if (action === "delete") {
+		await clearNoteChunksAndVectors(env, noteId);
+		return 0;
+	}
+
+	const note = await getNoteById(env.DB, noteId);
+	if (!note || note.deletedAt || note.isArchived) {
+		await clearNoteChunksAndVectors(env, noteId);
+		return 0;
+	}
+
+	const hydrated = await hydrateNoteBodyFromR2(env, note);
+	const bodyText = hydrated.bodyText ?? "";
+	const chunks = buildNoteChunks(bodyText, getIndexMaxChars(env), getIndexOverlapChars(env));
+	await upsertNoteChunksToVectorIndex(env, hydrated, chunks);
+	return chunks.length;
+}
+
+function buildNoteChunks(
+	bodyText: string,
+	maxChars: number,
+	overlapChars: number,
+): Array<{ chunkIndex: number; chunkText: string; tokenCount: number }> {
+	const normalized = bodyText.replace(/\r\n/g, "\n").trim();
+	if (!normalized) {
+		return [];
+	}
+
+	const paragraphs = normalized
+		.split(/\n{2,}/u)
+		.map((item) => item.trim())
+		.filter((item) => item.length > 0);
+	const rawChunks: string[] = [];
+	let current = "";
+	for (const paragraph of paragraphs) {
+		const candidate = current ? `${current}\n\n${paragraph}` : paragraph;
+		if (candidate.length <= maxChars) {
+			current = candidate;
+			continue;
+		}
+		if (current) {
+			rawChunks.push(current);
+		}
+		if (paragraph.length <= maxChars) {
+			current = paragraph;
+			continue;
+		}
+		const longParagraphChunks = splitLongText(paragraph, maxChars, overlapChars);
+		rawChunks.push(...longParagraphChunks.slice(0, -1));
+		current = longParagraphChunks.at(-1) ?? "";
+	}
+	if (current) {
+		rawChunks.push(current);
+	}
+
+	const finalChunks: string[] = [];
+	for (let index = 0; index < rawChunks.length; index += 1) {
+		const base = rawChunks[index] ?? "";
+		const prev = finalChunks[index - 1];
+		if (!prev || overlapChars <= 0) {
+			finalChunks.push(base);
+			continue;
+		}
+		const tail = prev.slice(Math.max(0, prev.length - overlapChars)).trim();
+		const merged = `${tail}\n${base}`.trim();
+		finalChunks.push(merged.length <= maxChars ? merged : merged.slice(merged.length - maxChars));
+	}
+
+	return finalChunks.map((chunkText, chunkIndex) => ({
+		chunkIndex,
+		chunkText,
+		tokenCount: countWords(chunkText),
+	}));
+}
+
+function splitLongText(text: string, maxChars: number, overlapChars: number): string[] {
+	const stride = Math.max(1, maxChars - Math.max(0, overlapChars));
+	const chunks: string[] = [];
+	for (let start = 0; start < text.length; start += stride) {
+		const slice = text.slice(start, start + maxChars).trim();
+		if (slice) {
+			chunks.push(slice);
+		}
+		if (start + maxChars >= text.length) {
+			break;
+		}
+	}
+	return chunks;
+}
+
+function buildHashEmbedding(text: string, dimensions: number): number[] {
+	const vector = Array.from({ length: dimensions }, () => 0);
+	for (let i = 0; i < text.length; i += 1) {
+		const code = text.charCodeAt(i);
+		const index = ((code * 31) + i * 17) % dimensions;
+		vector[index] += ((code % 29) + 1) / 29;
+	}
+	let norm = 0;
+	for (const value of vector) {
+		norm += value * value;
+	}
+	const denominator = Math.sqrt(norm) || 1;
+	return vector.map((value) => value / denominator);
+}
+
+async function buildVectorId(noteId: string, chunkIndex: number, chunkText: string): Promise<string> {
+	const digest = await sha256Hex(new TextEncoder().encode(chunkText).buffer);
+	return `${noteId}:${chunkIndex}:${digest.slice(0, 16)}`;
+}
+
+async function upsertNoteChunksToVectorIndex(
+	env: Env,
+	note: NoteRow,
+	chunks: Array<{ chunkIndex: number; chunkText: string; tokenCount: number }>,
+): Promise<void> {
+	const vectorIndex = getNotesVectorIndex(env);
+	if (!vectorIndex) {
+		throw new Error("Vectorize binding `NOTES_VECTOR_INDEX` is missing");
+	}
+
+	const { results: existing } = await env.DB.prepare(
+		`SELECT
+			id,
+			note_id AS noteId,
+			chunk_index AS chunkIndex,
+			chunk_text AS chunkText,
+			token_count AS tokenCount,
+			embedding_model AS embeddingModel,
+			vector_id AS vectorId,
+			created_at AS createdAt
+		 FROM note_chunks
+		 WHERE note_id = ?`,
+	)
+		.bind(note.id)
+		.all<NoteChunkRow>();
+
+	const dimensions = getIndexVectorDimensions(env);
+	const model = getIndexEmbeddingModel(env);
+	const vectorRecords: VectorizeVector[] = [];
+	const chunkRows: Array<{ id: string; vectorId: string; chunkIndex: number; chunkText: string; tokenCount: number }> = [];
+	for (const chunk of chunks) {
+		const vectorId = await buildVectorId(note.id, chunk.chunkIndex, chunk.chunkText);
+		vectorRecords.push({
+			id: vectorId,
+			values: buildHashEmbedding(chunk.chunkText, dimensions),
+			metadata: {
+				noteId: note.id,
+				slug: note.slug,
+				title: note.title,
+				chunkIndex: chunk.chunkIndex,
+			},
+		});
+		chunkRows.push({
+			id: crypto.randomUUID(),
+			vectorId,
+			chunkIndex: chunk.chunkIndex,
+			chunkText: chunk.chunkText,
+			tokenCount: chunk.tokenCount,
+		});
+	}
+
+	if (vectorRecords.length > 0) {
+		await vectorIndex.upsert(vectorRecords);
+	}
+	const nextVectorIds = new Set(vectorRecords.map((item) => item.id));
+	const staleVectorIds = existing
+		.map((item) => item.vectorId)
+		.filter((vectorId): vectorId is string =>
+			typeof vectorId === "string" && vectorId.length > 0 && !nextVectorIds.has(vectorId),
+		);
+	if (staleVectorIds.length > 0) {
+		await vectorIndex.deleteByIds(staleVectorIds);
+	}
+
+	await env.DB.prepare("DELETE FROM note_chunks WHERE note_id = ?")
+		.bind(note.id)
+		.run();
+	if (chunkRows.length > 0) {
+		const statements = chunkRows.map((item) =>
+			env.DB.prepare(
+				`INSERT INTO note_chunks (
+					id, note_id, chunk_index, chunk_text, token_count, embedding_model, vector_id
+				) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			)
+				.bind(item.id, note.id, item.chunkIndex, item.chunkText, item.tokenCount, model, item.vectorId),
+		);
+		await env.DB.batch(statements);
+	}
+}
+
+async function clearNoteChunksAndVectors(env: Env, noteId: string): Promise<void> {
+	const { results } = await env.DB.prepare(
+		`SELECT vector_id AS vectorId
+		 FROM note_chunks
+		 WHERE note_id = ?`,
+	)
+		.bind(noteId)
+		.all<{ vectorId: string | null }>();
+	const vectorIds = results
+		.map((item) => item.vectorId)
+		.filter((item): item is string => Boolean(item));
+	if (vectorIds.length > 0) {
+		const vectorIndex = getNotesVectorIndex(env);
+		if (!vectorIndex) {
+			throw new Error("Vectorize binding `NOTES_VECTOR_INDEX` is missing");
+		}
+		await vectorIndex.deleteByIds(vectorIds);
+	}
+	await env.DB.prepare("DELETE FROM note_chunks WHERE note_id = ?")
+		.bind(noteId)
+		.run();
+}
+
+async function purgeNoteIndexData(env: Env, noteId: string): Promise<void> {
+	await ensureNoteIndexSchema(env.DB);
+	await clearNoteChunksAndVectors(env, noteId);
+	await env.DB.prepare("DELETE FROM note_index_jobs WHERE note_id = ?")
+		.bind(noteId)
+		.run();
+}
+
+function toSqliteDatetime(value: number): string {
+	const date = new Date(value);
+	const iso = date.toISOString();
+	return iso.slice(0, 19).replace("T", " ");
 }
 
 async function replaceNoteTags(db: D1Database, noteId: string, tagIds: string[]): Promise<void> {

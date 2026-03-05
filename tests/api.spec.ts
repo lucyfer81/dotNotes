@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import app from "../workers/app";
 import { FakeD1Database } from "./helpers/fake-d1";
 import { FakeR2Bucket } from "./helpers/fake-r2";
+import { FakeVectorIndex } from "./helpers/fake-vectorize";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -12,10 +13,12 @@ const schemaSql = readFileSync(path.resolve(__dirname, "../db/schema.sql"), "utf
 
 let db: FakeD1Database;
 let bucket: FakeR2Bucket;
+let vectorIndex: FakeVectorIndex;
 
 beforeEach(async () => {
 	db = new FakeD1Database();
 	bucket = new FakeR2Bucket();
+	vectorIndex = new FakeVectorIndex();
 	await db.exec(schemaSql);
 });
 
@@ -90,6 +93,7 @@ describe("search api", () => {
 		);
 		expect(activeSearch.data.items.map((item) => item.id)).toEqual([exact.id, bodyHit.id]);
 		expect(activeSearch.data.search?.mode).toBe("fts");
+		expect(typeof activeSearch.data.items[0]?.searchScore).toBe("number");
 
 		const tags = await readEnvelope<TagPayload[]>(await api("/api/tags?status=all"));
 		const searchTag = tags.data.find((item) => item.name.toLowerCase() === "searchscope");
@@ -160,6 +164,91 @@ describe("assets api", () => {
 	});
 });
 
+describe("tag governance api", () => {
+	it("supports merge and cleanup flow", async () => {
+		await createNote({
+			title: "Tag A Note",
+			folderId: "folder-10-projects",
+			bodyText: "alpha",
+			tagNames: ["topic-a"],
+		});
+		await createNote({
+			title: "Tag B Note",
+			folderId: "folder-10-projects",
+			bodyText: "beta",
+			tagNames: ["topic-b"],
+		});
+
+		const tags = await readEnvelope<TagPayload[]>(await api("/api/tags?status=all"));
+		const topicA = tags.data.find((item) => item.name === "topic-a");
+		const topicB = tags.data.find((item) => item.name === "topic-b");
+		expect(topicA?.id).toBeDefined();
+		expect(topicB?.id).toBeDefined();
+
+		await readEnvelope(await api("/api/tags/merge", {
+			method: "POST",
+			body: JSON.stringify({
+				sourceTagId: topicB!.id,
+				targetTagId: topicA!.id,
+			}),
+		}));
+
+		const mergedSearch = await readEnvelope<NotesListPayload>(
+			await api(`/api/notes?status=active&tagIds=${encodeURIComponent(topicA!.id)}`),
+		);
+		expect(mergedSearch.data.items.length).toBe(2);
+
+		await readEnvelope(await api("/api/tags", {
+			method: "POST",
+			body: JSON.stringify({ name: "orphan-cleanup" }),
+		}));
+		const dryCleanup = await readEnvelope<{ orphaned: number; deleted: number }>(
+			await api("/api/tags/cleanup", {
+				method: "POST",
+				body: JSON.stringify({ dryRun: true }),
+			}),
+		);
+		expect(dryCleanup.data.orphaned).toBeGreaterThanOrEqual(1);
+		expect(dryCleanup.data.deleted).toBe(0);
+
+		const cleanup = await readEnvelope<{ orphaned: number; deleted: number }>(
+			await api("/api/tags/cleanup", {
+				method: "POST",
+				body: JSON.stringify({ dryRun: false }),
+			}),
+		);
+		expect(cleanup.data.deleted).toBeGreaterThanOrEqual(1);
+	});
+});
+
+describe("index pipeline api", () => {
+	it("supports retry and processing with vectorize-backed chunks", async () => {
+		const created = await createNote({
+			title: "Index Note",
+			folderId: "folder-10-projects",
+			bodyText: "## section\nthis is an index body ".repeat(80),
+		});
+
+		const retryUpsert = await readEnvelope<{ processed: { status: string; chunkCount: number } }>(
+			await api(`/api/notes/${created.id}/index/retry`, { method: "POST" }),
+		);
+		expect(retryUpsert.data.processed.status).toBe("success");
+		expect(retryUpsert.data.processed.chunkCount).toBeGreaterThan(0);
+		expect(vectorIndex.size()).toBeGreaterThan(0);
+
+		await readEnvelope(await api(`/api/notes/${created.id}/archive`, {
+			method: "PATCH",
+			body: JSON.stringify({ archived: true }),
+		}));
+		const retryDelete = await readEnvelope<{ processed: { status: string; chunkCount: number } }>(
+			await api(`/api/notes/${created.id}/index/retry`, { method: "POST" }),
+		);
+		expect(retryDelete.data.processed.status).toBe("success");
+		expect(retryDelete.data.processed.chunkCount).toBe(0);
+		expect(vectorIndex.size()).toBe(0);
+	});
+});
+
 async function createNote(input: {
 	title: string;
 	folderId: string;
@@ -188,7 +277,11 @@ async function api(pathname: string, init?: RequestInit) {
 	return app.request(`https://dotnotes.test${pathname}`, { ...init, headers }, {
 		DB: db as unknown as D1Database,
 		NOTES_BUCKET: bucket as unknown as R2Bucket,
+		NOTES_VECTOR_INDEX: vectorIndex as unknown as VectorizeIndex,
 		BODY_R2_THRESHOLD_BYTES: "64",
+		INDEX_CHUNK_MAX_CHARS: "120",
+		INDEX_CHUNK_OVERLAP_CHARS: "16",
+		INDEX_VECTOR_DIMENSIONS: "32",
 	} as Env, createExecutionContext());
 }
 
@@ -227,7 +320,7 @@ type TagPayload = {
 };
 
 type NotesListPayload = {
-	items: Array<{ id: string; storageType: "d1" | "r2"; bodyText: string | null }>;
+	items: Array<{ id: string; storageType: "d1" | "r2"; bodyText: string | null; searchScore: number | null }>;
 	search?: { mode: "fts" | "like-fallback" | "none"; keyword: string };
 };
 
