@@ -69,6 +69,10 @@ type CleanupTagsOptions = {
 	dryRun?: boolean;
 	limit?: number;
 };
+type UpdateTagInput = {
+	name?: string;
+	color?: string;
+};
 
 type UpdateNoteInput = {
 	title?: string;
@@ -185,6 +189,18 @@ export async function mergeTags(sourceTagId: string, targetTagId: string): Promi
 		method: "POST",
 		body: JSON.stringify({ sourceTagId, targetTagId }),
 	});
+}
+
+export async function updateTag(tagId: string, input: UpdateTagInput): Promise<TagApiItem> {
+	const data = await requestApiData<unknown>(`/api/tags/${encodeURIComponent(tagId)}`, {
+		method: "PATCH",
+		body: JSON.stringify(input),
+	});
+	const tag = toTagApiItem(data);
+	if (!tag) {
+		throw new Error("Invalid update tag response");
+	}
+	return tag;
 }
 
 export async function deleteTag(tagId: string, targetTagId?: string): Promise<void> {

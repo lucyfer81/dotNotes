@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { Link } from "react-router";
 import {
 	archiveNote,
 	createFolder,
@@ -1372,13 +1373,19 @@ export default function Home() {
 						<ModeButton label="Organize" active={workspaceMode === "organize"} onClick={() => setWorkspaceMode("organize")} />
 						<ModeButton label="Focus" active={workspaceMode === "focus"} onClick={() => setWorkspaceMode("focus")} />
 					</div>
-					<button
-						onClick={() => setAiOpen((v) => !v)}
-						className="rounded-xl border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-100 md:text-sm"
-					>
-						{aiOpen ? "隐藏 AI" : "打开 AI"}
-					</button>
-				</header>
+						<button
+							onClick={() => setAiOpen((v) => !v)}
+							className="rounded-xl border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-100 md:text-sm"
+						>
+							{aiOpen ? "隐藏 AI" : "打开 AI"}
+						</button>
+						<Link
+							to="/tags"
+							className="rounded-xl border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-100 md:text-sm"
+						>
+							标签治理
+						</Link>
+					</header>
 
 				<div className="hidden min-h-0 flex-1 md:block">
 					{workspaceMode === "capture" ? (
