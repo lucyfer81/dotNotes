@@ -2426,8 +2426,8 @@ function scheduleIndexProcessing(c: AppContext, limit: number): void {
 }
 
 async function ensureNoteIndexSchema(db: D1Database): Promise<void> {
-	await db.exec(`
-		CREATE TABLE IF NOT EXISTS note_index_jobs (
+	await db.prepare(
+		`CREATE TABLE IF NOT EXISTS note_index_jobs (
 			note_id TEXT PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE,
 			action TEXT NOT NULL DEFAULT 'upsert' CHECK (action IN ('upsert', 'delete')),
 			status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'success', 'failed')),
@@ -2438,17 +2438,20 @@ async function ensureNoteIndexSchema(db: D1Database): Promise<void> {
 			last_indexed_at TEXT,
 			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-		);
-		CREATE INDEX IF NOT EXISTS idx_note_index_jobs_status_retry
-			ON note_index_jobs(status, next_retry_at, updated_at);
-		CREATE TRIGGER IF NOT EXISTS trg_note_index_jobs_updated_at
+		)`,
+	).run();
+	await db.prepare(
+		"CREATE INDEX IF NOT EXISTS idx_note_index_jobs_status_retry ON note_index_jobs(status, next_retry_at, updated_at)",
+	).run();
+	await db.prepare(
+		`CREATE TRIGGER IF NOT EXISTS trg_note_index_jobs_updated_at
 		AFTER UPDATE ON note_index_jobs
 		FOR EACH ROW
 		WHEN NEW.updated_at = OLD.updated_at
 		BEGIN
 			UPDATE note_index_jobs SET updated_at = CURRENT_TIMESTAMP WHERE note_id = OLD.note_id;
-		END;
-	`);
+		END`,
+	).run();
 }
 
 async function enqueueNoteIndexJob(db: D1Database, noteId: string, action: IndexAction): Promise<void> {
