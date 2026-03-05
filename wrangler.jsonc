@@ -12,13 +12,20 @@
 	"compatibility_date": "2025-10-08",
 	"main": "./workers/app.ts",
 	"vars": {
-		"VALUE_FROM_CLOUDFLARE": "Hello from Hono/CF"
+		"VALUE_FROM_CLOUDFLARE": "Hello from Hono/CF",
+		"BODY_R2_THRESHOLD_BYTES": "65536"
 	},
 	"d1_databases": [
 		{
 			"binding": "DB",
 			"database_name": "dotnotes-db",
 			"database_id": "b6b9ba36-9f9e-4e43-942e-d6d4ff5e15df"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "NOTES_BUCKET",
+			"bucket_name": "dotnotes-assets"
 		}
 	],
 	"observability": {

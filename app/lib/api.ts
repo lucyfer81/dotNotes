@@ -41,6 +41,16 @@ export type NoteLinksApiItem = {
 	outbound: NoteLinkApiItem[];
 	inbound: NoteLinkApiItem[];
 };
+export type NoteAssetApiItem = {
+	id: string;
+	noteId: string;
+	fileName: string | null;
+	mimeType: string;
+	sizeBytes: number;
+	sha256: string | null;
+	createdAt: string;
+	downloadUrl: string;
+};
 
 type ListNotesOptions = {
 	limit?: number;
@@ -270,6 +280,44 @@ export async function getNoteLinks(noteId: string, status?: NoteStatus): Promise
 	return parsed;
 }
 
+export async function listNoteAssets(noteId: string): Promise<NoteAssetApiItem[]> {
+	const data = await requestApiData<unknown>(`/api/notes/${encodeURIComponent(noteId)}/assets`);
+	if (!Array.isArray(data)) {
+		throw new Error("Invalid note assets response");
+	}
+	return data
+		.map((item) => toNoteAssetApiItem(item))
+		.filter((item): item is NoteAssetApiItem => item !== null);
+}
+
+export async function uploadNoteAsset(noteId: string, file: File): Promise<NoteAssetApiItem> {
+	const form = new FormData();
+	form.set("noteId", noteId);
+	form.set("file", file);
+	const response = await fetch("/api/assets/upload", {
+		method: "POST",
+		body: form,
+	});
+	const payload = await response.json().catch(() => null);
+	if (!response.ok) {
+		throw new Error(readApiError(payload, response.status));
+	}
+	if (!isRecord(payload) || payload.ok !== true || !("data" in payload)) {
+		throw new Error("Invalid API envelope");
+	}
+	const parsed = toNoteAssetApiItem(payload.data);
+	if (!parsed) {
+		throw new Error("Invalid upload note asset response");
+	}
+	return parsed;
+}
+
+export async function deleteNoteAsset(assetId: string): Promise<void> {
+	await requestApiData<unknown>(`/api/assets/${encodeURIComponent(assetId)}`, {
+		method: "DELETE",
+	});
+}
+
 async function requestApiData<T>(url: string, init?: RequestInit): Promise<T> {
 	const headers = new Headers(init?.headers);
 	headers.set("Accept", "application/json");
@@ -396,6 +444,34 @@ function toNoteLinksApiItem(value: unknown): NoteLinksApiItem | null {
 		noteId: value.noteId,
 		outbound,
 		inbound,
+	};
+}
+
+function toNoteAssetApiItem(value: unknown): NoteAssetApiItem | null {
+	if (!isRecord(value)) {
+		return null;
+	}
+	if (
+		typeof value.id !== "string" ||
+		typeof value.noteId !== "string" ||
+		(typeof value.fileName !== "string" && value.fileName !== null) ||
+		typeof value.mimeType !== "string" ||
+		typeof value.sizeBytes !== "number" ||
+		(typeof value.sha256 !== "string" && value.sha256 !== null) ||
+		typeof value.createdAt !== "string" ||
+		typeof value.downloadUrl !== "string"
+	) {
+		return null;
+	}
+	return {
+		id: value.id,
+		noteId: value.noteId,
+		fileName: value.fileName,
+		mimeType: value.mimeType,
+		sizeBytes: value.sizeBytes,
+		sha256: value.sha256,
+		createdAt: value.createdAt,
+		downloadUrl: value.downloadUrl,
 	};
 }
 

@@ -4,15 +4,18 @@ import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it } from "vitest";
 import app from "../workers/app";
 import { FakeD1Database } from "./helpers/fake-d1";
+import { FakeR2Bucket } from "./helpers/fake-r2";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const schemaSql = readFileSync(path.resolve(__dirname, "../db/schema.sql"), "utf8");
 
 let db: FakeD1Database;
+let bucket: FakeR2Bucket;
 
 beforeEach(async () => {
 	db = new FakeD1Database();
+	bucket = new FakeR2Bucket();
 	await db.exec(schemaSql);
 });
 
@@ -104,6 +107,59 @@ describe("search api", () => {
 	});
 });
 
+describe("storage strategy api", () => {
+	it("auto switches oversized body to r2 while keeping body text readable", async () => {
+		const largeBody = `# Big note\n${"large-content ".repeat(40).trimEnd()}`;
+		const created = await createNote({
+			title: "Large Body Note",
+			folderId: "folder-10-projects",
+			bodyText: largeBody,
+		});
+		expect(created.storageType).toBe("r2");
+		expect(created.bodyText).toBe(largeBody);
+
+		const listed = await readEnvelope<NotesListPayload>(
+			await api(`/api/notes?q=${encodeURIComponent("Large Body Note")}&status=active`),
+		);
+		expect(listed.data.items[0]?.storageType).toBe("r2");
+		expect(listed.data.items[0]?.bodyText).toBe(largeBody);
+	});
+});
+
+describe("assets api", () => {
+	it("supports upload, list, download and delete", async () => {
+		const created = await createNote({
+			title: "Asset Host Note",
+			folderId: "folder-10-projects",
+			bodyText: "assets body",
+		});
+		const noteId = created.id;
+
+		const form = new FormData();
+		form.set("noteId", noteId);
+		form.set("file", new File(["hello-asset"], "hello.txt", { type: "text/plain" }));
+
+		const uploaded = await readEnvelope<AssetPayload>(await api("/api/assets/upload", {
+			method: "POST",
+			body: form,
+		}));
+		expect(uploaded.data.noteId).toBe(noteId);
+		expect(uploaded.data.fileName).toBe("hello.txt");
+
+		const list = await readEnvelope<AssetPayload[]>(await api(`/api/notes/${noteId}/assets`));
+		expect(list.data.length).toBe(1);
+		expect(list.data[0]?.id).toBe(uploaded.data.id);
+
+		const content = await api(`/api/assets/${uploaded.data.id}/content`);
+		expect(content.status).toBe(200);
+		expect(await content.text()).toBe("hello-asset");
+
+		await readEnvelope(await api(`/api/assets/${uploaded.data.id}`, { method: "DELETE" }));
+		const afterDelete = await readEnvelope<AssetPayload[]>(await api(`/api/notes/${noteId}/assets`));
+		expect(afterDelete.data.length).toBe(0);
+	});
+});
+
 async function createNote(input: {
 	title: string;
 	folderId: string;
@@ -125,12 +181,14 @@ async function createNote(input: {
 
 async function api(pathname: string, init?: RequestInit) {
 	const headers = new Headers(init?.headers);
-	if (init?.body && !headers.has("Content-Type")) {
+	if (init?.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
 		headers.set("Content-Type", "application/json");
 	}
 	headers.set("Accept", "application/json");
 	return app.request(`https://dotnotes.test${pathname}`, { ...init, headers }, {
 		DB: db as unknown as D1Database,
+		NOTES_BUCKET: bucket as unknown as R2Bucket,
+		BODY_R2_THRESHOLD_BYTES: "64",
 	} as Env, createExecutionContext());
 }
 
@@ -157,6 +215,8 @@ function createExecutionContext(): ExecutionContext {
 
 type NotePayload = {
 	id: string;
+	storageType: "d1" | "r2";
+	bodyText: string | null;
 	isArchived: number;
 	deletedAt: string | null;
 };
@@ -167,6 +227,13 @@ type TagPayload = {
 };
 
 type NotesListPayload = {
-	items: Array<{ id: string }>;
+	items: Array<{ id: string; storageType: "d1" | "r2"; bodyText: string | null }>;
 	search?: { mode: "fts" | "like-fallback" | "none"; keyword: string };
+};
+
+type AssetPayload = {
+	id: string;
+	noteId: string;
+	fileName: string | null;
+	downloadUrl: string;
 };

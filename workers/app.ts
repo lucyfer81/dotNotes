@@ -52,8 +52,31 @@ type ListNotesQueryInput = {
 	limit: number;
 	offset: number;
 };
+type AssetRow = {
+	id: string;
+	noteId: string;
+	r2Key: string;
+	fileName: string | null;
+	mimeType: string;
+	sizeBytes: number;
+	width: number | null;
+	height: number | null;
+	sha256: string | null;
+	createdAt: string;
+};
+type NoteBodyStorageResult = {
+	storageType: "d1" | "r2";
+	bodyText: string | null;
+	bodyR2Key: string | null;
+	plainBodyText: string;
+	sizeBytes: number;
+	wordCount: number;
+};
 
 const LINK_PATTERN = /\[\[([^\[\]]+)\]\]/g;
+const DEFAULT_BODY_R2_THRESHOLD_BYTES = 64 * 1024;
+const NOTE_BODY_R2_PREFIX = "note-bodies";
+const ASSET_R2_PREFIX = "assets";
 type PresetFolder = {
 	id: string;
 	name: string;
@@ -372,14 +395,15 @@ app.get("/api/notes", async (c) => {
 		limit,
 		offset,
 	});
+	const hydratedNotes = await hydrateNoteBodiesFromR2(c.env, notes);
 
-	const tagsByNote = await fetchTagsByNoteIds(c.env.DB, notes.map((item) => item.id));
+	const tagsByNote = await fetchTagsByNoteIds(c.env.DB, hydratedNotes.map((item) => item.id));
 	return jsonOk(c, {
-		items: notes.map((note) => ({
+		items: hydratedNotes.map((note) => ({
 			...note,
 			tags: tagsByNote.get(note.id) ?? [],
 		})),
-		paging: { limit, offset, count: notes.length },
+		paging: { limit, offset, count: hydratedNotes.length },
 		filters: { folderId, tagIds, tagMode, keyword, status },
 		search: { mode, keyword },
 	});
@@ -392,7 +416,8 @@ app.get("/api/notes/:id", async (c) => {
 		return jsonError(c, 404, "Note not found");
 	}
 	const tags = await fetchTagsForSingleNote(c.env.DB, noteId);
-	return jsonOk(c, { ...note, tags });
+	const hydrated = await hydrateNoteBodyFromR2(c.env, note);
+	return jsonOk(c, { ...hydrated, tags });
 });
 
 app.get("/api/notes/:id/links", async (c) => {
@@ -473,7 +498,7 @@ app.post("/api/notes", async (c) => {
 		return jsonError(c, 400, "`storageType` must be `d1` or `r2`");
 	}
 
-	const bodyTextInput = readNullableString(payload, "bodyText");
+	const bodyTextInput = readNullableString(payload, "bodyText") ?? "";
 	const bodyR2KeyInput = readNullableString(payload, "bodyR2Key");
 	const noteId = readOptionalString(payload, "id") ?? crypto.randomUUID();
 	const initialSlug = slugify(readOptionalString(payload, "slug") ?? title);
@@ -481,16 +506,16 @@ app.post("/api/notes", async (c) => {
 	const isPinned = parseBooleanLike(payload.isPinned) ? 1 : 0;
 	const isArchived = parseBooleanLike(payload.isArchived) ? 1 : 0;
 
-	let bodyText: string | null = bodyTextInput;
-	let bodyR2Key: string | null = bodyR2KeyInput;
-	if (storageType === "d1") {
-		bodyText = bodyText ?? "";
-		bodyR2Key = null;
-	} else {
-		bodyText = null;
-		if (!bodyR2Key) {
-			return jsonError(c, 400, "`bodyR2Key` is required when storageType is `r2`");
-		}
+	let resolvedBody: NoteBodyStorageResult;
+	try {
+		resolvedBody = await resolveBodyStorageForCreate(c.env, {
+			noteId,
+			requestedStorageType: storageType,
+			bodyText: bodyTextInput,
+			bodyR2Key: bodyR2KeyInput,
+		});
+	} catch (error) {
+		return jsonError(c, 500, "Failed to resolve note body storage", String(error));
 	}
 
 	const tagIdsInput = toStringArray(payload.tagIds);
@@ -503,13 +528,13 @@ app.post("/api/notes", async (c) => {
 		return jsonError(c, 400, "Some tagIds do not exist", missingTagIds.join(","));
 	}
 
-	const excerpt = readOptionalString(payload, "excerpt") ?? buildExcerpt(bodyText ?? "");
+	const excerpt = readOptionalString(payload, "excerpt") ?? buildExcerpt(resolvedBody.plainBodyText);
 	const sizeBytes =
 		readOptionalNumber(payload, "sizeBytes") ??
-		(bodyText ? byteLength(bodyText) : 0);
+		resolvedBody.sizeBytes;
 	const wordCount =
 		readOptionalNumber(payload, "wordCount") ??
-		(bodyText ? countWords(bodyText) : 0);
+		resolvedBody.wordCount;
 
 	await c.env.DB.prepare(
 		`INSERT INTO notes (
@@ -523,9 +548,9 @@ app.post("/api/notes", async (c) => {
 			slug,
 			title,
 			folderId,
-			storageType,
-			bodyText,
-			bodyR2Key,
+			resolvedBody.storageType,
+			resolvedBody.bodyText,
+			resolvedBody.bodyR2Key,
 			excerpt,
 			sizeBytes,
 			wordCount,
@@ -539,16 +564,17 @@ app.post("/api/notes", async (c) => {
 	const explicitLinkSlugs = hasOwn(payload, "linkSlugs")
 		? toStringArray(payload.linkSlugs)
 		: null;
-	const desiredLinkSlugs = explicitLinkSlugs ?? (bodyText ? extractLinkSlugs(bodyText) : []);
+	const desiredLinkSlugs = explicitLinkSlugs ?? extractLinkSlugs(resolvedBody.plainBodyText);
 	const linkResult = await replaceNoteLinks(c.env.DB, noteId, desiredLinkSlugs);
 
 	const created = await getNoteById(c.env.DB, noteId);
 	const tags = await fetchTagsForSingleNote(c.env.DB, noteId);
+	const hydrated = created ? await hydrateNoteBodyFromR2(c.env, created) : null;
 
 	return jsonOk(
 		c,
 		{
-			...(created as NoteRow),
+			...(hydrated as NoteRow),
 			tags,
 			links: linkResult,
 		},
@@ -589,23 +615,24 @@ app.put("/api/notes/:id", async (c) => {
 	if (!storageTypeCandidate) {
 		return jsonError(c, 400, "`storageType` must be `d1` or `r2`");
 	}
-	const nextStorageType = storageTypeCandidate;
-
-	let nextBodyText = hasOwn(payload, "bodyText")
+	const nextBodyTextInput = hasOwn(payload, "bodyText")
 		? readNullableString(payload, "bodyText")
-		: existing.bodyText;
-	let nextBodyR2Key = hasOwn(payload, "bodyR2Key")
+		: undefined;
+	const nextBodyR2KeyInput = hasOwn(payload, "bodyR2Key")
 		? readNullableString(payload, "bodyR2Key")
-		: existing.bodyR2Key;
+		: undefined;
 
-	if (nextStorageType === "d1") {
-		nextBodyText = nextBodyText ?? "";
-		nextBodyR2Key = null;
-	} else {
-		nextBodyText = null;
-		if (!nextBodyR2Key) {
-			return jsonError(c, 400, "`bodyR2Key` is required when storageType is `r2`");
-		}
+	let resolvedBody: NoteBodyStorageResult;
+	try {
+		resolvedBody = await resolveBodyStorageForUpdate(c.env, {
+			noteId,
+			requestedStorageType: storageTypeCandidate,
+			bodyTextInput: nextBodyTextInput,
+			bodyR2KeyInput: nextBodyR2KeyInput,
+			existing,
+		});
+	} catch (error) {
+		return jsonError(c, 500, "Failed to resolve note body storage", String(error));
 	}
 
 	const requestedSlug = hasOwn(payload, "slug")
@@ -624,18 +651,14 @@ app.put("/api/notes/:id", async (c) => {
 		? (parseBooleanLike(payload.isArchived) ? 1 : 0)
 		: existing.isArchived;
 	const nextExcerpt = hasOwn(payload, "excerpt")
-		? (readOptionalString(payload, "excerpt") ?? buildExcerpt(nextBodyText ?? ""))
-		: buildExcerpt(nextBodyText ?? existing.bodyText ?? "");
+		? (readOptionalString(payload, "excerpt") ?? buildExcerpt(resolvedBody.plainBodyText))
+		: buildExcerpt(resolvedBody.plainBodyText);
 	const nextSizeBytes = hasOwn(payload, "sizeBytes")
 		? (readOptionalNumber(payload, "sizeBytes") ?? 0)
-		: nextBodyText
-			? byteLength(nextBodyText)
-			: existing.sizeBytes;
+		: resolvedBody.sizeBytes;
 	const nextWordCount = hasOwn(payload, "wordCount")
 		? (readOptionalNumber(payload, "wordCount") ?? 0)
-		: nextBodyText
-			? countWords(nextBodyText)
-			: existing.wordCount;
+		: resolvedBody.wordCount;
 
 	await c.env.DB.prepare(
 		`UPDATE notes
@@ -656,9 +679,9 @@ app.put("/api/notes/:id", async (c) => {
 			nextSlug,
 			nextTitle,
 			nextFolderId,
-			nextStorageType,
-			nextBodyText,
-			nextBodyR2Key,
+			resolvedBody.storageType,
+			resolvedBody.bodyText,
+			resolvedBody.bodyR2Key,
 			nextExcerpt,
 			nextSizeBytes,
 			nextWordCount,
@@ -689,19 +712,20 @@ app.put("/api/notes/:id", async (c) => {
 	let linkResult: { inserted: number; unresolvedSlugs: string[] } | null = null;
 	const shouldSyncLinks =
 		hasOwn(payload, "linkSlugs") ||
-		(nextStorageType === "d1" && hasOwn(payload, "bodyText"));
+		hasOwn(payload, "bodyText");
 	if (shouldSyncLinks) {
 		const explicitLinkSlugs = hasOwn(payload, "linkSlugs")
 			? toStringArray(payload.linkSlugs)
 			: null;
 		const desired = explicitLinkSlugs ??
-			(nextStorageType === "d1" && nextBodyText ? extractLinkSlugs(nextBodyText) : []);
+			extractLinkSlugs(resolvedBody.plainBodyText);
 		linkResult = await replaceNoteLinks(c.env.DB, noteId, desired);
 	}
 
 	const updated = await getNoteById(c.env.DB, noteId);
 	const tags = await fetchTagsForSingleNote(c.env.DB, noteId);
-	return jsonOk(c, { ...(updated as NoteRow), tags, links: linkResult });
+	const hydrated = updated ? await hydrateNoteBodyFromR2(c.env, updated) : null;
+	return jsonOk(c, { ...(hydrated as NoteRow), tags, links: linkResult });
 });
 
 app.delete("/api/notes/:id", async (c) => {
@@ -784,11 +808,269 @@ app.delete("/api/notes/:id/hard", async (c) => {
 		return jsonError(c, 409, "Only deleted notes can be permanently removed");
 	}
 
+	const assetKeys = await listAssetKeysByNoteId(c.env.DB, noteId);
+	await deleteObjectsFromR2(c.env, [
+		...assetKeys,
+		existing.bodyR2Key,
+	]);
+
 	await c.env.DB.prepare("DELETE FROM notes WHERE id = ?")
 		.bind(noteId)
 		.run();
 
 	return jsonOk(c, { id: noteId, deleted: true, hardDeleted: true });
+});
+
+app.get("/api/notes/:id/assets", async (c) => {
+	const noteId = c.req.param("id");
+	const note = await getNoteById(c.env.DB, noteId);
+	if (!note || note.deletedAt) {
+		return jsonError(c, 404, "Note not found");
+	}
+	const { results } = await c.env.DB.prepare(
+		`SELECT
+			id,
+			note_id AS noteId,
+			r2_key AS r2Key,
+			file_name AS fileName,
+			mime_type AS mimeType,
+			size_bytes AS sizeBytes,
+			width,
+			height,
+			sha256,
+			created_at AS createdAt
+		 FROM assets
+		 WHERE note_id = ?
+		 ORDER BY created_at DESC`,
+	)
+		.bind(noteId)
+		.all<AssetRow>();
+	return jsonOk(c, results.map((item) => ({
+		...item,
+		downloadUrl: buildAssetDownloadUrl(item.id),
+	})));
+});
+
+app.post("/api/assets/upload", async (c) => {
+	const form = await c.req.formData().catch(() => null);
+	if (!form) {
+		return jsonError(c, 400, "Invalid form data");
+	}
+	const noteIdRaw = form.get("noteId");
+	const noteId = typeof noteIdRaw === "string" ? noteIdRaw.trim() : "";
+	if (!noteId) {
+		return jsonError(c, 400, "`noteId` is required");
+	}
+	const note = await getNoteById(c.env.DB, noteId);
+	if (!note || note.deletedAt) {
+		return jsonError(c, 404, "Note not found");
+	}
+	const fileValue = form.get("file");
+	if (!(fileValue instanceof File)) {
+		return jsonError(c, 400, "`file` is required");
+	}
+	if (fileValue.size <= 0) {
+		return jsonError(c, 400, "Empty file is not allowed");
+	}
+
+	const bucket = getNotesBucket(c.env);
+	if (!bucket) {
+		return jsonError(c, 500, "R2 bucket binding `NOTES_BUCKET` is missing");
+	}
+
+	const assetId = crypto.randomUUID();
+	const fileName = sanitizeFileName(fileValue.name || "attachment");
+	const r2Key = `${ASSET_R2_PREFIX}/${noteId}/${assetId}-${fileName}`;
+	const binary = await fileValue.arrayBuffer();
+	await bucket.put(r2Key, binary, {
+		httpMetadata: {
+			contentType: fileValue.type || "application/octet-stream",
+		},
+	});
+
+	const sha256 = await sha256Hex(binary);
+	await c.env.DB.prepare(
+		`INSERT INTO assets (
+			id, note_id, r2_key, file_name, mime_type, size_bytes, width, height, sha256
+		) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?)`,
+	)
+		.bind(
+			assetId,
+			noteId,
+			r2Key,
+			fileName,
+			fileValue.type || "application/octet-stream",
+			fileValue.size,
+			sha256,
+		)
+		.run();
+
+	const created = await c.env.DB.prepare(
+		`SELECT
+			id,
+			note_id AS noteId,
+			r2_key AS r2Key,
+			file_name AS fileName,
+			mime_type AS mimeType,
+			size_bytes AS sizeBytes,
+			width,
+			height,
+			sha256,
+			created_at AS createdAt
+		 FROM assets
+		 WHERE id = ?`,
+	)
+		.bind(assetId)
+		.first<AssetRow>();
+
+	return jsonOk(c, {
+		...(created as AssetRow),
+		downloadUrl: buildAssetDownloadUrl(assetId),
+	}, 201);
+});
+
+app.get("/api/assets/:id/content", async (c) => {
+	const assetId = c.req.param("id");
+	const asset = await c.env.DB.prepare(
+		`SELECT
+			id,
+			note_id AS noteId,
+			r2_key AS r2Key,
+			file_name AS fileName,
+			mime_type AS mimeType,
+			size_bytes AS sizeBytes,
+			width,
+			height,
+			sha256,
+			created_at AS createdAt
+		 FROM assets
+		 WHERE id = ?
+		 LIMIT 1`,
+	)
+		.bind(assetId)
+		.first<AssetRow>();
+	if (!asset) {
+		return jsonError(c, 404, "Asset not found");
+	}
+
+	const bucket = getNotesBucket(c.env);
+	if (!bucket) {
+		return jsonError(c, 500, "R2 bucket binding `NOTES_BUCKET` is missing");
+	}
+	const object = await bucket.get(asset.r2Key);
+	if (!object) {
+		return jsonError(c, 404, "Asset object not found");
+	}
+
+	const headers = new Headers();
+	headers.set("Content-Type", asset.mimeType || "application/octet-stream");
+	headers.set("Cache-Control", "public, max-age=300");
+	if (asset.fileName) {
+		headers.set("Content-Disposition", `inline; filename="${asset.fileName.replace(/"/g, "'")}"`);
+	}
+	return new Response(object.body, { status: 200, headers });
+});
+
+app.delete("/api/assets/:id", async (c) => {
+	const assetId = c.req.param("id");
+	const asset = await c.env.DB.prepare(
+		`SELECT
+			id,
+			note_id AS noteId,
+			r2_key AS r2Key,
+			file_name AS fileName,
+			mime_type AS mimeType,
+			size_bytes AS sizeBytes,
+			width,
+			height,
+			sha256,
+			created_at AS createdAt
+		 FROM assets
+		 WHERE id = ?
+		 LIMIT 1`,
+	)
+		.bind(assetId)
+		.first<AssetRow>();
+	if (!asset) {
+		return jsonError(c, 404, "Asset not found");
+	}
+
+	await deleteObjectsFromR2(c.env, [asset.r2Key]);
+	await c.env.DB.prepare("DELETE FROM assets WHERE id = ?")
+		.bind(assetId)
+		.run();
+	return jsonOk(c, { id: assetId, deleted: true });
+});
+
+app.post("/api/notes/storage/migrate", async (c) => {
+	const payload = (await parseObjectBody(c)) ?? {};
+	const dryRun = parseBooleanLike(payload.dryRun);
+	const limit = clampInt(
+		typeof payload.limit === "string" ? payload.limit : String(readOptionalNumber(payload, "limit") ?? "50"),
+		50,
+		1,
+		200,
+	);
+	const minBytes = clampInt(
+		typeof payload.minBytes === "string"
+			? payload.minBytes
+			: String(readOptionalNumber(payload, "minBytes") ?? getBodyR2ThresholdBytes(c.env)),
+		getBodyR2ThresholdBytes(c.env),
+		1,
+		5_000_000,
+	);
+
+	const bucket = getNotesBucket(c.env);
+	if (!bucket) {
+		return jsonError(c, 500, "R2 bucket binding `NOTES_BUCKET` is missing");
+	}
+
+	const { results } = await c.env.DB.prepare(
+		`SELECT
+			id,
+			body_text AS bodyText,
+			size_bytes AS sizeBytes
+		 FROM notes
+		 WHERE storage_type = 'd1'
+		   AND body_text IS NOT NULL
+		   AND size_bytes >= ?
+		   AND deleted_at IS NULL
+		 ORDER BY updated_at DESC
+		 LIMIT ?`,
+	)
+		.bind(minBytes, limit)
+		.all<{ id: string; bodyText: string; sizeBytes: number }>();
+
+	const migrated: string[] = [];
+	for (const item of results) {
+		if (dryRun) {
+			migrated.push(item.id);
+			continue;
+		}
+		const bodyR2Key = `${NOTE_BODY_R2_PREFIX}/${item.id}.md`;
+		await bucket.put(bodyR2Key, item.bodyText, {
+			httpMetadata: { contentType: "text/markdown; charset=utf-8" },
+		});
+		await c.env.DB.prepare(
+			`UPDATE notes
+			 SET storage_type = 'r2',
+				 body_text = NULL,
+				 body_r2_key = ?
+			 WHERE id = ?`,
+		)
+			.bind(bodyR2Key, item.id)
+			.run();
+		migrated.push(item.id);
+	}
+
+	return jsonOk(c, {
+		dryRun,
+		limit,
+		minBytes,
+		scanned: results.length,
+		migrated: migrated.length,
+		noteIds: migrated,
+	});
 });
 
 app.all("/api/*", (c) => jsonError(c, 404, "API route not found"));
@@ -950,6 +1232,223 @@ function clampInt(value: string | undefined, fallback: number, min: number, max:
 		return fallback;
 	}
 	return Math.min(max, Math.max(min, parsed));
+}
+
+function getNotesBucket(env: Env): R2Bucket | null {
+	return "NOTES_BUCKET" in env && env.NOTES_BUCKET ? env.NOTES_BUCKET : null;
+}
+
+function getBodyR2ThresholdBytes(env: Env): number {
+	const value = "BODY_R2_THRESHOLD_BYTES" in env ? Number(env.BODY_R2_THRESHOLD_BYTES) : Number.NaN;
+	if (Number.isFinite(value) && value > 0) {
+		return Math.trunc(value);
+	}
+	return DEFAULT_BODY_R2_THRESHOLD_BYTES;
+}
+
+async function resolveBodyStorageForCreate(
+	env: Env,
+	input: {
+		noteId: string;
+		requestedStorageType: "d1" | "r2";
+		bodyText: string;
+		bodyR2Key: string | null;
+	},
+): Promise<NoteBodyStorageResult> {
+	const plainBodyText = input.bodyText;
+	const sizeBytes = byteLength(plainBodyText);
+	const wordCount = countWords(plainBodyText);
+	const threshold = getBodyR2ThresholdBytes(env);
+	const bucket = getNotesBucket(env);
+
+	if (input.requestedStorageType === "r2") {
+		const key = input.bodyR2Key || `${NOTE_BODY_R2_PREFIX}/${input.noteId}.md`;
+		if (!input.bodyR2Key) {
+			if (!bucket) {
+				throw new Error("R2 bucket binding `NOTES_BUCKET` is missing");
+			}
+			await bucket.put(key, plainBodyText, {
+				httpMetadata: { contentType: "text/markdown; charset=utf-8" },
+			});
+		}
+		return {
+			storageType: "r2",
+			bodyText: null,
+			bodyR2Key: key,
+			plainBodyText,
+			sizeBytes,
+			wordCount,
+		};
+	}
+
+	if (sizeBytes > threshold) {
+		if (!bucket) {
+			throw new Error("R2 bucket binding `NOTES_BUCKET` is missing");
+		}
+		const key = `${NOTE_BODY_R2_PREFIX}/${input.noteId}.md`;
+		await bucket.put(key, plainBodyText, {
+			httpMetadata: { contentType: "text/markdown; charset=utf-8" },
+		});
+		return {
+			storageType: "r2",
+			bodyText: null,
+			bodyR2Key: key,
+			plainBodyText,
+			sizeBytes,
+			wordCount,
+		};
+	}
+
+	return {
+		storageType: "d1",
+		bodyText: plainBodyText,
+		bodyR2Key: null,
+		plainBodyText,
+		sizeBytes,
+		wordCount,
+	};
+}
+
+async function resolveBodyStorageForUpdate(
+	env: Env,
+	input: {
+		noteId: string;
+		requestedStorageType: "d1" | "r2";
+		bodyTextInput: string | null | undefined;
+		bodyR2KeyInput: string | null | undefined;
+		existing: NoteRow;
+	},
+): Promise<NoteBodyStorageResult> {
+	const bodyChanged = input.bodyTextInput !== undefined;
+	const storageChanged = input.requestedStorageType !== input.existing.storageType;
+	const bodyR2KeyChanged = input.bodyR2KeyInput !== undefined;
+	const noStorageMutation = !bodyChanged && !storageChanged && !bodyR2KeyChanged;
+
+	if (noStorageMutation) {
+		const plain = input.existing.storageType === "d1"
+			? (input.existing.bodyText ?? "")
+			: await readNoteBodyFromR2(env, input.existing.bodyR2Key);
+		return {
+			storageType: input.existing.storageType,
+			bodyText: input.existing.bodyText,
+			bodyR2Key: input.existing.bodyR2Key,
+			plainBodyText: plain,
+			sizeBytes: byteLength(plain),
+			wordCount: countWords(plain),
+		};
+	}
+
+	let plainBodyText = "";
+	if (bodyChanged) {
+		plainBodyText = input.bodyTextInput ?? "";
+	} else if (input.existing.storageType === "d1") {
+		plainBodyText = input.existing.bodyText ?? "";
+	} else {
+		plainBodyText = await readNoteBodyFromR2(env, input.existing.bodyR2Key);
+	}
+
+	const sizeBytes = byteLength(plainBodyText);
+	const wordCount = countWords(plainBodyText);
+	const threshold = getBodyR2ThresholdBytes(env);
+	const bucket = getNotesBucket(env);
+
+	if (input.requestedStorageType === "r2") {
+		const key = input.bodyR2KeyInput ?? input.existing.bodyR2Key ?? `${NOTE_BODY_R2_PREFIX}/${input.noteId}.md`;
+		const shouldWriteBody =
+			bodyChanged ||
+			!input.existing.bodyR2Key ||
+			(input.bodyR2KeyInput !== undefined && input.bodyR2KeyInput !== input.existing.bodyR2Key);
+		if (shouldWriteBody) {
+			if (!bucket) {
+				throw new Error("R2 bucket binding `NOTES_BUCKET` is missing");
+			}
+			await bucket.put(key, plainBodyText, {
+				httpMetadata: { contentType: "text/markdown; charset=utf-8" },
+			});
+		}
+		if (input.existing.bodyR2Key && input.existing.bodyR2Key !== key) {
+			await deleteObjectsFromR2(env, [input.existing.bodyR2Key]);
+		}
+		return {
+			storageType: "r2",
+			bodyText: null,
+			bodyR2Key: key,
+			plainBodyText,
+			sizeBytes,
+			wordCount,
+		};
+	}
+
+	if (sizeBytes > threshold) {
+		if (!bucket) {
+			throw new Error("R2 bucket binding `NOTES_BUCKET` is missing");
+		}
+		const key = input.existing.bodyR2Key ?? `${NOTE_BODY_R2_PREFIX}/${input.noteId}.md`;
+		await bucket.put(key, plainBodyText, {
+			httpMetadata: { contentType: "text/markdown; charset=utf-8" },
+		});
+		return {
+			storageType: "r2",
+			bodyText: null,
+			bodyR2Key: key,
+			plainBodyText,
+			sizeBytes,
+			wordCount,
+		};
+	}
+
+	if (input.existing.bodyR2Key) {
+		await deleteObjectsFromR2(env, [input.existing.bodyR2Key]);
+	}
+	return {
+		storageType: "d1",
+		bodyText: plainBodyText,
+		bodyR2Key: null,
+		plainBodyText,
+		sizeBytes,
+		wordCount,
+	};
+}
+
+async function hydrateNoteBodiesFromR2(env: Env, notes: NoteRow[]): Promise<NoteRow[]> {
+	return Promise.all(notes.map((note) => hydrateNoteBodyFromR2(env, note)));
+}
+
+async function hydrateNoteBodyFromR2(env: Env, note: NoteRow): Promise<NoteRow> {
+	if (note.storageType !== "r2") {
+		return note;
+	}
+	const text = await readNoteBodyFromR2(env, note.bodyR2Key);
+	return {
+		...note,
+		bodyText: text,
+	};
+}
+
+async function readNoteBodyFromR2(env: Env, bodyR2Key: string | null): Promise<string> {
+	if (!bodyR2Key) {
+		return "";
+	}
+	const bucket = getNotesBucket(env);
+	if (!bucket) {
+		return "";
+	}
+	const object = await bucket.get(bodyR2Key);
+	if (!object) {
+		return "";
+	}
+	return object.text();
+}
+
+async function deleteObjectsFromR2(env: Env, keys: Array<string | null | undefined>): Promise<void> {
+	const bucket = getNotesBucket(env);
+	if (!bucket) {
+		return;
+	}
+	const filtered = [...new Set(keys.filter((key): key is string => Boolean(key)))];
+	for (const key of filtered) {
+		await bucket.delete(key);
+	}
 }
 
 async function listNotesWithSearchMode(
@@ -1305,6 +1804,36 @@ async function getNoteById(db: D1Database, noteId: string): Promise<NoteRow | nu
 		.bind(noteId)
 		.first<NoteRow>();
 	return note ?? null;
+}
+
+function buildAssetDownloadUrl(assetId: string): string {
+	return `/api/assets/${encodeURIComponent(assetId)}/content`;
+}
+
+function sanitizeFileName(input: string): string {
+	const trimmed = input.trim();
+	const sanitized = trimmed
+		.replace(/[^\p{L}\p{N}._-]+/gu, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 120);
+	return sanitized || "attachment";
+}
+
+async function sha256Hex(value: ArrayBuffer): Promise<string> {
+	const digest = await crypto.subtle.digest("SHA-256", value);
+	const bytes = new Uint8Array(digest);
+	return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function listAssetKeysByNoteId(db: D1Database, noteId: string): Promise<string[]> {
+	const { results } = await db.prepare(
+		`SELECT r2_key AS r2Key
+		 FROM assets
+		 WHERE note_id = ?`,
+	)
+		.bind(noteId)
+		.all<{ r2Key: string }>();
+	return results.map((item) => item.r2Key);
 }
 
 async function fetchTagsForSingleNote(db: D1Database, noteId: string): Promise<TagRow[]> {

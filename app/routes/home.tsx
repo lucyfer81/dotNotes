@@ -5,16 +5,20 @@ import {
 	archiveNote,
 	createFolder,
 	createNote,
+	deleteNoteAsset,
 	deleteNote,
 	getNoteLinks,
 	hardDeleteNote,
 	listFolders,
+	listNoteAssets,
 	listNotes,
 	listTags,
 	restoreNote,
+	uploadNoteAsset,
 	updateFolder,
 	updateNote,
 	type FolderApiItem,
+	type NoteAssetApiItem,
 	type NoteLinkApiItem,
 	type NoteLinksApiItem,
 	type NoteApiItem,
@@ -125,6 +129,11 @@ export default function Home() {
 	const [recentNoteIds, setRecentNoteIds] = useState<string[]>([]);
 	const [noteLinks, setNoteLinks] = useState<NoteLinksApiItem | null>(null);
 	const [isLoadingNoteLinks, setIsLoadingNoteLinks] = useState(false);
+	const [noteAssets, setNoteAssets] = useState<NoteAssetApiItem[]>([]);
+	const [isLoadingAssets, setIsLoadingAssets] = useState(false);
+	const [isUploadingAsset, setIsUploadingAsset] = useState(false);
+	const [deletingAssetId, setDeletingAssetId] = useState("");
+	const [assetErrorMessage, setAssetErrorMessage] = useState("");
 	const [isClientReady, setIsClientReady] = useState(false);
 	const [markdownEditorComponent, setMarkdownEditorComponent] =
 		useState<ComponentType<{
@@ -620,6 +629,39 @@ export default function Home() {
 	}, [activeNoteId, activeNote?.updatedAt, noteStatusFilter]);
 
 	useEffect(() => {
+		if (!activeNoteId || !activeNote || activeNote.deletedAt) {
+			setNoteAssets([]);
+			setIsLoadingAssets(false);
+			setAssetErrorMessage("");
+			return;
+		}
+
+		let cancelled = false;
+		setIsLoadingAssets(true);
+		void listNoteAssets(activeNoteId)
+			.then((assets) => {
+				if (!cancelled) {
+					setNoteAssets(assets);
+				}
+			})
+			.catch((error) => {
+				if (!cancelled) {
+					setNoteAssets([]);
+					setAssetErrorMessage(readErrorMessage(error));
+				}
+			})
+			.finally(() => {
+				if (!cancelled) {
+					setIsLoadingAssets(false);
+				}
+			});
+
+		return () => {
+			cancelled = true;
+		};
+	}, [activeNoteId, activeNote?.updatedAt, activeNote?.deletedAt]);
+
+	useEffect(() => {
 		if (!commandOpen) {
 			return;
 		}
@@ -810,6 +852,58 @@ export default function Home() {
 		handleDraftChange(nextValue);
 		setLinkInsertOpen(false);
 		setLinkInsertQuery("");
+	};
+
+	const handleInsertAssetLink = (asset: NoteAssetApiItem) => {
+		if (!activeNote || isActiveNoteDeleted) {
+			return;
+		}
+		const label = asset.fileName || "attachment";
+		const escapedLabel = label.replace(/\]/g, "\\]");
+		const nextValue = draft.length === 0
+			? `[${escapedLabel}](${asset.downloadUrl})`
+			: `${draft}${draft.endsWith("\n") ? "" : "\n"}[${escapedLabel}](${asset.downloadUrl})`;
+		handleDraftChange(nextValue);
+	};
+
+	const handleUploadAsset = async (files: FileList | null) => {
+		if (!activeNote || isActiveNoteDeleted || !files || files.length === 0) {
+			return;
+		}
+		const file = files[0];
+		setIsUploadingAsset(true);
+		setAssetErrorMessage("");
+		try {
+			const uploaded = await uploadNoteAsset(activeNote.id, file);
+			setNoteAssets((prev) => [uploaded, ...prev.filter((item) => item.id !== uploaded.id)]);
+			handleInsertAssetLink(uploaded);
+		} catch (error) {
+			setAssetErrorMessage(readErrorMessage(error));
+		} finally {
+			setIsUploadingAsset(false);
+		}
+	};
+
+	const handleDeleteAsset = async (asset: NoteAssetApiItem) => {
+		if (!activeNote || isActiveNoteDeleted || deletingAssetId) {
+			return;
+		}
+		if (typeof window !== "undefined") {
+			const confirmed = window.confirm(`确定删除附件「${asset.fileName || asset.id}」吗？`);
+			if (!confirmed) {
+				return;
+			}
+		}
+		setDeletingAssetId(asset.id);
+		setAssetErrorMessage("");
+		try {
+			await deleteNoteAsset(asset.id);
+			setNoteAssets((prev) => prev.filter((item) => item.id !== asset.id));
+		} catch (error) {
+			setAssetErrorMessage(readErrorMessage(error));
+		} finally {
+			setDeletingAssetId("");
+		}
 	};
 
 	const closeLinkInsertPanel = () => {
@@ -1657,6 +1751,19 @@ export default function Home() {
 											/>
 										</div>
 									) : null}
+									<div className="mt-3">
+										<AttachmentPanel
+											assets={noteAssets}
+											isLoading={isLoadingAssets}
+											isUploading={isUploadingAsset}
+											deletingAssetId={deletingAssetId}
+											disabled={!activeNote || isActiveNoteDeleted || isDeletingNote || isArchivingNote || isRestoringNote}
+											errorMessage={assetErrorMessage}
+											onUpload={handleUploadAsset}
+											onInsert={handleInsertAssetLink}
+											onDelete={handleDeleteAsset}
+										/>
+									</div>
 								</div>
 
 								{focusEditorMode === "edit" ? (
@@ -2021,6 +2128,19 @@ export default function Home() {
 										/>
 									</div>
 								) : null}
+								<div className="mb-2">
+									<AttachmentPanel
+										assets={noteAssets}
+										isLoading={isLoadingAssets}
+										isUploading={isUploadingAsset}
+										deletingAssetId={deletingAssetId}
+										disabled={!activeNote || isActiveNoteDeleted || isDeletingNote || isArchivingNote || isRestoringNote}
+										errorMessage={assetErrorMessage}
+										onUpload={handleUploadAsset}
+										onInsert={handleInsertAssetLink}
+										onDelete={handleDeleteAsset}
+									/>
+								</div>
 								{mobileEditorMode === "edit" ? (
 								<textarea
 									value={draft}
@@ -2308,6 +2428,93 @@ function WikiLinkInsertPanel(props: {
 					))
 					: null}
 			</div>
+		</section>
+	);
+}
+
+function AttachmentPanel(props: {
+	assets: NoteAssetApiItem[];
+	isLoading: boolean;
+	isUploading: boolean;
+	deletingAssetId: string;
+	disabled: boolean;
+	errorMessage: string;
+	onUpload: (files: FileList | null) => void;
+	onInsert: (asset: NoteAssetApiItem) => void;
+	onDelete: (asset: NoteAssetApiItem) => void;
+}) {
+	const { assets, isLoading, isUploading, deletingAssetId, disabled, errorMessage, onUpload, onInsert, onDelete } = props;
+	return (
+		<section className="rounded-xl border border-slate-200 bg-slate-50/70 p-2">
+			<div className="mb-2 flex items-center justify-between">
+				<p className="text-xs font-medium text-slate-600">附件</p>
+				<label
+					className={`rounded-md border px-2 py-1 text-[11px] ${
+						disabled || isUploading
+							? "cursor-not-allowed border-slate-200 text-slate-300"
+							: "border-slate-200 text-slate-600 hover:bg-slate-100"
+					}`}
+				>
+					{isUploading ? "上传中..." : "上传"}
+					<input
+						type="file"
+						disabled={disabled || isUploading}
+						className="hidden"
+						onChange={(event) => {
+							onUpload(event.target.files);
+							event.currentTarget.value = "";
+						}}
+					/>
+				</label>
+			</div>
+			{errorMessage ? (
+				<p className="mb-2 rounded-md bg-rose-50 px-2 py-1 text-xs text-rose-600">{errorMessage}</p>
+			) : null}
+			<div className="max-h-32 space-y-1 overflow-y-auto pr-1">
+				{isLoading ? <p className="px-2 py-1 text-xs text-slate-400">加载中...</p> : null}
+				{!isLoading && assets.length === 0 ? <p className="px-2 py-1 text-xs text-slate-400">暂无附件</p> : null}
+				{!isLoading
+					? assets.map((asset) => (
+						<div
+							key={asset.id}
+							className="flex items-center justify-between gap-2 rounded-md border border-slate-200 bg-white px-2 py-1"
+						>
+							<button
+								type="button"
+								className="min-w-0 flex-1 truncate text-left text-xs text-slate-700 hover:text-slate-900"
+								onClick={() => onInsert(asset)}
+								disabled={disabled}
+								title={asset.fileName || asset.id}
+							>
+								{asset.fileName || asset.id}
+							</button>
+							<div className="flex items-center gap-1">
+								<a
+									href={asset.downloadUrl}
+									target="_blank"
+									rel="noreferrer"
+									className="rounded border border-slate-200 px-2 py-0.5 text-[11px] text-slate-500 hover:bg-slate-100"
+								>
+									查看
+								</a>
+								<button
+									type="button"
+									onClick={() => onDelete(asset)}
+									disabled={disabled || deletingAssetId === asset.id}
+									className={`rounded border px-2 py-0.5 text-[11px] ${
+										disabled || deletingAssetId === asset.id
+											? "cursor-not-allowed border-slate-200 text-slate-300"
+											: "border-rose-200 text-rose-600 hover:bg-rose-50"
+									}`}
+								>
+									{deletingAssetId === asset.id ? "删除中" : "删除"}
+								</button>
+							</div>
+						</div>
+					))
+					: null}
+			</div>
+			<p className="mt-2 px-1 text-[11px] text-slate-400">点击文件名可插入 Markdown 链接。</p>
 		</section>
 	);
 }
