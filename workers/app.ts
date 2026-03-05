@@ -42,6 +42,16 @@ type NoteRow = {
 	createdAt: string;
 	updatedAt: string;
 };
+type NoteSearchMode = "none" | "fts" | "like-fallback";
+type ListNotesQueryInput = {
+	folderId: string | null;
+	tagIds: string[];
+	tagMode: TagMode;
+	keyword: string;
+	status: NoteStatusFilter;
+	limit: number;
+	offset: number;
+};
 
 const LINK_PATTERN = /\[\[([^\[\]]+)\]\]/g;
 type PresetFolder = {
@@ -353,74 +363,15 @@ app.get("/api/notes", async (c) => {
 	const status = normalizeNoteStatus(c.req.query("status"), c.req.query("includeArchived"));
 	const limit = clampInt(c.req.query("limit"), 20, 1, 100);
 	const offset = clampInt(c.req.query("offset"), 0, 0, 10000);
-
-	const where: string[] = [];
-	const params: Array<string | number> = [];
-
-	where.push(buildNoteStatusWhere("n", status));
-	if (folderId) {
-		where.push("n.folder_id = ?");
-		params.push(folderId);
-	}
-	if (keyword) {
-		const search = `%${keyword}%`;
-		where.push("(n.title LIKE ? OR n.excerpt LIKE ? OR COALESCE(n.body_text, '') LIKE ?)");
-		params.push(search, search, search);
-	}
-	if (tagIds.length > 0) {
-		const marks = placeholders(tagIds.length);
-		if (tagMode === "all") {
-			where.push(
-				`n.id IN (
-					SELECT nt.note_id
-					FROM note_tags nt
-					WHERE nt.tag_id IN (${marks})
-					GROUP BY nt.note_id
-					HAVING COUNT(DISTINCT nt.tag_id) = ?
-				)`,
-			);
-			params.push(...tagIds, tagIds.length);
-		} else {
-			where.push(
-				`EXISTS (
-					SELECT 1 FROM note_tags nt
-					WHERE nt.note_id = n.id AND nt.tag_id IN (${marks})
-				)`,
-			);
-			params.push(...tagIds);
-		}
-	}
-
-	const sql = `
-		SELECT
-			n.id,
-			n.slug,
-			n.title,
-			n.folder_id AS folderId,
-			n.storage_type AS storageType,
-			n.body_text AS bodyText,
-			n.body_r2_key AS bodyR2Key,
-			n.excerpt,
-			n.size_bytes AS sizeBytes,
-			n.word_count AS wordCount,
-			n.is_pinned AS isPinned,
-			n.is_archived AS isArchived,
-			n.deleted_at AS deletedAt,
-			n.created_at AS createdAt,
-			n.updated_at AS updatedAt
-		FROM notes n
-		${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
-		ORDER BY
-			CASE WHEN n.deleted_at IS NULL THEN 0 ELSE 1 END ASC,
-			n.is_pinned DESC,
-			COALESCE(n.deleted_at, n.updated_at) DESC
-		LIMIT ? OFFSET ?
-	`;
-	params.push(limit, offset);
-
-	const { results: notes } = await c.env.DB.prepare(sql)
-		.bind(...params)
-		.all<NoteRow>();
+	const { notes, mode } = await listNotesWithSearchMode(c.env.DB, {
+		folderId,
+		tagIds,
+		tagMode,
+		keyword,
+		status,
+		limit,
+		offset,
+	});
 
 	const tagsByNote = await fetchTagsByNoteIds(c.env.DB, notes.map((item) => item.id));
 	return jsonOk(c, {
@@ -430,6 +381,7 @@ app.get("/api/notes", async (c) => {
 		})),
 		paging: { limit, offset, count: notes.length },
 		filters: { folderId, tagIds, tagMode, keyword, status },
+		search: { mode, keyword },
 	});
 });
 
@@ -998,6 +950,194 @@ function clampInt(value: string | undefined, fallback: number, min: number, max:
 		return fallback;
 	}
 	return Math.min(max, Math.max(min, parsed));
+}
+
+async function listNotesWithSearchMode(
+	db: D1Database,
+	input: ListNotesQueryInput,
+): Promise<{ notes: NoteRow[]; mode: NoteSearchMode }> {
+	if (!input.keyword) {
+		const notes = await queryNotesWithLike(db, input, false);
+		return { notes, mode: "none" };
+	}
+
+	const ftsMatchQuery = buildFtsMatchQuery(input.keyword);
+	if (!ftsMatchQuery) {
+		const notes = await queryNotesWithLike(db, input, true);
+		return { notes, mode: "like-fallback" };
+	}
+
+	try {
+		const notes = await queryNotesWithFts(db, input, ftsMatchQuery);
+		return { notes, mode: "fts" };
+	} catch (error) {
+		console.error("FTS query failed, falling back to LIKE", error);
+		const notes = await queryNotesWithLike(db, input, true);
+		return { notes, mode: "like-fallback" };
+	}
+}
+
+async function queryNotesWithFts(
+	db: D1Database,
+	input: ListNotesQueryInput,
+	ftsMatchQuery: string,
+): Promise<NoteRow[]> {
+	const { where, params } = buildNotesListWhere("n", input);
+	const escapedPrefix = `${escapeLikePattern(input.keyword)}%`;
+	const sql = `
+		WITH fts_hits AS (
+			SELECT
+				rowid AS noteRowId,
+				bm25(notes_fts, 12.0, 4.0, 1.0) AS rank
+			FROM notes_fts
+			WHERE notes_fts MATCH ?
+		)
+		SELECT
+			n.id,
+			n.slug,
+			n.title,
+			n.folder_id AS folderId,
+			n.storage_type AS storageType,
+			n.body_text AS bodyText,
+			n.body_r2_key AS bodyR2Key,
+			n.excerpt,
+			n.size_bytes AS sizeBytes,
+			n.word_count AS wordCount,
+			n.is_pinned AS isPinned,
+			n.is_archived AS isArchived,
+			n.deleted_at AS deletedAt,
+			n.created_at AS createdAt,
+			n.updated_at AS updatedAt
+		FROM notes n
+		JOIN fts_hits fh ON fh.noteRowId = n.rowid
+		${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
+		ORDER BY
+			CASE WHEN LOWER(n.title) = LOWER(?) THEN 0 ELSE 1 END ASC,
+			CASE WHEN LOWER(n.title) LIKE LOWER(?) ESCAPE '\\' THEN 0 ELSE 1 END ASC,
+			fh.rank ASC,
+			n.is_pinned DESC,
+			COALESCE(n.deleted_at, n.updated_at) DESC
+		LIMIT ? OFFSET ?
+	`;
+
+	const bindings: Array<string | number> = [
+		ftsMatchQuery,
+		...params,
+		input.keyword,
+		escapedPrefix,
+		input.limit,
+		input.offset,
+	];
+	const { results } = await db.prepare(sql).bind(...bindings).all<NoteRow>();
+	return results;
+}
+
+async function queryNotesWithLike(
+	db: D1Database,
+	input: ListNotesQueryInput,
+	includeKeyword: boolean,
+): Promise<NoteRow[]> {
+	const { where, params } = buildNotesListWhere("n", input);
+	let escapedPrefix = "";
+	if (includeKeyword && input.keyword) {
+		const escapedLike = `%${escapeLikePattern(input.keyword)}%`;
+		escapedPrefix = `${escapeLikePattern(input.keyword)}%`;
+		where.push(
+			"(n.title LIKE ? ESCAPE '\\' OR n.excerpt LIKE ? ESCAPE '\\' OR COALESCE(n.body_text, '') LIKE ? ESCAPE '\\')",
+		);
+		params.push(escapedLike, escapedLike, escapedLike);
+	}
+
+	const sql = `
+		SELECT
+			n.id,
+			n.slug,
+			n.title,
+			n.folder_id AS folderId,
+			n.storage_type AS storageType,
+			n.body_text AS bodyText,
+			n.body_r2_key AS bodyR2Key,
+			n.excerpt,
+			n.size_bytes AS sizeBytes,
+			n.word_count AS wordCount,
+			n.is_pinned AS isPinned,
+			n.is_archived AS isArchived,
+			n.deleted_at AS deletedAt,
+			n.created_at AS createdAt,
+			n.updated_at AS updatedAt
+		FROM notes n
+		${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
+		ORDER BY
+			${includeKeyword && input.keyword
+				? "CASE WHEN LOWER(n.title) = LOWER(?) THEN 0 ELSE 1 END ASC,\n\t\t\tCASE WHEN LOWER(n.title) LIKE LOWER(?) ESCAPE '\\' THEN 0 ELSE 1 END ASC,"
+				: ""}
+			CASE WHEN n.deleted_at IS NULL THEN 0 ELSE 1 END ASC,
+			n.is_pinned DESC,
+			COALESCE(n.deleted_at, n.updated_at) DESC
+		LIMIT ? OFFSET ?
+	`;
+
+	const orderParams: Array<string | number> = [];
+	if (includeKeyword && input.keyword) {
+		orderParams.push(input.keyword, escapedPrefix);
+	}
+	const bindings = [...params, ...orderParams, input.limit, input.offset];
+	const { results } = await db.prepare(sql).bind(...bindings).all<NoteRow>();
+	return results;
+}
+
+function buildNotesListWhere(
+	alias: string,
+	input: Pick<ListNotesQueryInput, "folderId" | "tagIds" | "tagMode" | "status">,
+): { where: string[]; params: Array<string | number> } {
+	const where: string[] = [buildNoteStatusWhere(alias, input.status)];
+	const params: Array<string | number> = [];
+
+	if (input.folderId) {
+		where.push(`${alias}.folder_id = ?`);
+		params.push(input.folderId);
+	}
+	if (input.tagIds.length > 0) {
+		const marks = placeholders(input.tagIds.length);
+		if (input.tagMode === "all") {
+			where.push(
+				`${alias}.id IN (
+					SELECT nt.note_id
+					FROM note_tags nt
+					WHERE nt.tag_id IN (${marks})
+					GROUP BY nt.note_id
+					HAVING COUNT(DISTINCT nt.tag_id) = ?
+				)`,
+			);
+			params.push(...input.tagIds, input.tagIds.length);
+		} else {
+			where.push(
+				`EXISTS (
+					SELECT 1 FROM note_tags nt
+					WHERE nt.note_id = ${alias}.id AND nt.tag_id IN (${marks})
+				)`,
+			);
+			params.push(...input.tagIds);
+		}
+	}
+	return { where, params };
+}
+
+function buildFtsMatchQuery(keyword: string): string {
+	const tokens = keyword
+		.trim()
+		.split(/\s+/u)
+		.map((item) => item.trim())
+		.filter((item) => item.length > 0)
+		.map((item) => item.replace(/"/g, "\"\""));
+	if (tokens.length === 0) {
+		return "";
+	}
+	return tokens.map((token) => `"${token}"*`).join(" AND ");
+}
+
+function escapeLikePattern(value: string): string {
+	return value.replace(/[\\%_]/g, "\\$&");
 }
 
 function normalizeTagMode(value: string | undefined): TagMode {

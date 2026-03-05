@@ -50,6 +50,45 @@ CREATE TABLE IF NOT EXISTS notes (
 	)
 );
 
+-- Full-text search index for notes (title/excerpt/body_text).
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+	title,
+	excerpt,
+	body_text,
+	content='notes',
+	content_rowid='rowid',
+	tokenize='unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_notes_fts_insert
+AFTER INSERT ON notes
+FOR EACH ROW
+BEGIN
+	INSERT INTO notes_fts(rowid, title, excerpt, body_text)
+	VALUES (NEW.rowid, NEW.title, NEW.excerpt, COALESCE(NEW.body_text, ''));
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_notes_fts_delete
+AFTER DELETE ON notes
+FOR EACH ROW
+BEGIN
+	INSERT INTO notes_fts(notes_fts, rowid, title, excerpt, body_text)
+	VALUES ('delete', OLD.rowid, OLD.title, OLD.excerpt, COALESCE(OLD.body_text, ''));
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_notes_fts_update
+AFTER UPDATE OF title, excerpt, body_text ON notes
+FOR EACH ROW
+BEGIN
+	INSERT INTO notes_fts(notes_fts, rowid, title, excerpt, body_text)
+	VALUES ('delete', OLD.rowid, OLD.title, OLD.excerpt, COALESCE(OLD.body_text, ''));
+	INSERT INTO notes_fts(rowid, title, excerpt, body_text)
+	VALUES (NEW.rowid, NEW.title, NEW.excerpt, COALESCE(NEW.body_text, ''));
+END;
+
+-- Ensure existing rows are indexed when schema is applied to a non-empty DB.
+INSERT INTO notes_fts(notes_fts) VALUES ('rebuild');
+
 -- Many-to-many tags for the second-level filter.
 CREATE TABLE IF NOT EXISTS note_tags (
 	note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,

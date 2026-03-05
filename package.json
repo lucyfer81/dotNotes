@@ -32,10 +32,12 @@
 		"@types/node": "^24.10.1",
 		"@types/react": "19.2.7",
 		"@types/react-dom": "19.2.3",
+		"better-sqlite3": "^12.6.2",
 		"tailwindcss": "4.1.17",
 		"typescript": "5.9.3",
 		"vite": "^6.0.0",
 		"vite-tsconfig-paths": "5.1.4",
+		"vitest": "^3.2.4",
 		"wrangler": "^4.69.0"
 	},
 	"private": true,
@@ -45,6 +47,7 @@
 		"deploy": "XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-/tmp/dotnotes-codex-config} npm run build && XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-/tmp/dotnotes-codex-config} wrangler deploy",
 		"dev": "XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-/tmp/dotnotes-codex-config} react-router dev",
 		"preview": "npm run build && vite preview",
+		"test": "XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-/tmp/dotnotes-codex-config} vitest run",
 		"typecheck": "XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-/tmp/dotnotes-codex-config} npm run cf-typegen && XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-/tmp/dotnotes-codex-config} react-router typegen && tsc -b"
 	},
 	"type": "module"
