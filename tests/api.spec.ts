@@ -190,7 +190,8 @@ describe("wiki link behavior with renamed titles", () => {
 
 describe("storage strategy api", () => {
 	it("auto switches oversized body to r2 while keeping body text readable", async () => {
-		const largeBody = `# Big note\n${"large-content ".repeat(40).trimEnd()}`;
+		const uniqueToken = "r2-body-search-token-991";
+		const largeBody = `# Big note\n${"large-content ".repeat(50).trimEnd()}\n\n${uniqueToken}`;
 		const created = await createNote({
 			title: "Large Body Note",
 			folderId: "folder-10-projects",
@@ -204,6 +205,12 @@ describe("storage strategy api", () => {
 		);
 		expect(listed.data.items[0]?.storageType).toBe("r2");
 		expect(listed.data.items[0]?.bodyText).toBe(largeBody);
+
+		const bodySearch = await readEnvelope<NotesListPayload>(
+			await api(`/api/notes?q=${encodeURIComponent(uniqueToken)}&status=active`),
+		);
+		expect(bodySearch.data.items.map((item) => item.id)).toContain(created.id);
+		expect(bodySearch.data.search?.mode).toBe("fts");
 	});
 });
 
@@ -323,6 +330,65 @@ describe("index pipeline api", () => {
 		expect(retryDelete.data.processed.status).toBe("success");
 		expect(retryDelete.data.processed.chunkCount).toBe(0);
 		expect(vectorIndex.size()).toBe(0);
+	});
+});
+
+describe("ops metrics api", () => {
+	it("exposes api error/search/index metrics and alert summaries", async () => {
+		const created = await createNote({
+			title: "Ops Metrics Note",
+			folderId: "folder-10-projects",
+			bodyText: "metrics content token",
+		});
+
+		await readEnvelope(await api(`/api/notes?q=${encodeURIComponent("metrics content token")}&status=active`));
+		await api("/api/notes/not-exists");
+		await readEnvelope(await api(`/api/notes/${created.id}/index/retry`, { method: "POST" }));
+
+		const metrics = await readEnvelope<{
+			api: { totalRequests: number; errorRate: number | null };
+			search: { p95Ms: number | null };
+			index: { backlog: number; successRate: number | null };
+			alerts: Array<{ key: string; status: string }>;
+		}>(await api("/api/ops/metrics?windowMinutes=120"));
+
+		expect(metrics.data.api.totalRequests).toBeGreaterThan(0);
+		expect(metrics.data.api.errorRate).not.toBeNull();
+		expect(metrics.data.search.p95Ms).not.toBeNull();
+		expect(metrics.data.index.backlog).toBeGreaterThanOrEqual(0);
+		expect(metrics.data.alerts.some((item) => item.key === "api_error_rate")).toBe(true);
+	});
+});
+
+describe("ai pre-integration api", () => {
+	it("returns retrieval context while generation remains disabled", async () => {
+		const created = await createNote({
+			title: "AI Context Note",
+			folderId: "folder-10-projects",
+			bodyText: "This paragraph prepares ai retrieval context.",
+		});
+		await readEnvelope(await api(`/api/notes/${created.id}/index/retry`, { method: "POST" }));
+
+		const context = await readEnvelope<{
+			enabled: boolean;
+			notes: Array<{ noteId: string }>;
+			chunks: Array<{ noteId: string }>;
+		}>(await api("/api/ai/context", {
+			method: "POST",
+			body: JSON.stringify({ query: "retrieval context" }),
+		}));
+		expect(context.data.enabled).toBe(false);
+		expect(context.data.notes.map((item) => item.noteId)).toContain(created.id);
+
+		const execute = await readEnvelope<{
+			enabled: boolean;
+			answer: string | null;
+		}>(await api("/api/ai/execute", {
+			method: "POST",
+			body: JSON.stringify({ query: "retrieval context", noteId: created.id }),
+		}));
+		expect(execute.data.enabled).toBe(false);
+		expect(execute.data.answer).toBeNull();
 	});
 });
 

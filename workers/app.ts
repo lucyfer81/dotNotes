@@ -105,6 +105,37 @@ type NoteIndexProcessResult = {
 	error: string | null;
 	attemptCount: number;
 };
+type ApiMetricsAlertStatus = "ok" | "warn" | "no_data";
+type ApiMetricsAlert = {
+	key: string;
+	label: string;
+	status: ApiMetricsAlertStatus;
+	threshold: number;
+	value: number | null;
+	message: string;
+};
+type AiContextRequestInput = {
+	query: string;
+	noteId: string | null;
+	limit: number;
+	status: NoteStatusFilter;
+};
+type AiContextNoteItem = {
+	noteId: string;
+	slug: string;
+	title: string;
+	snippet: string;
+	updatedAt: string;
+	searchScore: number | null;
+};
+type AiContextChunkItem = {
+	noteId: string;
+	slug: string;
+	title: string;
+	chunkIndex: number;
+	snippet: string;
+	updatedAt: string;
+};
 
 const DEFAULT_BODY_R2_THRESHOLD_BYTES = 64 * 1024;
 const NOTE_BODY_R2_PREFIX = "note-bodies";
@@ -117,6 +148,11 @@ const DEFAULT_INDEX_VECTOR_DIMENSIONS = 64;
 const DEFAULT_INDEX_EMBEDDING_MODEL = "hash-v1";
 const DEFAULT_TAG_NAME_MAX_LENGTH = 48;
 const DEFAULT_TAG_PER_NOTE_LIMIT = 12;
+const DEFAULT_OPS_WINDOW_MINUTES = 60;
+const DEFAULT_API_ERROR_RATE_ALERT_THRESHOLD = 0.05;
+const DEFAULT_SEARCH_P95_ALERT_THRESHOLD_MS = 800;
+const DEFAULT_INDEX_SUCCESS_RATE_ALERT_THRESHOLD = 0.95;
+const DEFAULT_INDEX_BACKLOG_ALERT_THRESHOLD = 20;
 type PresetFolder = {
 	id: string;
 	name: string;
@@ -136,12 +172,36 @@ const PRESET_FOLDER_ID_SET = new Set(PRESET_FOLDERS.map((folder) => folder.id));
 const PARA_MAIN_FOLDER_ID_SET = new Set(
 	PRESET_FOLDERS.filter((folder) => folder.isParaMain).map((folder) => folder.id),
 );
+let apiMetricsSchemaReady = false;
 
 const app = new Hono<{ Bindings: Env }>();
 
 app.onError((error, c) => {
 	console.error("Unhandled API error", error);
 	return jsonError(c, 500, "Internal server error", String(error));
+});
+
+app.use("/api/*", async (c, next) => {
+	const startedAt = Date.now();
+	try {
+		await next();
+	} finally {
+		const routePath = c.req.path;
+		if (routePath.startsWith("/api/ops/")) {
+			return;
+		}
+		try {
+			await recordApiRequestEvent(c.env.DB, {
+				path: routePath,
+				method: c.req.method,
+				statusCode: c.res.status,
+				durationMs: Date.now() - startedAt,
+				isSearchRequest: isSearchNotesRequest(c),
+			});
+		} catch (error) {
+			console.error("Failed to record API metrics event", error);
+		}
+	}
 });
 
 app.get("/api/folders", async (c) => {
@@ -717,6 +777,7 @@ app.post("/api/notes", async (c) => {
 			isArchived,
 		)
 		.run();
+	await syncNoteFtsContent(c.env.DB, noteId, title, excerpt, resolvedBody.plainBodyText);
 
 	await replaceNoteTags(c.env.DB, noteId, tagIds);
 
@@ -851,6 +912,7 @@ app.put("/api/notes/:id", async (c) => {
 			noteId,
 		)
 		.run();
+	await syncNoteFtsContent(c.env.DB, noteId, nextTitle, nextExcerpt, resolvedBody.plainBodyText);
 
 	const tagIdsInput = hasOwn(payload, "tagIds")
 		? toStringArray(payload.tagIds)
@@ -1234,6 +1296,7 @@ app.post("/api/notes/storage/migrate", async (c) => {
 		)
 			.bind(bodyR2Key, item.id)
 			.run();
+		await syncNoteFtsContent(c.env.DB, item.id, undefined, undefined, item.bodyText);
 		migrated.push(item.id);
 	}
 
@@ -1383,6 +1446,59 @@ app.post("/api/notes/:id/index/retry", async (c) => {
 		noteId,
 		action,
 		processed: processed[0] ?? null,
+	});
+});
+
+app.get("/api/ops/metrics", async (c) => {
+	const windowMinutes = clampInt(c.req.query("windowMinutes"), DEFAULT_OPS_WINDOW_MINUTES, 5, 24 * 60);
+	const metrics = await buildOpsMetrics(c.env.DB, windowMinutes);
+	return jsonOk(c, metrics);
+});
+
+app.get("/api/ops/alerts", async (c) => {
+	const windowMinutes = clampInt(c.req.query("windowMinutes"), DEFAULT_OPS_WINDOW_MINUTES, 5, 24 * 60);
+	const metrics = await buildOpsMetrics(c.env.DB, windowMinutes);
+	return jsonOk(c, {
+		windowMinutes,
+		generatedAt: metrics.generatedAt,
+		alerts: metrics.alerts,
+	});
+});
+
+app.post("/api/ai/context", async (c) => {
+	const payload = await parseObjectBody(c);
+	if (!payload) {
+		return jsonError(c, 400, "Invalid JSON body");
+	}
+	const input = parseAiContextInput(payload);
+	if (!input) {
+		return jsonError(c, 400, "`query` is required");
+	}
+	const context = await buildAiContext(c.env.DB, input);
+	return jsonOk(c, {
+		enabled: false,
+		phase: "before-ai",
+		message: "AI generation is disabled in BeforeAI phase. Retrieval context is ready.",
+		...context,
+	});
+});
+
+app.post("/api/ai/execute", async (c) => {
+	const payload = await parseObjectBody(c);
+	if (!payload) {
+		return jsonError(c, 400, "Invalid JSON body");
+	}
+	const input = parseAiContextInput(payload);
+	if (!input) {
+		return jsonError(c, 400, "`query` is required");
+	}
+	const context = await buildAiContext(c.env.DB, input);
+	return jsonOk(c, {
+		enabled: false,
+		phase: "before-ai",
+		answer: null,
+		message: "AI generation endpoint is reserved. Retrieval/context pipeline is available.",
+		...context,
 	});
 });
 
@@ -1545,6 +1661,360 @@ function clampInt(value: string | undefined, fallback: number, min: number, max:
 		return fallback;
 	}
 	return Math.min(max, Math.max(min, parsed));
+}
+
+function isSearchNotesRequest(c: AppContext): boolean {
+	if (c.req.method !== "GET" || c.req.path !== "/api/notes") {
+		return false;
+	}
+	const keyword = c.req.query("q");
+	return typeof keyword === "string" && keyword.trim().length > 0;
+}
+
+function normalizeMetricsPath(pathname: string): string {
+	return pathname.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ":id");
+}
+
+async function ensureApiMetricsSchema(db: D1Database): Promise<void> {
+	if (apiMetricsSchemaReady) {
+		return;
+	}
+	await db.prepare(
+		`CREATE TABLE IF NOT EXISTS api_request_events (
+			id TEXT PRIMARY KEY,
+			path TEXT NOT NULL,
+			method TEXT NOT NULL,
+			status_code INTEGER NOT NULL,
+			duration_ms INTEGER NOT NULL,
+			is_error INTEGER NOT NULL DEFAULT 0 CHECK (is_error IN (0, 1)),
+			is_search INTEGER NOT NULL DEFAULT 0 CHECK (is_search IN (0, 1)),
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+	).run();
+	await db.prepare(
+		"CREATE INDEX IF NOT EXISTS idx_api_request_events_created_at ON api_request_events(created_at)",
+	).run();
+	await db.prepare(
+		"CREATE INDEX IF NOT EXISTS idx_api_request_events_search_time ON api_request_events(is_search, created_at)",
+	).run();
+	apiMetricsSchemaReady = true;
+}
+
+async function recordApiRequestEvent(
+	db: D1Database,
+	input: {
+		path: string;
+		method: string;
+		statusCode: number;
+		durationMs: number;
+		isSearchRequest: boolean;
+	},
+): Promise<void> {
+	await ensureApiMetricsSchema(db);
+	await db.prepare(
+		`INSERT INTO api_request_events (
+			id, path, method, status_code, duration_ms, is_error, is_search
+		) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+	)
+		.bind(
+			crypto.randomUUID(),
+			normalizeMetricsPath(input.path),
+			input.method,
+			input.statusCode,
+			Math.max(0, Math.trunc(input.durationMs)),
+			input.statusCode >= 400 ? 1 : 0,
+			input.isSearchRequest ? 1 : 0,
+		)
+		.run();
+}
+
+async function buildOpsMetrics(db: D1Database, windowMinutes: number): Promise<{
+	windowMinutes: number;
+	generatedAt: string;
+	api: {
+		totalRequests: number;
+		errorRequests: number;
+		errorRate: number | null;
+	};
+	search: {
+		requestCount: number;
+		p50Ms: number | null;
+		p95Ms: number | null;
+		avgMs: number | null;
+	};
+	index: {
+		pending: number;
+		processing: number;
+		failed: number;
+		backlog: number;
+		recentSuccess: number;
+		recentFailed: number;
+		successRate: number | null;
+	};
+	alerts: ApiMetricsAlert[];
+}> {
+	await ensureApiMetricsSchema(db);
+	await ensureNoteIndexSchema(db);
+	const windowExpr = `-${windowMinutes} minutes`;
+
+	const apiTotals = await db.prepare(
+		`SELECT
+			COUNT(*) AS totalRequests,
+			COALESCE(SUM(is_error), 0) AS errorRequests
+		 FROM api_request_events
+		 WHERE created_at >= datetime('now', ?)`,
+	)
+		.bind(windowExpr)
+		.first<{ totalRequests: number; errorRequests: number }>();
+	const totalRequests = apiTotals?.totalRequests ?? 0;
+	const errorRequests = apiTotals?.errorRequests ?? 0;
+	const errorRate = totalRequests > 0 ? errorRequests / totalRequests : null;
+
+	const { results: searchRows } = await db.prepare(
+		`SELECT duration_ms AS durationMs
+		 FROM api_request_events
+		 WHERE is_search = 1
+		   AND created_at >= datetime('now', ?)
+		 ORDER BY duration_ms ASC`,
+	)
+		.bind(windowExpr)
+		.all<{ durationMs: number }>();
+	const searchDurations = searchRows.map((row) => row.durationMs).filter((value) => Number.isFinite(value));
+	const searchCount = searchDurations.length;
+	const searchAvgMs = searchCount > 0
+		? Math.round(searchDurations.reduce((sum, value) => sum + value, 0) / searchCount)
+		: null;
+	const searchP50Ms = percentileFromSorted(searchDurations, 0.5);
+	const searchP95Ms = percentileFromSorted(searchDurations, 0.95);
+
+	const indexStats = await db.prepare(
+		`SELECT
+			COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending,
+			COALESCE(SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END), 0) AS processing,
+			COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
+			COALESCE(SUM(CASE WHEN status = 'success' AND last_indexed_at >= datetime('now', ?) THEN 1 ELSE 0 END), 0) AS recentSuccess,
+			COALESCE(SUM(CASE WHEN status = 'failed' AND updated_at >= datetime('now', ?) THEN 1 ELSE 0 END), 0) AS recentFailed
+		 FROM note_index_jobs`,
+	)
+		.bind(windowExpr, windowExpr)
+		.first<{
+			pending: number;
+			processing: number;
+			failed: number;
+			recentSuccess: number;
+			recentFailed: number;
+		}>();
+	const pending = indexStats?.pending ?? 0;
+	const processing = indexStats?.processing ?? 0;
+	const failed = indexStats?.failed ?? 0;
+	const recentSuccess = indexStats?.recentSuccess ?? 0;
+	const recentFailed = indexStats?.recentFailed ?? 0;
+	const backlog = pending + processing + failed;
+	const successRate = recentSuccess + recentFailed > 0
+		? recentSuccess / (recentSuccess + recentFailed)
+		: null;
+
+	const alerts: ApiMetricsAlert[] = [
+		buildMetricsAlert(
+			"api_error_rate",
+			"API 错误率",
+			errorRate,
+			DEFAULT_API_ERROR_RATE_ALERT_THRESHOLD,
+			(value, threshold) => `当前 ${formatRate(value)}，阈值 ${formatRate(threshold)}`,
+		),
+		buildMetricsAlert(
+			"search_p95_ms",
+			"搜索 P95(ms)",
+			searchP95Ms,
+			DEFAULT_SEARCH_P95_ALERT_THRESHOLD_MS,
+			(value, threshold) => `当前 ${Math.round(value)}ms，阈值 ${Math.round(threshold)}ms`,
+		),
+		buildMetricsAlert(
+			"index_success_rate",
+			"索引成功率",
+			successRate,
+			DEFAULT_INDEX_SUCCESS_RATE_ALERT_THRESHOLD,
+			(value, threshold) => `当前 ${formatRate(value)}，阈值 ${formatRate(threshold)}`,
+			"lt",
+		),
+		buildMetricsAlert(
+			"index_backlog",
+			"索引积压数",
+			backlog,
+			DEFAULT_INDEX_BACKLOG_ALERT_THRESHOLD,
+			(value, threshold) => `当前 ${Math.round(value)}，阈值 ${Math.round(threshold)}`,
+		),
+	];
+
+	return {
+		windowMinutes,
+		generatedAt: new Date().toISOString(),
+		api: {
+			totalRequests,
+			errorRequests,
+			errorRate,
+		},
+		search: {
+			requestCount: searchCount,
+			p50Ms: searchP50Ms,
+			p95Ms: searchP95Ms,
+			avgMs: searchAvgMs,
+		},
+		index: {
+			pending,
+			processing,
+			failed,
+			backlog,
+			recentSuccess,
+			recentFailed,
+			successRate,
+		},
+		alerts,
+	};
+}
+
+function percentileFromSorted(sortedValues: number[], percentile: number): number | null {
+	if (sortedValues.length === 0) {
+		return null;
+	}
+	const rank = Math.max(0, Math.ceil(sortedValues.length * percentile) - 1);
+	return sortedValues[Math.min(sortedValues.length - 1, rank)] ?? null;
+}
+
+function formatRate(value: number): string {
+	return `${(value * 100).toFixed(2)}%`;
+}
+
+function buildMetricsAlert(
+	key: string,
+	label: string,
+	value: number | null,
+	threshold: number,
+	messageBuilder: (value: number, threshold: number) => string,
+	comparator: "gt" | "lt" = "gt",
+): ApiMetricsAlert {
+	if (value === null) {
+		return {
+			key,
+			label,
+			status: "no_data",
+			threshold,
+			value: null,
+			message: "窗口内暂无数据",
+		};
+	}
+	const shouldWarn = comparator === "lt" ? value < threshold : value > threshold;
+	return {
+		key,
+		label,
+		status: shouldWarn ? "warn" : "ok",
+		threshold,
+		value,
+		message: messageBuilder(value, threshold),
+	};
+}
+
+function parseAiContextInput(payload: Record<string, unknown>): AiContextRequestInput | null {
+	const query = readRequiredString(payload, "query");
+	if (!query) {
+		return null;
+	}
+	const noteId = readOptionalString(payload, "noteId");
+	const limit = clampInt(
+		typeof payload.limit === "string" ? payload.limit : String(readOptionalNumber(payload, "limit") ?? "6"),
+		6,
+		1,
+		20,
+	);
+	const statusInput = readOptionalString(payload, "status");
+	const status = normalizeNoteStatus(statusInput ?? undefined, undefined);
+	return {
+		query,
+		noteId,
+		limit,
+		status,
+	};
+}
+
+async function buildAiContext(
+	db: D1Database,
+	input: AiContextRequestInput,
+): Promise<{
+	query: string;
+	status: NoteStatusFilter;
+	retrievedAt: string;
+	searchMode: NoteSearchMode;
+	notes: AiContextNoteItem[];
+	chunks: AiContextChunkItem[];
+}> {
+	const { notes, mode } = await listNotesWithSearchMode(db, {
+		folderId: null,
+		tagIds: [],
+		tagMode: "any",
+		keyword: input.query,
+		status: input.status,
+		limit: input.limit * 2,
+		offset: 0,
+	});
+	const filteredNotes = input.noteId
+		? notes.filter((note) => note.id === input.noteId)
+		: notes;
+	const noteItems: AiContextNoteItem[] = filteredNotes.slice(0, input.limit).map((item) => ({
+		noteId: item.id,
+		slug: item.slug,
+		title: item.title,
+		snippet: (item.excerpt || "").slice(0, 240),
+		updatedAt: item.updatedAt,
+		searchScore: item.searchScore,
+	}));
+	const chunkItems = await listAiContextChunks(db, input);
+	return {
+		query: input.query,
+		status: input.status,
+		retrievedAt: new Date().toISOString(),
+		searchMode: mode,
+		notes: noteItems,
+		chunks: chunkItems,
+	};
+}
+
+async function listAiContextChunks(db: D1Database, input: AiContextRequestInput): Promise<AiContextChunkItem[]> {
+	const escaped = `%${escapeLikePattern(input.query)}%`;
+	const statusWhere = buildNoteStatusWhere("n", input.status);
+	const where = [
+		statusWhere,
+		"nc.chunk_text LIKE ? ESCAPE '\\'",
+	];
+	const params: Array<string | number> = [escaped];
+	if (input.noteId) {
+		where.push("n.id = ?");
+		params.push(input.noteId);
+	}
+	const sql = `
+		SELECT
+			nc.note_id AS noteId,
+			n.slug,
+			n.title,
+			n.updated_at AS updatedAt,
+			nc.chunk_index AS chunkIndex,
+			nc.chunk_text AS chunkText
+		FROM note_chunks nc
+		JOIN notes n ON n.id = nc.note_id
+		WHERE ${where.join(" AND ")}
+		ORDER BY n.updated_at DESC, nc.chunk_index ASC
+		LIMIT ?
+	`;
+	const { results } = await db.prepare(sql)
+		.bind(...params, input.limit)
+		.all<{ noteId: string; slug: string; title: string; updatedAt: string; chunkIndex: number; chunkText: string }>();
+	return results.map((item) => ({
+		noteId: item.noteId,
+		slug: item.slug,
+		title: item.title,
+		updatedAt: item.updatedAt,
+		chunkIndex: item.chunkIndex,
+		snippet: item.chunkText.slice(0, 320),
+	}));
 }
 
 function getNotesBucket(env: Env): R2Bucket | null {
@@ -2182,6 +2652,42 @@ async function getNoteById(db: D1Database, noteId: string): Promise<NoteRow | nu
 		.bind(noteId)
 		.first<NoteRow>();
 	return note ?? null;
+}
+
+async function syncNoteFtsContent(
+	db: D1Database,
+	noteId: string,
+	titleInput?: string,
+	excerptInput?: string,
+	bodyTextInput?: string,
+): Promise<void> {
+	const note = await db.prepare(
+		`SELECT
+			rowid AS rowId,
+			title,
+			excerpt,
+			COALESCE(body_text, '') AS bodyText
+		 FROM notes
+		 WHERE id = ?
+		 LIMIT 1`,
+	)
+		.bind(noteId)
+		.first<{ rowId: number; title: string; excerpt: string; bodyText: string }>();
+	if (!note) {
+		return;
+	}
+	const title = titleInput ?? note.title;
+	const excerpt = excerptInput ?? note.excerpt;
+	const bodyText = bodyTextInput ?? note.bodyText;
+	await db.prepare("DELETE FROM notes_fts WHERE rowid = ?")
+		.bind(note.rowId)
+		.run();
+	await db.prepare(
+		`INSERT INTO notes_fts(rowid, title, excerpt, body_text)
+		 VALUES (?, ?, ?, ?)`,
+	)
+		.bind(note.rowId, title, excerpt, bodyText)
+		.run();
 }
 
 function buildAssetDownloadUrl(assetId: string): string {

@@ -147,6 +147,17 @@ CREATE TABLE IF NOT EXISTS note_index_jobs (
 	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS api_request_events (
+	id TEXT PRIMARY KEY,
+	path TEXT NOT NULL,
+	method TEXT NOT NULL,
+	status_code INTEGER NOT NULL,
+	duration_ms INTEGER NOT NULL,
+	is_error INTEGER NOT NULL DEFAULT 0 CHECK (is_error IN (0, 1)),
+	is_search INTEGER NOT NULL DEFAULT 0 CHECK (is_search IN (0, 1)),
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_notes_folder_updated
 	ON notes(folder_id, updated_at DESC)
 	WHERE deleted_at IS NULL AND is_archived = 0;
@@ -160,6 +171,10 @@ CREATE INDEX IF NOT EXISTS idx_assets_note ON assets(note_id);
 CREATE INDEX IF NOT EXISTS idx_note_chunks_note ON note_chunks(note_id, chunk_index);
 CREATE INDEX IF NOT EXISTS idx_note_index_jobs_status_retry
 	ON note_index_jobs(status, next_retry_at, updated_at);
+CREATE INDEX IF NOT EXISTS idx_api_request_events_created_at
+	ON api_request_events(created_at);
+CREATE INDEX IF NOT EXISTS idx_api_request_events_search_time
+	ON api_request_events(is_search, created_at);
 
 CREATE TRIGGER IF NOT EXISTS trg_folders_updated_at
 AFTER UPDATE ON folders
