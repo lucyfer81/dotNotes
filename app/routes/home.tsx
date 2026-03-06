@@ -93,6 +93,7 @@ export function meta({}: Route.MetaArgs) {
 export default function Home() {
 	const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("capture");
 	const [editorMode, setEditorMode] = useState<EditorMode>("edit");
+	const [isFocusFullscreen, setIsFocusFullscreen] = useState(false);
 	const [viewportWidth, setViewportWidth] = useState(0);
 	const [aiOpen, setAiOpen] = useState(false);
 	const [folderItems, setFolderItems] = useState<FolderApiItem[]>(defaultRootFolders);
@@ -112,6 +113,8 @@ export default function Home() {
 	const [tagItems, setTagItems] = useState<TagApiItem[]>([]);
 	const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
 	const [activeNoteId, setActiveNoteId] = useState("");
+	const [titleDraft, setTitleDraft] = useState("");
+	const [isTitleEditing, setIsTitleEditing] = useState(false);
 	const [draft, setDraft] = useState("");
 	const [isCreatingNote, setIsCreatingNote] = useState(false);
 	const [isSavingDraft, setIsSavingDraft] = useState(false);
@@ -122,6 +125,7 @@ export default function Home() {
 	const [linkInsertQuery, setLinkInsertQuery] = useState("");
 	const [linkInsertResults, setLinkInsertResults] = useState<NoteItem[]>([]);
 	const [isLinkInsertLoading, setIsLinkInsertLoading] = useState(false);
+	const [isSyncingLinks, setIsSyncingLinks] = useState(false);
 	const [commandOpen, setCommandOpen] = useState(false);
 	const [commandQuery, setCommandQuery] = useState("");
 	const [commandResults, setCommandResults] = useState<NoteItem[]>([]);
@@ -296,6 +300,11 @@ export default function Home() {
 	}, [activeNote]);
 
 	useEffect(() => {
+		setTitleDraft(activeNote?.title ?? "");
+		setIsTitleEditing(false);
+	}, [activeNoteId]);
+
+	useEffect(() => {
 		if (import.meta.env.SSR || typeof window === "undefined") {
 			return;
 		}
@@ -404,7 +413,40 @@ export default function Home() {
 		}
 		setLinkInsertOpen(false);
 		setLinkInsertQuery("");
+		setIsFocusFullscreen(false);
 	}, [workspaceMode]);
+
+	useEffect(() => {
+		if (typeof window === "undefined") {
+			return;
+		}
+		if (!isFocusFullscreen) {
+			return;
+		}
+		const onKeyDown = (event: KeyboardEvent) => {
+			if (event.key === "Escape") {
+				setIsFocusFullscreen(false);
+			}
+		};
+		window.addEventListener("keydown", onKeyDown);
+		return () => {
+			window.removeEventListener("keydown", onKeyDown);
+		};
+	}, [isFocusFullscreen]);
+
+	useEffect(() => {
+		if (typeof document === "undefined") {
+			return;
+		}
+		if (!isFocusFullscreen) {
+			return;
+		}
+		const previousOverflow = document.body.style.overflow;
+		document.body.style.overflow = "hidden";
+		return () => {
+			document.body.style.overflow = previousOverflow;
+		};
+	}, [isFocusFullscreen]);
 
 	useEffect(() => {
 		setLinkInsertOpen(false);
@@ -843,16 +885,88 @@ export default function Home() {
 		scheduleAutoSave(activeNoteId, value);
 	};
 
-	const handleInsertWikiLink = (note: NoteItem) => {
+	const handleTitleChange = (value: string) => {
+		setTitleDraft(value);
+	};
+
+	const startTitleEdit = () => {
 		if (!activeNote || isActiveNoteDeleted) {
 			return;
 		}
-		const nextValue = draft.length === 0
-			? `[[${note.title}]]`
-			: `${draft}${draft.endsWith("\n") ? "" : "\n"}[[${note.title}]]`;
-		handleDraftChange(nextValue);
+		setTitleDraft(activeNote.title);
+		setIsTitleEditing(true);
+	};
+
+	const cancelTitleEdit = () => {
+		if (!activeNote) {
+			setIsTitleEditing(false);
+			return;
+		}
+		setTitleDraft(activeNote.title);
+		setIsTitleEditing(false);
+	};
+
+	const confirmTitleEdit = () => {
+		if (!activeNote || isActiveNoteDeleted) {
+			return;
+		}
+		const nextTitle = titleDraft.trim();
+		if (!nextTitle) {
+			return;
+		}
+		setIsTitleEditing(false);
+		if (nextTitle === activeNote.title) {
+			return;
+		}
+		setNoteItems((prev) =>
+			prev.map((note) =>
+				note.id === activeNote.id
+					? {
+						...note,
+						title: nextTitle,
+					}
+					: note,
+			),
+		);
+		setTitleDraft(nextTitle);
+		scheduleAutoSave(activeNote.id, draft);
+	};
+
+	const handleInsertWikiLink = (note: NoteItem) => {
+		if (!activeNote || isActiveNoteDeleted || !noteLinks) {
+			return;
+		}
+		const currentSlugs = new Set(noteLinks.outbound.map((item) => item.slug));
+		currentSlugs.add(note.slug);
+		void syncActiveNoteLinks([...currentSlugs]);
 		setLinkInsertOpen(false);
 		setLinkInsertQuery("");
+	};
+
+	const syncActiveNoteLinks = async (nextSlugs: string[]) => {
+		if (!activeNote || isActiveNoteDeleted || isSyncingLinks) {
+			return;
+		}
+		setIsSyncingLinks(true);
+		try {
+			const updated = await updateNote(activeNote.id, { linkSlugs: nextSlugs });
+			const next = toNoteItem(updated);
+			setNoteItems((prev) => prev.map((note) => (note.id === next.id ? { ...note, ...next } : note)));
+		} catch (error) {
+			console.error("Failed to sync note links", error);
+		} finally {
+			setIsSyncingLinks(false);
+		}
+	};
+
+	const handleRemoveOutboundLink = (noteId: string) => {
+		if (!activeNote || isActiveNoteDeleted || !noteLinks) {
+			return;
+		}
+		const nextSlugs = noteLinks.outbound
+			.filter((item) => item.noteId !== noteId)
+			.map((item) => item.slug);
+		void syncActiveNoteLinks(nextSlugs);
 	};
 
 	const handleInsertAssetLink = (asset: NoteAssetApiItem) => {
@@ -1175,6 +1289,10 @@ export default function Home() {
 		}
 	};
 
+	const toggleFocusFullscreen = () => {
+		setIsFocusFullscreen((prev) => !prev);
+	};
+
 	const closeCommandPalette = () => {
 		setCommandOpen(false);
 		setCommandQuery("");
@@ -1337,17 +1455,10 @@ export default function Home() {
 				: "全部";
 	const canArchiveActiveNote = Boolean(activeNote && !activeNote.deletedAt);
 	const canRestoreActiveNote = Boolean(activeNote?.deletedAt);
+	const canConfirmTitleEdit = titleDraft.trim().length > 0 && !isActiveNoteDeleted;
 	const outboundLinks = noteLinks?.outbound ?? [];
 	const inboundLinks = noteLinks?.inbound ?? [];
-	const unresolvedWikiLinks = useMemo(() => {
-		if (!activeNote) {
-			return [];
-		}
-		const outboundSlugSet = new Set(outboundLinks.map((item) => item.slug));
-		return extractWikiLinkCandidates(draft).filter(
-			(item) => item.slug !== activeNote.slug && !outboundSlugSet.has(item.slug),
-		);
-	}, [activeNote, draft, outboundLinks]);
+	const canEditLinks = Boolean(activeNote && noteLinks && !isActiveNoteDeleted && !isSyncingLinks && !isLoadingNoteLinks);
 
 	return (
 		<div className="min-h-screen bg-[#f4f6f8] text-slate-900">
@@ -1398,7 +1509,7 @@ export default function Home() {
 								<textarea
 									value={captureInput}
 									onChange={(e) => setCaptureInput(e.target.value)}
-									placeholder="随手记一条，支持 [[note]] 和 #tag"
+									placeholder="随手记一条，支持 #tag"
 									className="h-28 w-full resize-none rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm outline-none focus:ring"
 								/>
 									<div className="mt-3 flex items-center justify-between">
@@ -1636,11 +1747,83 @@ export default function Home() {
 					) : null}
 
 					{workspaceMode === "focus" ? (
-						<section className="flex h-full min-h-0 flex-col rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-							<div className="mb-3 border-b border-slate-100 pb-3">
+						<section
+							className={`flex min-h-0 flex-col bg-white ${
+								isFocusFullscreen
+									? "fixed inset-0 z-[80] h-[100dvh] rounded-none border-0 p-4 shadow-none"
+									: "h-full rounded-2xl border border-slate-200 p-4 shadow-sm"
+							}`}
+						>
+							{!isFocusFullscreen ? (
+								<div className="mb-3 border-b border-slate-100 pb-3">
 								<div className="flex items-center justify-between gap-3">
-									<div>
-										<p className="text-lg font-semibold tracking-tight">{activeNote?.title ?? "未选择笔记"}</p>
+									<div className="min-w-0 flex-1">
+										{activeNote ? (
+											<div className="flex items-center gap-2">
+												{isTitleEditing ? (
+													<>
+														<input
+															type="text"
+															value={titleDraft}
+															onChange={(event) => handleTitleChange(event.target.value)}
+															placeholder="输入笔记标题"
+															disabled={isActiveNoteDeleted}
+															className={`min-w-0 flex-1 rounded-lg border px-3 py-2 text-lg font-semibold tracking-tight outline-none ${
+																isActiveNoteDeleted
+																	? "cursor-not-allowed border-slate-200 bg-slate-100 text-slate-400"
+																	: "border-slate-200 bg-white text-slate-900 focus:border-slate-400"
+															}`}
+														/>
+														<button
+															type="button"
+															onClick={confirmTitleEdit}
+															disabled={!canConfirmTitleEdit}
+															aria-label="确认标题"
+															className={`rounded-lg border p-2 ${
+																!canConfirmTitleEdit
+																	? "cursor-not-allowed border-slate-200 text-slate-300"
+																	: "border-emerald-200 text-emerald-700 hover:bg-emerald-50"
+															}`}
+														>
+															<svg viewBox="0 0 20 20" fill="none" className="h-4 w-4" aria-hidden="true">
+																<path d="M4 10.5L8 14.5L16 6.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+															</svg>
+														</button>
+														<button
+															type="button"
+															onClick={cancelTitleEdit}
+															aria-label="取消标题编辑"
+															className="rounded-lg border border-rose-200 p-2 text-rose-600 hover:bg-rose-50"
+														>
+															<svg viewBox="0 0 20 20" fill="none" className="h-4 w-4" aria-hidden="true">
+																<path d="M5.5 5.5L14.5 14.5M14.5 5.5L5.5 14.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+															</svg>
+														</button>
+													</>
+												) : (
+													<>
+														<p className="truncate text-lg font-semibold tracking-tight">{activeNote.title}</p>
+														<button
+															type="button"
+															onClick={startTitleEdit}
+															disabled={isActiveNoteDeleted}
+															aria-label="编辑标题"
+															className={`rounded-lg border p-2 ${
+																isActiveNoteDeleted
+																	? "cursor-not-allowed border-slate-200 text-slate-300"
+																	: "border-slate-200 text-slate-600 hover:bg-slate-100"
+															}`}
+														>
+															<svg viewBox="0 0 20 20" fill="none" className="h-4 w-4" aria-hidden="true">
+																<path d="M13.5 4.5L15.5 6.5M6 14L10.5 13L16 7.5L13.5 5L8 10.5L7 15L6 14Z" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+															</svg>
+														</button>
+													</>
+												)}
+											</div>
+										) : (
+											<p className="text-lg font-semibold tracking-tight">未选择笔记</p>
+										)}
 										<p className="mt-1 text-xs text-slate-500">
 											{activeNote?.updatedAt ? formatUpdatedAt(activeNote.updatedAt) : ""} · {saveStateText} · {noteStatusLabel}
 										</p>
@@ -1661,6 +1844,13 @@ export default function Home() {
 												onClick={() => setEditorMode("split")}
 											/>
 										</div>
+										<button
+											type="button"
+											onClick={toggleFocusFullscreen}
+											className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-medium text-slate-600 hover:bg-slate-100"
+										>
+											{isFocusFullscreen ? "退出全屏" : "全屏"}
+										</button>
 										{canArchiveActiveNote ? (
 											<button
 												type="button"
@@ -1735,9 +1925,9 @@ export default function Home() {
 											type="button"
 											data-link-toggle="true"
 											onClick={toggleLinkInsertPanel}
-											disabled={!activeNote || isActiveNoteDeleted}
+											disabled={!activeNote || isActiveNoteDeleted || (!linkInsertOpen && !canEditLinks)}
 											className={`rounded-lg border px-3 py-2 text-xs font-medium ${
-												!activeNote || isActiveNoteDeleted
+												!activeNote || isActiveNoteDeleted || (!linkInsertOpen && !canEditLinks)
 													? "cursor-not-allowed border-slate-200 text-slate-300"
 													: "border-sky-200 text-sky-700 hover:bg-sky-50"
 											}`}
@@ -1752,7 +1942,7 @@ export default function Home() {
 												onQueryChange={setLinkInsertQuery}
 												results={linkInsertResults}
 												isLoading={isLinkInsertLoading}
-												disabled={!activeNote || isActiveNoteDeleted}
+												disabled={!canEditLinks}
 												onInsert={handleInsertWikiLink}
 												onClose={closeLinkInsertPanel}
 											/>
@@ -1772,10 +1962,15 @@ export default function Home() {
 										/>
 									</div>
 								</div>
+							) : null}
 
 								{focusEditorMode === "edit" ? (
 									isClientReady && MarkdownEditorComponent ? (
-										<div className="min-h-0 flex-1 overflow-hidden rounded-xl border border-slate-200 bg-white [&_.cm-editor]:h-full [&_.cm-scroller]:overflow-auto [&_.cm-theme]:h-full">
+										<div
+											className={`min-h-0 flex-1 overflow-hidden bg-white [&_.cm-editor]:h-full [&_.cm-scroller]:overflow-auto [&_.cm-theme]:h-full ${
+												isFocusFullscreen ? "" : "rounded-xl border border-slate-200"
+											}`}
+										>
 											<MarkdownEditorComponent
 												value={draft}
 												height="100%"
@@ -1787,13 +1982,21 @@ export default function Home() {
 										<textarea
 											value={draft}
 											onChange={(event) => handleDraftChange(event.target.value)}
-											className="min-h-0 h-full flex-1 resize-none rounded-xl border border-slate-200 bg-white p-3 text-sm"
+											className={`min-h-0 h-full flex-1 resize-none bg-white text-sm ${
+												isFocusFullscreen ? "border-0 p-0" : "rounded-xl border border-slate-200 p-3"
+											}`}
 										/>
 									)
 								) : null}
 
 							{focusEditorMode === "preview" ? (
-								<div className="min-h-0 flex-1 overflow-y-auto rounded-xl border border-slate-200 bg-slate-50 p-4">
+								<div
+									className={`min-h-0 flex-1 overflow-y-auto ${
+										isFocusFullscreen
+											? "bg-white p-0"
+											: "rounded-xl border border-slate-200 bg-slate-50 p-4"
+									}`}
+								>
 									<ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
 										{previewMarkdown || "*（空白笔记）*"}
 									</ReactMarkdown>
@@ -1809,7 +2012,11 @@ export default function Home() {
 										}`}
 									>
 										{isClientReady && MarkdownEditorComponent ? (
-											<div className="min-h-0 overflow-hidden rounded-xl border border-slate-200 bg-white [&_.cm-editor]:h-full [&_.cm-scroller]:overflow-auto [&_.cm-theme]:h-full">
+											<div
+												className={`min-h-0 overflow-hidden bg-white [&_.cm-editor]:h-full [&_.cm-scroller]:overflow-auto [&_.cm-theme]:h-full ${
+													isFocusFullscreen ? "" : "rounded-xl border border-slate-200"
+												}`}
+											>
 												<MarkdownEditorComponent
 													value={draft}
 													height="100%"
@@ -1821,10 +2028,18 @@ export default function Home() {
 											<textarea
 												value={draft}
 												onChange={(event) => handleDraftChange(event.target.value)}
-												className="min-h-0 h-full w-full resize-none rounded-xl border border-slate-200 bg-white p-3 text-sm"
+												className={`min-h-0 h-full w-full resize-none bg-white text-sm ${
+													isFocusFullscreen ? "border-0 p-0" : "rounded-xl border border-slate-200 p-3"
+												}`}
 											/>
 										)}
-										<div className="min-h-0 overflow-y-auto rounded-xl border border-slate-200 bg-slate-50 p-4">
+										<div
+											className={`min-h-0 overflow-y-auto ${
+												isFocusFullscreen
+													? "bg-white p-0"
+													: "rounded-xl border border-slate-200 bg-slate-50 p-4"
+											}`}
+										>
 											<ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
 												{previewMarkdown || "*（空白笔记）*"}
 										</ReactMarkdown>
@@ -1832,15 +2047,19 @@ export default function Home() {
 								</div>
 							) : null}
 
-							<div className="mt-3">
+							{!isFocusFullscreen ? (
+								<div className="mt-3">
 								<LinkSummaryPanel
 									isLoading={isLoadingNoteLinks}
+									isMutating={isSyncingLinks}
 									outbound={outboundLinks}
 									inbound={inboundLinks}
-									unresolved={unresolvedWikiLinks}
 									onOpenNote={focusNote}
+									onRemoveOutbound={handleRemoveOutboundLink}
+									canRemoveOutbound={canEditLinks}
 								/>
 							</div>
+							) : null}
 						</section>
 					) : null}
 				</div>
@@ -2031,9 +2250,82 @@ export default function Home() {
 					) : null}
 
 						{workspaceMode === "focus" ? (
-							<section className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
-								<div className="mb-2 flex items-center justify-between gap-2">
-								<p className="text-sm font-semibold">{activeNote?.title ?? "未选择笔记"}</p>
+							<section
+								className={`bg-white ${
+									isFocusFullscreen
+										? "fixed inset-0 z-[80] h-[100dvh] overflow-y-auto border-0 p-3 shadow-none"
+										: "rounded-2xl border border-slate-200 p-3 shadow-sm"
+								}`}
+							>
+								{!isFocusFullscreen ? (
+									<>
+									<div className="mb-2 flex items-center justify-between gap-2">
+									{activeNote ? (
+										<div className="flex min-w-0 flex-1 items-center gap-2">
+											{isTitleEditing ? (
+												<>
+													<input
+														type="text"
+														value={titleDraft}
+														onChange={(event) => handleTitleChange(event.target.value)}
+														placeholder="输入笔记标题"
+														disabled={isActiveNoteDeleted}
+														className={`min-w-0 flex-1 rounded-lg border px-2 py-1 text-sm font-semibold outline-none ${
+															isActiveNoteDeleted
+																? "cursor-not-allowed border-slate-200 bg-slate-100 text-slate-400"
+																: "border-slate-200 bg-white text-slate-900 focus:border-slate-400"
+														}`}
+													/>
+													<button
+														type="button"
+														onClick={confirmTitleEdit}
+														disabled={!canConfirmTitleEdit}
+														aria-label="确认标题"
+														className={`rounded-md border p-1.5 ${
+															!canConfirmTitleEdit
+																? "cursor-not-allowed border-slate-200 text-slate-300"
+																: "border-emerald-200 text-emerald-700"
+														}`}
+													>
+														<svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5" aria-hidden="true">
+															<path d="M4 10.5L8 14.5L16 6.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+														</svg>
+													</button>
+													<button
+														type="button"
+														onClick={cancelTitleEdit}
+														aria-label="取消标题编辑"
+														className="rounded-md border border-rose-200 p-1.5 text-rose-600"
+													>
+														<svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5" aria-hidden="true">
+															<path d="M5.5 5.5L14.5 14.5M14.5 5.5L5.5 14.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+														</svg>
+													</button>
+												</>
+											) : (
+												<>
+													<p className="truncate text-sm font-semibold">{activeNote.title}</p>
+													<button
+														type="button"
+														onClick={startTitleEdit}
+														disabled={isActiveNoteDeleted}
+														aria-label="编辑标题"
+														className={`rounded-md border p-1.5 ${
+															isActiveNoteDeleted
+																? "cursor-not-allowed border-slate-200 text-slate-300"
+																: "border-slate-200 text-slate-600"
+														}`}
+													>
+														<svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5" aria-hidden="true">
+															<path d="M13.5 4.5L15.5 6.5M6 14L10.5 13L16 7.5L13.5 5L8 10.5L7 15L6 14Z" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+														</svg>
+													</button>
+												</>
+											)}
+										</div>
+									) : (
+										<p className="text-sm font-semibold">未选择笔记</p>
+									)}
 								<div className="flex items-center gap-2">
 									<div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1">
 										<ModeButton
@@ -2044,6 +2336,13 @@ export default function Home() {
 										/>
 										<ModeButton label="预览" active={mobileEditorMode === "preview"} onClick={() => setEditorMode("preview")} />
 									</div>
+									<button
+										type="button"
+										onClick={toggleFocusFullscreen}
+										className="rounded-lg border border-slate-200 px-2 py-1 text-xs text-slate-600"
+									>
+										{isFocusFullscreen ? "退出全屏" : "全屏"}
+									</button>
 									{canArchiveActiveNote ? (
 										<button
 											type="button"
@@ -2083,7 +2382,7 @@ export default function Home() {
 										}`}
 									>
 										{isDeletingNote ? "处理中" : activeNote?.deletedAt ? "永久删除" : "移入回收站"}
-										</button>
+									</button>
 									</div>
 								</div>
 								<p className="mb-2 text-xs text-slate-500">当前状态筛选：{noteStatusLabel}</p>
@@ -2112,9 +2411,9 @@ export default function Home() {
 										type="button"
 										data-link-toggle="true"
 										onClick={toggleLinkInsertPanel}
-										disabled={!activeNote || isActiveNoteDeleted}
+										disabled={!activeNote || isActiveNoteDeleted || (!linkInsertOpen && !canEditLinks)}
 										className={`rounded-lg border px-2 py-1 text-xs ${
-											!activeNote || isActiveNoteDeleted
+											!activeNote || isActiveNoteDeleted || (!linkInsertOpen && !canEditLinks)
 												? "cursor-not-allowed border-slate-200 text-slate-300"
 												: "border-sky-200 text-sky-700"
 										}`}
@@ -2129,7 +2428,7 @@ export default function Home() {
 											onQueryChange={setLinkInsertQuery}
 											results={linkInsertResults}
 											isLoading={isLinkInsertLoading}
-											disabled={!activeNote || isActiveNoteDeleted}
+											disabled={!canEditLinks}
 											onInsert={handleInsertWikiLink}
 											onClose={closeLinkInsertPanel}
 										/>
@@ -2148,28 +2447,44 @@ export default function Home() {
 										onDelete={handleDeleteAsset}
 									/>
 								</div>
+								</>
+								) : null}
 								{mobileEditorMode === "edit" ? (
-								<textarea
-									value={draft}
-									onChange={(e) => handleDraftChange(e.target.value)}
-									className="h-[58dvh] w-full rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm"
-								/>
-							) : (
-								<div className="h-[58dvh] overflow-y-auto rounded-xl border border-slate-200 bg-slate-50 p-3">
-									<ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-										{previewMarkdown || "*（空白笔记）*"}
-									</ReactMarkdown>
-								</div>
-							)}
-							<div className="mt-3">
+									<textarea
+										value={draft}
+										onChange={(e) => handleDraftChange(e.target.value)}
+										className={`w-full text-sm ${
+											isFocusFullscreen
+												? "h-[calc(100dvh-1.5rem)] resize-none border-0 bg-white p-0"
+												: "h-[58dvh] rounded-xl border border-slate-200 bg-slate-50 p-3"
+										}`}
+									/>
+								) : (
+									<div
+										className={`overflow-y-auto ${
+											isFocusFullscreen
+												? "h-[calc(100dvh-1.5rem)] bg-white p-0"
+												: "h-[58dvh] rounded-xl border border-slate-200 bg-slate-50 p-3"
+										}`}
+									>
+										<ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+											{previewMarkdown || "*（空白笔记）*"}
+										</ReactMarkdown>
+									</div>
+								)}
+							{!isFocusFullscreen ? (
+								<div className="mt-3">
 								<LinkSummaryPanel
 									isLoading={isLoadingNoteLinks}
+									isMutating={isSyncingLinks}
 									outbound={outboundLinks}
 									inbound={inboundLinks}
-									unresolved={unresolvedWikiLinks}
 									onOpenNote={focusNote}
+									onRemoveOutbound={handleRemoveOutboundLink}
+									canRemoveOutbound={canEditLinks}
 								/>
 							</div>
+							) : null}
 						</section>
 					) : null}
 				</div>
@@ -2374,7 +2689,7 @@ function WikiLinkInsertPanel(props: {
 	return (
 		<section className="mt-3 rounded-xl border border-slate-200 bg-slate-50/70 p-2">
 			<div className="mb-2 flex items-center justify-between">
-				<p className="text-xs font-medium text-slate-600">双链插入</p>
+				<p className="text-xs font-medium text-slate-600">双链管理</p>
 				<button
 					type="button"
 					onClick={onClose}
@@ -2403,20 +2718,20 @@ function WikiLinkInsertPanel(props: {
 						}
 					}}
 					disabled={disabled}
-					placeholder={disabled ? "回收站笔记不可插入双链" : "搜索其他笔记并插入 [[双链]]"}
+					placeholder={disabled ? "当前状态不可编辑双链" : "搜索其他笔记并建立出链"}
 					className={`min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-700 ${
 						disabled ? "cursor-not-allowed opacity-60" : ""
 					}`}
 				/>
-				<span className="shrink-0 text-[11px] text-slate-400">Enter 插入首项</span>
+				<span className="shrink-0 text-[11px] text-slate-400">Enter 添加首项</span>
 			</div>
-			<p className="mt-2 px-1 text-[11px] text-slate-400">删除链接：直接删掉正文里的 `[[笔记名]]`。</p>
+			<p className="mt-2 px-1 text-[11px] text-slate-400">链接仅存储在数据库中，不写入正文。</p>
 			<div className="mt-2 max-h-24 space-y-1 overflow-y-auto pr-1">
 				{isLoading ? (
 					<p className="px-2 py-1 text-xs text-slate-400">搜索中...</p>
 				) : null}
 				{!isLoading && results.length === 0 ? (
-					<p className="px-2 py-1 text-xs text-slate-400">没有可插入的笔记</p>
+					<p className="px-2 py-1 text-xs text-slate-400">没有可添加的笔记</p>
 				) : null}
 				{!isLoading
 					? results.map((note) => (
@@ -2430,7 +2745,7 @@ function WikiLinkInsertPanel(props: {
 							}`}
 						>
 							<span className="font-medium text-slate-800">{note.title}</span>
-							<span className="ml-2 text-slate-400">→ 插入 [[{note.title}]]</span>
+							<span className="ml-2 text-slate-400">→ 添加为出链</span>
 						</button>
 					))
 					: null}
@@ -2528,36 +2843,31 @@ function AttachmentPanel(props: {
 
 function LinkSummaryPanel(props: {
 	isLoading: boolean;
+	isMutating: boolean;
 	outbound: NoteLinkApiItem[];
 	inbound: NoteLinkApiItem[];
-	unresolved: WikiLinkCandidate[];
 	onOpenNote: (noteId: string) => void;
+	onRemoveOutbound: (noteId: string) => void;
+	canRemoveOutbound: boolean;
 }) {
-	const { isLoading, outbound, inbound, unresolved, onOpenNote } = props;
+	const { isLoading, isMutating, outbound, inbound, onOpenNote, onRemoveOutbound, canRemoveOutbound } = props;
 
 	return (
 		<section className="rounded-xl border border-slate-200 bg-slate-50 p-3">
 			<div className="mb-2 flex items-center justify-between">
 				<p className="text-xs font-semibold uppercase tracking-wide text-slate-500">链接概览</p>
-				{isLoading ? <span className="text-xs text-slate-400">更新中...</span> : null}
+				{isLoading || isMutating ? <span className="text-xs text-slate-400">{isMutating ? "处理中..." : "更新中..."}</span> : null}
 			</div>
-			<div className="grid gap-3 lg:grid-cols-3">
-				<LinkNoteList title="出链" items={outbound} emptyText="暂无出链" onOpenNote={onOpenNote} />
+			<div className="grid gap-3 lg:grid-cols-2">
+				<LinkNoteList
+					title="出链"
+					items={outbound}
+					emptyText="暂无出链"
+					onOpenNote={onOpenNote}
+					onRemoveNote={onRemoveOutbound}
+					canRemove={canRemoveOutbound}
+				/>
 				<LinkNoteList title="反链" items={inbound} emptyText="暂无反链" onOpenNote={onOpenNote} />
-				<div className="rounded-lg border border-amber-200 bg-amber-50/70 p-2">
-					<p className="text-xs font-medium text-amber-800">未解析</p>
-					<div className="mt-2 max-h-28 space-y-1 overflow-y-auto pr-1">
-						{unresolved.length === 0 ? (
-							<p className="text-xs text-amber-600/70">全部可解析</p>
-						) : (
-							unresolved.map((item) => (
-								<p key={item.slug} className="truncate rounded bg-white/80 px-2 py-1 text-xs text-amber-900">
-									[[{item.label}]]
-								</p>
-							))
-						)}
-					</div>
-				</div>
 			</div>
 		</section>
 	);
@@ -2568,8 +2878,10 @@ function LinkNoteList(props: {
 	items: NoteLinkApiItem[];
 	emptyText: string;
 	onOpenNote: (noteId: string) => void;
+	onRemoveNote?: (noteId: string) => void;
+	canRemove?: boolean;
 }) {
-	const { title, items, emptyText, onOpenNote } = props;
+	const { title, items, emptyText, onOpenNote, onRemoveNote, canRemove = false } = props;
 
 	return (
 		<div className="rounded-lg border border-slate-200 bg-white p-2">
@@ -2579,15 +2891,30 @@ function LinkNoteList(props: {
 					<p className="text-xs text-slate-400">{emptyText}</p>
 				) : (
 					items.map((item) => (
-						<button
-							key={`${title}-${item.noteId}`}
-							type="button"
-							onClick={() => onOpenNote(item.noteId)}
-							className="w-full rounded-md px-2 py-1 text-left text-xs text-slate-700 hover:bg-slate-100"
-						>
-							<p className="truncate font-medium text-slate-800">{item.title}</p>
-							<p className="mt-0.5 truncate text-[11px] text-slate-500">{formatUpdatedAt(item.updatedAt)}</p>
-						</button>
+						<div key={`${title}-${item.noteId}`} className="flex items-center gap-1 rounded-md px-1 py-1 hover:bg-slate-100">
+							<button
+								type="button"
+								onClick={() => onOpenNote(item.noteId)}
+								className="min-w-0 flex-1 rounded-md px-2 py-1 text-left text-xs text-slate-700"
+							>
+								<p className="truncate font-medium text-slate-800">{item.title}</p>
+								<p className="mt-0.5 truncate text-[11px] text-slate-500">{formatUpdatedAt(item.updatedAt)}</p>
+							</button>
+							{onRemoveNote ? (
+								<button
+									type="button"
+									onClick={() => onRemoveNote(item.noteId)}
+									disabled={!canRemove}
+									className={`rounded border px-2 py-0.5 text-[11px] ${
+										!canRemove
+											? "cursor-not-allowed border-slate-200 text-slate-300"
+											: "border-rose-200 text-rose-600 hover:bg-rose-50"
+									}`}
+								>
+									删除
+								</button>
+							) : null}
+						</div>
 					))
 				)}
 			</div>
@@ -2659,30 +2986,29 @@ function matchesTagFilter(note: NoteItem, selectedTagIds: string[]): boolean {
 	return selectedTagIds.some((tagId) => idSet.has(tagId));
 }
 
-function extractWikiLinkCandidates(content: string): WikiLinkCandidate[] {
-	const items = new Map<string, WikiLinkCandidate>();
-	for (const match of content.matchAll(WIKI_LINK_PATTERN)) {
-		const label = match[1]?.trim();
-		if (!label) {
-			continue;
-		}
-		const slug = toWikiSlug(label);
-		if (!items.has(slug)) {
-			items.set(slug, { label, slug });
-		}
-	}
-	return [...items.values()];
-}
-
 function toMarkdownWithWikiLinks(content: string): string {
 	return content.replace(WIKI_LINK_PATTERN, (_, rawValue: string) => {
-		const label = rawValue.trim();
-		if (!label) {
+		const parsed = parseWikiLink(rawValue);
+		if (!parsed) {
 			return "";
 		}
-		const slug = toWikiSlug(label);
-		return `[[${label}]](wiki:${encodeURIComponent(slug)})`;
+		return `[[${parsed.label}]](wiki:${encodeURIComponent(parsed.slug)})`;
 	});
+}
+
+function parseWikiLink(rawValue: string): WikiLinkCandidate | null {
+	const raw = rawValue.trim();
+	if (!raw) {
+		return null;
+	}
+	const separatorIndex = raw.lastIndexOf("|");
+	const label = (separatorIndex >= 0 ? raw.slice(0, separatorIndex) : raw).trim();
+	if (!label) {
+		return null;
+	}
+	const explicitSlug = separatorIndex >= 0 ? raw.slice(separatorIndex + 1).trim() : "";
+	const slugSource = explicitSlug || label;
+	return { label, slug: toWikiSlug(slugSource) };
 }
 
 function toWikiSlug(input: string): string {

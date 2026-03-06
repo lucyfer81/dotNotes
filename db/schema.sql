@@ -97,7 +97,7 @@ CREATE TABLE IF NOT EXISTS note_tags (
 	PRIMARY KEY (note_id, tag_id)
 );
 
--- Parsed from [[note-slug]] syntax, enables forward and backward links.
+-- Stored note-to-note links, enables forward and backward links.
 CREATE TABLE IF NOT EXISTS note_links (
 	source_note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
 	target_note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,

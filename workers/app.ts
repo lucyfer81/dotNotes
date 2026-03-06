@@ -106,7 +106,6 @@ type NoteIndexProcessResult = {
 	attemptCount: number;
 };
 
-const LINK_PATTERN = /\[\[([^\[\]]+)\]\]/g;
 const DEFAULT_BODY_R2_THRESHOLD_BYTES = 64 * 1024;
 const NOTE_BODY_R2_PREFIX = "note-bodies";
 const ASSET_R2_PREFIX = "assets";
@@ -721,10 +720,9 @@ app.post("/api/notes", async (c) => {
 
 	await replaceNoteTags(c.env.DB, noteId, tagIds);
 
-	const explicitLinkSlugs = hasOwn(payload, "linkSlugs")
+	const desiredLinkSlugs = hasOwn(payload, "linkSlugs")
 		? toStringArray(payload.linkSlugs)
-		: null;
-	const desiredLinkSlugs = explicitLinkSlugs ?? extractLinkSlugs(resolvedBody.plainBodyText);
+		: [];
 	const linkResult = await replaceNoteLinks(c.env.DB, noteId, desiredLinkSlugs);
 	const queuedAction: IndexAction = isArchived ? "delete" : "upsert";
 	await enqueueNoteIndexJob(c.env.DB, noteId, queuedAction);
@@ -882,15 +880,9 @@ app.put("/api/notes/:id", async (c) => {
 	}
 
 	let linkResult: { inserted: number; unresolvedSlugs: string[] } | null = null;
-	const shouldSyncLinks =
-		hasOwn(payload, "linkSlugs") ||
-		hasOwn(payload, "bodyText");
+	const shouldSyncLinks = hasOwn(payload, "linkSlugs");
 	if (shouldSyncLinks) {
-		const explicitLinkSlugs = hasOwn(payload, "linkSlugs")
-			? toStringArray(payload.linkSlugs)
-			: null;
-		const desired = explicitLinkSlugs ??
-			extractLinkSlugs(resolvedBody.plainBodyText);
+		const desired = toStringArray(payload.linkSlugs);
 		linkResult = await replaceNoteLinks(c.env.DB, noteId, desired);
 	}
 	const indexAction: IndexAction = nextIsArchived ? "delete" : "upsert";
@@ -2121,18 +2113,6 @@ function byteLength(value: string): number {
 function countWords(value: string): number {
 	const matches = value.trim().match(/\S+/g);
 	return matches ? matches.length : 0;
-}
-
-function extractLinkSlugs(value: string): string[] {
-	const unique = new Set<string>();
-	for (const match of value.matchAll(LINK_PATTERN)) {
-		const raw = match[1]?.trim();
-		if (!raw) {
-			continue;
-		}
-		unique.add(slugify(raw));
-	}
-	return [...unique];
 }
 
 async function ensureUniqueSlug(db: D1Database, desiredSlug: string, excludeNoteId?: string): Promise<string> {

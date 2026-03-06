@@ -80,6 +80,7 @@ type UpdateNoteInput = {
 	bodyText?: string;
 	excerpt?: string;
 	tagNames?: string[];
+	linkSlugs?: string[];
 };
 
 type CreateNoteInput = {
