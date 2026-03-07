@@ -158,6 +158,36 @@ CREATE TABLE IF NOT EXISTS api_request_events (
 	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS rss_feeds (
+	id TEXT PRIMARY KEY,
+	url TEXT NOT NULL UNIQUE,
+	title TEXT,
+	enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+	last_fetched_at TEXT,
+	last_error TEXT,
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS rss_items (
+	id TEXT PRIMARY KEY,
+	feed_id TEXT NOT NULL REFERENCES rss_feeds(id) ON DELETE CASCADE,
+	source_id TEXT,
+	dedupe_key TEXT NOT NULL,
+	link TEXT,
+	title TEXT,
+	author TEXT,
+	published_at TEXT,
+	summary_raw TEXT NOT NULL DEFAULT '',
+	summary_zh TEXT,
+	status TEXT NOT NULL DEFAULT 'new' CHECK (status IN ('new', 'saved', 'ignored')),
+	note_id TEXT REFERENCES notes(id) ON DELETE SET NULL,
+	fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	UNIQUE (feed_id, dedupe_key)
+);
+
 CREATE INDEX IF NOT EXISTS idx_notes_folder_updated
 	ON notes(folder_id, updated_at DESC)
 	WHERE deleted_at IS NULL AND is_archived = 0;
@@ -175,6 +205,12 @@ CREATE INDEX IF NOT EXISTS idx_api_request_events_created_at
 	ON api_request_events(created_at);
 CREATE INDEX IF NOT EXISTS idx_api_request_events_search_time
 	ON api_request_events(is_search, created_at);
+CREATE INDEX IF NOT EXISTS idx_rss_feeds_enabled_updated
+	ON rss_feeds(enabled, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_rss_items_feed_published
+	ON rss_items(feed_id, published_at DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_rss_items_status_updated
+	ON rss_items(status, updated_at DESC);
 
 CREATE TRIGGER IF NOT EXISTS trg_folders_updated_at
 AFTER UPDATE ON folders
@@ -198,6 +234,22 @@ FOR EACH ROW
 WHEN NEW.updated_at = OLD.updated_at
 BEGIN
 	UPDATE note_index_jobs SET updated_at = CURRENT_TIMESTAMP WHERE note_id = OLD.note_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_rss_feeds_updated_at
+AFTER UPDATE ON rss_feeds
+FOR EACH ROW
+WHEN NEW.updated_at = OLD.updated_at
+BEGIN
+	UPDATE rss_feeds SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_rss_items_updated_at
+AFTER UPDATE ON rss_items
+FOR EACH ROW
+WHEN NEW.updated_at = OLD.updated_at
+BEGIN
+	UPDATE rss_items SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
 END;
 
 CREATE VIEW IF NOT EXISTS note_backlinks AS
