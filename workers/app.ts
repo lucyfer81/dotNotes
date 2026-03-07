@@ -1566,8 +1566,10 @@ app.post("/api/ops/ai/probe", async (c) => {
 	const baseUrl = getAiBaseUrl(c.env);
 	const apiKey = getSiliconflowApiKey(c.env);
 	const chatModel = getAiChatModel(c.env);
+	const chatModelOverride = readOptionalString(payload, "chatModel");
+	const chatModelToUse = chatModelOverride ?? chatModel;
 	const embeddingModel = getAiEmbeddingModel(c.env);
-	if (!baseUrl || !apiKey || !chatModel) {
+	if (!baseUrl || !apiKey || !chatModelToUse) {
 		return jsonError(c, 500, "AI probe configuration missing");
 	}
 	const colo = readRequestColo(c.req.raw);
@@ -1617,7 +1619,7 @@ app.post("/api/ops/ai/probe", async (c) => {
 					"Content-Type": "application/json",
 				},
 				body: JSON.stringify({
-					model: chatModel,
+					model: chatModelToUse,
 					temperature: 0,
 					max_tokens: 16,
 					messages: [
@@ -1629,7 +1631,7 @@ app.post("/api/ops/ai/probe", async (c) => {
 			}),
 		);
 		probes.chat = {
-			model: chatModel,
+			model: chatModelToUse,
 			...summarizeProbeSamples(samples),
 		};
 	}

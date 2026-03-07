@@ -386,11 +386,11 @@ describe("ops metrics api", () => {
 				probes: {
 					models?: { sampleCount: number; successCount: number };
 					embedding?: { sampleCount: number; successCount: number };
-					chat?: { sampleCount: number; successCount: number };
+					chat?: { model: string; sampleCount: number; successCount: number };
 				};
 			}>(await api("/api/ops/ai/probe", {
 				method: "POST",
-				body: JSON.stringify({ count: 3 }),
+				body: JSON.stringify({ count: 3, chatModel: "Qwen/Qwen3-30B-A3B-Instruct-2507" }),
 			}, {
 				AI_BASE_URL: "https://api.siliconflow.cn/v1",
 				AI_CHAT_MODEL: "Qwen/Qwen2.5-7B-Instruct",
@@ -404,6 +404,7 @@ describe("ops metrics api", () => {
 			expect(probed.data.probes.embedding?.successCount).toBe(3);
 			expect(probed.data.probes.chat?.sampleCount).toBe(3);
 			expect(probed.data.probes.chat?.successCount).toBe(3);
+			expect(probed.data.probes.chat?.model).toBe("Qwen/Qwen3-30B-A3B-Instruct-2507");
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
