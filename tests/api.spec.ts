@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import app from "../workers/app";
 import { FakeD1Database } from "./helpers/fake-d1";
 import { FakeR2Bucket } from "./helpers/fake-r2";
@@ -392,6 +392,67 @@ describe("ai pre-integration api", () => {
 	});
 });
 
+describe("ai enhance api", () => {
+	it("returns structured enhancement suggestions from siliconflow-compatible payload", async () => {
+		const created = await createNote({
+			title: "AI Enhance Note",
+			folderId: "folder-10-projects",
+			bodyText:
+				"RAG 检索与总结流程设计，包含 tags 与链接候选。为了验证摘要逻辑，这里补充更多上下文：先定义查询意图，再构建候选池，之后由模型给出标题、标签、双链建议。最后通过摘要提炼关键结论、风险和后续动作，确保输出不是原文复述。并且记录失败回退策略、重试机制与可观测指标，用于后续迭代。",
+		});
+
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = vi.fn(async () =>
+			new Response(
+				JSON.stringify({
+					choices: [
+						{
+							message: {
+								content: JSON.stringify({
+									titleCandidates: [{ title: "RAG 流程设计", confidence: 0.88, reason: "主题聚焦" }],
+									tagSuggestions: [{ name: "ai/rag", confidence: 0.83, reason: "语义命中" }],
+									semanticSearch: [],
+									linkSuggestions: [],
+									summary: "这是一条关于 RAG 流程设计的笔记。",
+									outline: ["问题定义", "检索链路", "输出策略"],
+									similarNotes: [],
+								}),
+							},
+						},
+					],
+				}),
+				{
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				},
+			),
+		) as typeof fetch;
+
+		try {
+			const enhanced = await readEnvelope<{
+				provider: string;
+				titleCandidates: Array<{ title: string }>;
+				tagSuggestions: Array<{ name: string }>;
+				summary: string;
+			}>(await api(`/api/ai/notes/${created.id}/enhance`, {
+				method: "POST",
+				body: JSON.stringify({ query: "RAG" }),
+			}, {
+				AI_BASE_URL: "https://api.siliconflow.cn/v1",
+				AI_CHAT_MODEL: "Qwen/Qwen2.5-7B-Instruct",
+				SILICONFLOW_API_KEY: "test-key",
+			}));
+
+			expect(enhanced.data.provider).toBe("siliconflow");
+			expect(enhanced.data.titleCandidates[0]?.title).toBe("RAG 流程设计");
+			expect(enhanced.data.tagSuggestions[0]?.name).toBe("ai-rag");
+			expect(enhanced.data.summary).toContain("RAG");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+});
+
 async function createNote(input: {
 	title: string;
 	folderId: string;
@@ -411,7 +472,7 @@ async function createNote(input: {
 	return created.data;
 }
 
-async function api(pathname: string, init?: RequestInit) {
+async function api(pathname: string, init?: RequestInit, envOverrides: Record<string, unknown> = {}) {
 	const headers = new Headers(init?.headers);
 	if (init?.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
 		headers.set("Content-Type", "application/json");
@@ -425,6 +486,7 @@ async function api(pathname: string, init?: RequestInit) {
 		INDEX_CHUNK_MAX_CHARS: "120",
 		INDEX_CHUNK_OVERLAP_CHARS: "16",
 		INDEX_VECTOR_DIMENSIONS: "32",
+		...envOverrides,
 	} as Env, createExecutionContext());
 }
 

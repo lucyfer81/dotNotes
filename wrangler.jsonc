@@ -21,7 +21,11 @@
 		"INDEX_VECTOR_DIMENSIONS": "64",
 		"INDEX_EMBEDDING_MODEL": "hash-v1",
 		"TAG_NAME_MAX_LENGTH": "48",
-		"TAG_PER_NOTE_LIMIT": "12"
+		"TAG_PER_NOTE_LIMIT": "12",
+		"AI_BASE_URL": "https://api.siliconflow.cn/v1",
+		"AI_CHAT_MODEL": "deepseek-ai/DeepSeek-V3.2",
+		"AI_TIMEOUT_MS": "30000",
+		"AI_MAX_INPUT_CHARS": "12000"
 	},
 	"d1_databases": [
 		{

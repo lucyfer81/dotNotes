@@ -8,6 +8,7 @@ import {
 	createNote,
 	deleteNoteAsset,
 	deleteNote,
+	enhanceNoteWithAiTask,
 	getNoteLinks,
 	hardDeleteNote,
 	listFolders,
@@ -18,6 +19,9 @@ import {
 	uploadNoteAsset,
 	updateFolder,
 	updateNote,
+	type AiEnhanceRelatedNoteApiItem,
+	type AiEnhanceResultApiItem,
+	type AiEnhanceTaskApiKey,
 	type FolderApiItem,
 	type NoteAssetApiItem,
 	type NoteLinkApiItem,
@@ -68,6 +72,14 @@ const EDITOR_MODE_STORAGE_KEY = "dotnotes.editor.mode";
 const RECENT_NOTE_IDS_STORAGE_KEY = "dotnotes.command.recent-note-ids";
 const RECENT_NOTE_LIMIT = 12;
 const WIKI_LINK_PATTERN = /\[\[([^\[\]]+)\]\]/g;
+const AI_TASK_ITEMS: Array<{ key: AiEnhanceTaskApiKey; label: string }> = [
+	{ key: "title", label: "生成标题" },
+	{ key: "tags", label: "生成标签" },
+	{ key: "semantic", label: "语义搜索" },
+	{ key: "links", label: "双链建议" },
+	{ key: "summary", label: "摘要大纲" },
+	{ key: "similar", label: "相似笔记" },
+];
 
 const defaultRootFolders: FolderApiItem[] = [
 	{ id: "folder-00-inbox", parentId: null, name: "00-Inbox", sortOrder: 0 },
@@ -96,6 +108,13 @@ export default function Home() {
 	const [isFocusFullscreen, setIsFocusFullscreen] = useState(false);
 	const [viewportWidth, setViewportWidth] = useState(0);
 	const [aiOpen, setAiOpen] = useState(false);
+	const [aiQuery, setAiQuery] = useState("");
+	const [aiEnhanceResult, setAiEnhanceResult] = useState<AiEnhanceResultApiItem | null>(null);
+	const [runningAiTasks, setRunningAiTasks] = useState<AiEnhanceTaskApiKey[]>([]);
+	const [aiErrorMessage, setAiErrorMessage] = useState("");
+	const [isApplyingAiTitle, setIsApplyingAiTitle] = useState(false);
+	const [isApplyingAiTags, setIsApplyingAiTags] = useState(false);
+	const [isApplyingAiLinks, setIsApplyingAiLinks] = useState(false);
 	const [folderItems, setFolderItems] = useState<FolderApiItem[]>(defaultRootFolders);
 	const [organizeFolderId, setOrganizeFolderId] = useState<string | null>(null);
 	const [captureFolderId, setCaptureFolderId] = useState<string>(defaultRootFolders[0].id);
@@ -153,6 +172,14 @@ export default function Home() {
 	const saveTimerRef = useRef<number | null>(null);
 	const pendingSaveRef = useRef<{ noteId: string; content: string } | null>(null);
 	const saveInFlightRef = useRef(false);
+	const aiTaskRunIdRef = useRef<Record<AiEnhanceTaskApiKey, number>>({
+		title: 0,
+		tags: 0,
+		semantic: 0,
+		links: 0,
+		summary: 0,
+		similar: 0,
+	});
 	const commandInputRef = useRef<HTMLInputElement | null>(null);
 
 	const activeNote = useMemo(
@@ -302,6 +329,21 @@ export default function Home() {
 	useEffect(() => {
 		setTitleDraft(activeNote?.title ?? "");
 		setIsTitleEditing(false);
+	}, [activeNoteId]);
+
+	useEffect(() => {
+		setAiEnhanceResult(null);
+		setAiErrorMessage("");
+		setAiQuery("");
+		setRunningAiTasks([]);
+		aiTaskRunIdRef.current = {
+			title: 0,
+			tags: 0,
+			semantic: 0,
+			links: 0,
+			summary: 0,
+			similar: 0,
+		};
 	}, [activeNoteId]);
 
 	useEffect(() => {
@@ -967,6 +1009,108 @@ export default function Home() {
 			.filter((item) => item.noteId !== noteId)
 			.map((item) => item.slug);
 		void syncActiveNoteLinks(nextSlugs);
+	};
+
+	const handleRunAiTask = async (task: AiEnhanceTaskApiKey) => {
+		if (!activeNote || activeNote.deletedAt || runningAiTasks.includes(task)) {
+			return;
+		}
+		const noteId = activeNote.id;
+		const query = aiQuery.trim() || undefined;
+		const runId = (aiTaskRunIdRef.current[task] ?? 0) + 1;
+		aiTaskRunIdRef.current[task] = runId;
+		setAiErrorMessage("");
+		setRunningAiTasks((prev) => (prev.includes(task) ? prev : [...prev, task]));
+		setAiEnhanceResult((prev) =>
+			prev && prev.noteId === noteId ? prev : buildInitialAiEnhanceResult(noteId, query ?? ""),
+		);
+		try {
+			const partial = await enhanceNoteWithAiTask(noteId, task, {
+				query,
+				topK: 6,
+			});
+			if (aiTaskRunIdRef.current[task] !== runId) {
+				return;
+			}
+			setAiEnhanceResult((prev) => mergeAiEnhanceResult(prev, partial, noteId, query ?? ""));
+		} catch (error) {
+			if (aiTaskRunIdRef.current[task] === runId) {
+				setAiErrorMessage(readErrorMessage(error));
+			}
+		} finally {
+			if (aiTaskRunIdRef.current[task] === runId) {
+				setRunningAiTasks((prev) => prev.filter((item) => item !== task));
+			}
+		}
+	};
+
+	const handleApplyAiTitle = async (title: string) => {
+		if (!activeNote || isActiveNoteDeleted || isApplyingAiTitle) {
+			return;
+		}
+		const nextTitle = title.trim();
+		if (!nextTitle || nextTitle === activeNote.title) {
+			return;
+		}
+		setIsApplyingAiTitle(true);
+		setAiErrorMessage("");
+		try {
+			const updated = await updateNote(activeNote.id, { title: nextTitle });
+			const next = toNoteItem(updated);
+			setNoteItems((prev) => prev.map((item) => (item.id === next.id ? { ...item, ...next } : item)));
+			setTitleDraft(nextTitle);
+		} catch (error) {
+			setAiErrorMessage(readErrorMessage(error));
+		} finally {
+			setIsApplyingAiTitle(false);
+		}
+	};
+
+	const handleApplyAiTags = async () => {
+		if (!activeNote || isActiveNoteDeleted || isApplyingAiTags || !aiEnhanceResult) {
+			return;
+		}
+		const suggestedTags = aiEnhanceResult.tagSuggestions.map((item) => item.name).filter((item) => item.trim().length > 0);
+		if (suggestedTags.length === 0) {
+			return;
+		}
+		const mergedTagNames = [...new Set([...activeNote.tags, ...suggestedTags])];
+		setIsApplyingAiTags(true);
+		setAiErrorMessage("");
+		try {
+			const updated = await updateNote(activeNote.id, { tagNames: mergedTagNames });
+			const next = toNoteItem(updated);
+			setNoteItems((prev) => prev.map((item) => (item.id === next.id ? { ...item, ...next } : item)));
+			await refreshTags();
+		} catch (error) {
+			setAiErrorMessage(readErrorMessage(error));
+		} finally {
+			setIsApplyingAiTags(false);
+		}
+	};
+
+	const handleApplyAiLinks = async () => {
+		if (!activeNote || isActiveNoteDeleted || isApplyingAiLinks || !aiEnhanceResult || isSyncingLinks) {
+			return;
+		}
+		const suggestedSlugs = aiEnhanceResult.linkSuggestions.map((item) => item.slug);
+		if (suggestedSlugs.length === 0) {
+			return;
+		}
+		setIsApplyingAiLinks(true);
+		setAiErrorMessage("");
+		try {
+			const existingSlugs = noteLinks?.outbound.map((item) => item.slug) ?? [];
+			const updated = await updateNote(activeNote.id, {
+				linkSlugs: [...new Set([...existingSlugs, ...suggestedSlugs])],
+			});
+			const next = toNoteItem(updated);
+			setNoteItems((prev) => prev.map((item) => (item.id === next.id ? { ...item, ...next } : item)));
+		} catch (error) {
+			setAiErrorMessage(readErrorMessage(error));
+		} finally {
+			setIsApplyingAiLinks(false);
+		}
 	};
 
 	const handleInsertAssetLink = (asset: NoteAssetApiItem) => {
@@ -2529,7 +2673,22 @@ export default function Home() {
 					</button>
 				</div>
 				<div className="h-[calc(100%-2.25rem)] overflow-y-auto">
-					<AiPanel />
+					<AiPanel
+						activeNote={activeNote}
+						query={aiQuery}
+						onQueryChange={setAiQuery}
+						onRunTask={handleRunAiTask}
+						runningTasks={runningAiTasks}
+						errorMessage={aiErrorMessage}
+						result={aiEnhanceResult}
+						onApplyTitle={handleApplyAiTitle}
+						onApplyTags={handleApplyAiTags}
+						onApplyLinks={handleApplyAiLinks}
+						isApplyingTitle={isApplyingAiTitle}
+						isApplyingTags={isApplyingAiTags}
+						isApplyingLinks={isApplyingAiLinks}
+						onOpenNote={focusNote}
+					/>
 				</div>
 			</div>
 
@@ -2551,7 +2710,22 @@ export default function Home() {
 						</button>
 					</div>
 					<div className="max-h-[68dvh] overflow-y-auto pb-[max(env(safe-area-inset-bottom),0.5rem)]">
-						<AiPanel />
+						<AiPanel
+							activeNote={activeNote}
+							query={aiQuery}
+							onQueryChange={setAiQuery}
+							onRunTask={handleRunAiTask}
+							runningTasks={runningAiTasks}
+							errorMessage={aiErrorMessage}
+							result={aiEnhanceResult}
+							onApplyTitle={handleApplyAiTitle}
+							onApplyTags={handleApplyAiTags}
+							onApplyLinks={handleApplyAiLinks}
+							isApplyingTitle={isApplyingAiTitle}
+							isApplyingTags={isApplyingAiTags}
+							isApplyingLinks={isApplyingAiLinks}
+							onOpenNote={focusNote}
+						/>
 					</div>
 				</div>
 			</div>
@@ -2922,30 +3096,304 @@ function LinkNoteList(props: {
 	);
 }
 
-function AiPanel() {
+function AiPanel(props: {
+	activeNote: NoteItem | null;
+	query: string;
+	onQueryChange: (value: string) => void;
+	onRunTask: (task: AiEnhanceTaskApiKey) => void;
+	runningTasks: AiEnhanceTaskApiKey[];
+	errorMessage: string;
+	result: AiEnhanceResultApiItem | null;
+	onApplyTitle: (title: string) => void;
+	onApplyTags: () => void;
+	onApplyLinks: () => void;
+	isApplyingTitle: boolean;
+	isApplyingTags: boolean;
+	isApplyingLinks: boolean;
+	onOpenNote: (noteId: string) => void;
+}) {
+	const {
+		activeNote,
+		query,
+		onQueryChange,
+		onRunTask,
+		runningTasks,
+		errorMessage,
+		result,
+		onApplyTitle,
+		onApplyTags,
+		onApplyLinks,
+		isApplyingTitle,
+		isApplyingTags,
+		isApplyingLinks,
+		onOpenNote,
+	} = props;
+	const unavailable = !activeNote || Boolean(activeNote.deletedAt);
+	const runningTaskSet = new Set(runningTasks);
+	const tagNames = result?.tagSuggestions.map((item) => item.name) ?? [];
+
 	return (
 		<div>
-			<div className="mb-4 flex items-center justify-between">
+			<div className="mb-3 flex items-center justify-between">
 				<p className="text-sm font-semibold">AI 助手</p>
-				<span className="rounded-md bg-emerald-50 px-2 py-1 text-xs text-emerald-700">在线</span>
+				<span className="rounded-md bg-emerald-50 px-2 py-1 text-xs text-emerald-700">
+					{result?.provider === "siliconflow" ? "Siliconflow" : "在线"}
+				</span>
 			</div>
-			<div className="space-y-2">
-				{["总结本笔记", "改写成行动项", "生成标签", "语义检索"].map((action) => (
-					<button
-						key={action}
-						className="w-full rounded-lg border border-slate-200 px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100"
-					>
-						{action}
-					</button>
-				))}
+			<div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+				<p className="text-xs text-slate-500">当前笔记</p>
+				<p className="mt-1 truncate text-sm font-medium text-slate-800">
+					{activeNote?.title ?? "未选中笔记"}
+				</p>
+				<input
+					value={query}
+					onChange={(event) => onQueryChange(event.target.value)}
+					placeholder="可选：输入补充检索词"
+					disabled={unavailable}
+					className="mt-3 w-full rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-700 outline-none focus:ring disabled:cursor-not-allowed disabled:bg-slate-100"
+				/>
+				<div className="mt-3 grid grid-cols-2 gap-2">
+					{AI_TASK_ITEMS.map((item) => {
+						const isRunningTask = runningTaskSet.has(item.key);
+						const canRunTask = !unavailable && !isRunningTask;
+						return (
+							<button
+								key={item.key}
+								type="button"
+								onClick={() => onRunTask(item.key)}
+								disabled={!canRunTask}
+								className={`rounded-lg px-2 py-2 text-xs font-medium ${
+									canRunTask
+										? "bg-slate-900 text-white hover:bg-slate-700"
+										: "cursor-not-allowed bg-slate-200 text-slate-500"
+								}`}
+							>
+								{isRunningTask ? "生成中..." : item.label}
+							</button>
+						);
+					})}
+				</div>
+				{unavailable ? <p className="mt-2 text-xs text-amber-600">请选中未删除笔记后使用。</p> : null}
+				{errorMessage ? <p className="mt-2 text-xs text-rose-600">{errorMessage}</p> : null}
 			</div>
-			<div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-3">
-				<p className="text-xs font-medium text-slate-500">检索结果示例</p>
-				<p className="mt-2 text-sm text-slate-700">RAG 方案草稿 · 命中 0.92</p>
-				<p className="mt-1 text-xs text-slate-500">定义 chunk 策略、召回与重排流程。</p>
-			</div>
+
+			{result ? (
+				<div className="mt-3 space-y-3">
+					{result.warnings.length > 0 ? (
+						<div className="rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs text-amber-700">
+							{result.warnings[0]}
+						</div>
+					) : null}
+
+					<section className="rounded-lg border border-slate-200 bg-white p-3">
+						<div className="mb-2 flex items-center justify-between">
+							<p className="text-xs font-semibold text-slate-600">标题候选</p>
+							<span className="text-[11px] text-slate-400">{formatUpdatedAt(result.generatedAt)}</span>
+						</div>
+						<div className="space-y-2">
+							{result.titleCandidates.length === 0 ? (
+								<p className="text-xs text-slate-400">暂无建议</p>
+							) : (
+								result.titleCandidates.map((item, index) => (
+									<div key={`${item.title}-${index}`} className="rounded-md border border-slate-200 p-2">
+										<p className="text-sm text-slate-800">{item.title}</p>
+										<p className="mt-1 text-[11px] text-slate-500">{item.reason}</p>
+										<button
+											type="button"
+											onClick={() => onApplyTitle(item.title)}
+											disabled={isApplyingTitle}
+											className={`mt-2 rounded border px-2 py-1 text-[11px] ${
+												isApplyingTitle
+													? "cursor-not-allowed border-slate-200 text-slate-300"
+													: "border-slate-300 text-slate-700 hover:bg-slate-100"
+											}`}
+										>
+											{isApplyingTitle ? "应用中..." : "应用标题"}
+										</button>
+									</div>
+								))
+							)}
+						</div>
+					</section>
+
+					<section className="rounded-lg border border-slate-200 bg-white p-3">
+						<div className="mb-2 flex items-center justify-between">
+							<p className="text-xs font-semibold text-slate-600">标签建议</p>
+							<button
+								type="button"
+								onClick={onApplyTags}
+								disabled={isApplyingTags || tagNames.length === 0}
+								className={`rounded border px-2 py-1 text-[11px] ${
+									isApplyingTags || tagNames.length === 0
+										? "cursor-not-allowed border-slate-200 text-slate-300"
+										: "border-slate-300 text-slate-700 hover:bg-slate-100"
+								}`}
+							>
+								{isApplyingTags ? "应用中..." : "应用标签"}
+							</button>
+						</div>
+						<div className="flex flex-wrap gap-1">
+							{tagNames.length === 0 ? (
+								<p className="text-xs text-slate-400">暂无建议</p>
+							) : (
+								tagNames.map((name) => (
+									<span key={name} className="rounded-full bg-slate-100 px-2 py-1 text-[11px] text-slate-700">
+										#{name}
+									</span>
+								))
+							)}
+						</div>
+					</section>
+
+					<section className="rounded-lg border border-slate-200 bg-white p-3">
+						<div className="mb-2 flex items-center justify-between">
+							<p className="text-xs font-semibold text-slate-600">摘要 / 大纲</p>
+						</div>
+						{result.summaryMeta.skipped ? (
+							<p className="text-xs text-slate-500">笔记较短，已跳过摘要（阈值策略）。</p>
+						) : (
+							<p className="text-sm leading-6 text-slate-700">{result.summary || "暂无摘要"}</p>
+						)}
+						{result.outline.length > 0 ? (
+							<div className="mt-2 space-y-1">
+								{result.outline.map((item, index) => (
+									<p key={`${item}-${index}`} className="text-xs text-slate-600">
+										{index + 1}. {item}
+									</p>
+								))}
+							</div>
+						) : null}
+					</section>
+
+					<section className="rounded-lg border border-slate-200 bg-white p-3">
+						<div className="mb-2 flex items-center justify-between">
+							<p className="text-xs font-semibold text-slate-600">双链建议</p>
+							<button
+								type="button"
+								onClick={onApplyLinks}
+								disabled={isApplyingLinks || result.linkSuggestions.length === 0}
+								className={`rounded border px-2 py-1 text-[11px] ${
+									isApplyingLinks || result.linkSuggestions.length === 0
+										? "cursor-not-allowed border-slate-200 text-slate-300"
+										: "border-slate-300 text-slate-700 hover:bg-slate-100"
+								}`}
+							>
+								{isApplyingLinks ? "应用中..." : "应用双链"}
+							</button>
+						</div>
+						<AiRelatedNoteList
+							items={result.linkSuggestions.map((item) => ({
+								noteId: item.targetNoteId,
+								slug: item.slug,
+								title: item.title,
+								snippet: item.reason,
+								score: item.score,
+								reason: item.reason,
+							}))}
+							onOpenNote={onOpenNote}
+							emptyText="暂无双链建议"
+						/>
+					</section>
+
+					<section className="rounded-lg border border-slate-200 bg-white p-3">
+						<p className="mb-2 text-xs font-semibold text-slate-600">语义搜索候选</p>
+						<AiRelatedNoteList
+							items={result.semanticSearch}
+							onOpenNote={onOpenNote}
+							emptyText="暂无结果"
+						/>
+					</section>
+
+					<section className="rounded-lg border border-slate-200 bg-white p-3">
+						<p className="mb-2 text-xs font-semibold text-slate-600">相似笔记</p>
+						<AiRelatedNoteList
+							items={result.similarNotes}
+							onOpenNote={onOpenNote}
+							emptyText="暂无相似笔记"
+						/>
+					</section>
+				</div>
+			) : null}
 		</div>
 	);
+}
+
+function AiRelatedNoteList(props: {
+	items: AiEnhanceRelatedNoteApiItem[];
+	onOpenNote: (noteId: string) => void;
+	emptyText: string;
+}) {
+	const { items, onOpenNote, emptyText } = props;
+	return items.length === 0 ? (
+		<p className="text-xs text-slate-400">{emptyText}</p>
+	) : (
+		<div className="space-y-2">
+			{items.map((item) => (
+				<div key={`${item.noteId}-${item.slug}`} className="rounded-md border border-slate-200 p-2">
+					<div className="flex items-center justify-between gap-2">
+						<button
+							type="button"
+							onClick={() => onOpenNote(item.noteId)}
+							className="truncate text-left text-xs font-medium text-slate-800 hover:text-sky-700"
+						>
+							{item.title}
+						</button>
+						<span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-600">
+							{Math.round(item.score * 100)}%
+						</span>
+					</div>
+					<p className="mt-1 line-clamp-2 text-[11px] text-slate-500">{item.snippet || item.reason}</p>
+				</div>
+			))}
+		</div>
+	);
+}
+
+function buildInitialAiEnhanceResult(noteId: string, query: string): AiEnhanceResultApiItem {
+	return {
+		noteId,
+		query,
+		generatedAt: new Date().toISOString(),
+		provider: "siliconflow",
+		model: null,
+		warnings: [],
+		titleCandidates: [],
+		tagSuggestions: [],
+		semanticSearch: [],
+		linkSuggestions: [],
+		summary: "",
+		outline: [],
+		summaryMeta: {
+			mode: "full",
+			skipped: false,
+			reason: null,
+		},
+		similarNotes: [],
+	};
+}
+
+function mergeAiEnhanceResult(
+	current: AiEnhanceResultApiItem | null,
+	partial: AiEnhanceResultApiItem,
+	noteId: string,
+	query: string,
+): AiEnhanceResultApiItem {
+	const base = current ?? buildInitialAiEnhanceResult(noteId, query);
+	return {
+		...base,
+		generatedAt: partial.generatedAt || base.generatedAt,
+		provider: partial.provider || base.provider,
+		model: partial.model,
+		warnings: [...new Set([...base.warnings, ...partial.warnings])],
+		titleCandidates: partial.titleCandidates.length > 0 ? partial.titleCandidates : base.titleCandidates,
+		tagSuggestions: partial.tagSuggestions.length > 0 ? partial.tagSuggestions : base.tagSuggestions,
+		semanticSearch: partial.semanticSearch.length > 0 ? partial.semanticSearch : base.semanticSearch,
+		linkSuggestions: partial.linkSuggestions.length > 0 ? partial.linkSuggestions : base.linkSuggestions,
+		summary: partial.summary || base.summary,
+		outline: partial.outline.length > 0 ? partial.outline : base.outline,
+		summaryMeta: partial.summaryMeta ?? base.summaryMeta,
+		similarNotes: partial.similarNotes.length > 0 ? partial.similarNotes : base.similarNotes,
+	};
 }
 
 function toNoteItem(note: NoteApiItem): NoteItem {

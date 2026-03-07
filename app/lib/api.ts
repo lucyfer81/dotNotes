@@ -52,6 +52,54 @@ export type NoteAssetApiItem = {
 	createdAt: string;
 	downloadUrl: string;
 };
+export type AiEnhanceTitleCandidateApiItem = {
+	title: string;
+	confidence: number;
+	reason: string;
+};
+export type AiEnhanceTagSuggestionApiItem = {
+	name: string;
+	confidence: number;
+	reason: string;
+};
+export type AiEnhanceRelatedNoteApiItem = {
+	noteId: string;
+	slug: string;
+	title: string;
+	snippet: string;
+	score: number;
+	reason: string;
+};
+export type AiEnhanceLinkSuggestionApiItem = {
+	targetNoteId: string;
+	slug: string;
+	title: string;
+	anchorText: string;
+	score: number;
+	reason: string;
+};
+export type AiEnhanceSummaryMetaApiItem = {
+	mode: "skip" | "mini" | "full";
+	skipped: boolean;
+	reason: string | null;
+};
+export type AiEnhanceResultApiItem = {
+	noteId: string;
+	query: string;
+	generatedAt: string;
+	provider: "siliconflow" | "local-fallback";
+	model: string | null;
+	warnings: string[];
+	titleCandidates: AiEnhanceTitleCandidateApiItem[];
+	tagSuggestions: AiEnhanceTagSuggestionApiItem[];
+	semanticSearch: AiEnhanceRelatedNoteApiItem[];
+	linkSuggestions: AiEnhanceLinkSuggestionApiItem[];
+	summary: string;
+	outline: string[];
+	summaryMeta: AiEnhanceSummaryMetaApiItem;
+	similarNotes: AiEnhanceRelatedNoteApiItem[];
+};
+export type AiEnhanceTaskApiKey = "title" | "tags" | "semantic" | "links" | "summary" | "similar";
 
 type ListNotesOptions = {
 	limit?: number;
@@ -102,6 +150,10 @@ type UpdateFolderInput = {
 	parentId?: string;
 	sortOrder?: number;
 	slug?: string;
+};
+type AiEnhanceInput = {
+	query?: string;
+	topK?: number;
 };
 
 export async function listFolders(): Promise<FolderApiItem[]> {
@@ -345,6 +397,40 @@ export async function getNoteLinks(noteId: string, status?: NoteStatus): Promise
 	return parsed;
 }
 
+export async function enhanceNoteWithAi(noteId: string, input: AiEnhanceInput = {}): Promise<AiEnhanceResultApiItem> {
+	const data = await requestApiData<unknown>(`/api/ai/notes/${encodeURIComponent(noteId)}/enhance`, {
+		method: "POST",
+		body: JSON.stringify({
+			query: input.query,
+			topK: input.topK,
+		}),
+	});
+	const parsed = toAiEnhanceResultApiItem(data);
+	if (!parsed) {
+		throw new Error("Invalid ai enhance response");
+	}
+	return parsed;
+}
+
+export async function enhanceNoteWithAiTask(
+	noteId: string,
+	task: AiEnhanceTaskApiKey,
+	input: AiEnhanceInput = {},
+): Promise<AiEnhanceResultApiItem> {
+	const data = await requestApiData<unknown>(`/api/ai/notes/${encodeURIComponent(noteId)}/enhance/${encodeURIComponent(task)}`, {
+		method: "POST",
+		body: JSON.stringify({
+			query: input.query,
+			topK: input.topK,
+		}),
+	});
+	const parsed = toAiEnhanceResultApiItem(data);
+	if (!parsed) {
+		throw new Error("Invalid ai task response");
+	}
+	return parsed;
+}
+
 export async function listNoteAssets(noteId: string): Promise<NoteAssetApiItem[]> {
 	const data = await requestApiData<unknown>(`/api/notes/${encodeURIComponent(noteId)}/assets`);
 	if (!Array.isArray(data)) {
@@ -511,6 +597,167 @@ function toNoteLinksApiItem(value: unknown): NoteLinksApiItem | null {
 		noteId: value.noteId,
 		outbound,
 		inbound,
+	};
+}
+
+function toAiEnhanceResultApiItem(value: unknown): AiEnhanceResultApiItem | null {
+	if (
+		!isRecord(value) ||
+		typeof value.noteId !== "string" ||
+		typeof value.query !== "string" ||
+		typeof value.generatedAt !== "string" ||
+		(value.provider !== "siliconflow" && value.provider !== "local-fallback") ||
+		(typeof value.model !== "string" && value.model !== null) ||
+		typeof value.summary !== "string"
+	) {
+		return null;
+	}
+
+	const warnings = Array.isArray(value.warnings)
+		? value.warnings.filter((item): item is string => typeof item === "string")
+		: [];
+	const outline = Array.isArray(value.outline)
+		? value.outline.filter((item): item is string => typeof item === "string")
+		: [];
+	const summaryMeta = toAiEnhanceSummaryMetaApiItem(value.summaryMeta) ?? {
+		mode: "full",
+		skipped: false,
+		reason: null,
+	};
+	const titleCandidates = Array.isArray(value.titleCandidates)
+		? value.titleCandidates
+				.map((item) => toAiEnhanceTitleCandidateApiItem(item))
+				.filter((item): item is AiEnhanceTitleCandidateApiItem => item !== null)
+		: [];
+	const tagSuggestions = Array.isArray(value.tagSuggestions)
+		? value.tagSuggestions
+				.map((item) => toAiEnhanceTagSuggestionApiItem(item))
+				.filter((item): item is AiEnhanceTagSuggestionApiItem => item !== null)
+		: [];
+	const semanticSearch = Array.isArray(value.semanticSearch)
+		? value.semanticSearch
+				.map((item) => toAiEnhanceRelatedNoteApiItem(item))
+				.filter((item): item is AiEnhanceRelatedNoteApiItem => item !== null)
+		: [];
+	const similarNotes = Array.isArray(value.similarNotes)
+		? value.similarNotes
+				.map((item) => toAiEnhanceRelatedNoteApiItem(item))
+				.filter((item): item is AiEnhanceRelatedNoteApiItem => item !== null)
+		: [];
+	const linkSuggestions = Array.isArray(value.linkSuggestions)
+		? value.linkSuggestions
+				.map((item) => toAiEnhanceLinkSuggestionApiItem(item))
+				.filter((item): item is AiEnhanceLinkSuggestionApiItem => item !== null)
+		: [];
+
+	return {
+		noteId: value.noteId,
+		query: value.query,
+		generatedAt: value.generatedAt,
+		provider: value.provider,
+		model: value.model,
+		warnings,
+		titleCandidates,
+		tagSuggestions,
+		semanticSearch,
+		linkSuggestions,
+		summary: value.summary,
+		outline,
+		summaryMeta,
+		similarNotes,
+	};
+}
+
+function toAiEnhanceSummaryMetaApiItem(value: unknown): AiEnhanceSummaryMetaApiItem | null {
+	if (!isRecord(value)) {
+		return null;
+	}
+	if ((value.mode !== "skip" && value.mode !== "mini" && value.mode !== "full") || typeof value.skipped !== "boolean") {
+		return null;
+	}
+	if (typeof value.reason !== "string" && value.reason !== null) {
+		return null;
+	}
+	return {
+		mode: value.mode,
+		skipped: value.skipped,
+		reason: value.reason,
+	};
+}
+
+function toAiEnhanceTitleCandidateApiItem(value: unknown): AiEnhanceTitleCandidateApiItem | null {
+	if (
+		!isRecord(value) ||
+		typeof value.title !== "string" ||
+		typeof value.confidence !== "number" ||
+		typeof value.reason !== "string"
+	) {
+		return null;
+	}
+	return {
+		title: value.title,
+		confidence: value.confidence,
+		reason: value.reason,
+	};
+}
+
+function toAiEnhanceTagSuggestionApiItem(value: unknown): AiEnhanceTagSuggestionApiItem | null {
+	if (
+		!isRecord(value) ||
+		typeof value.name !== "string" ||
+		typeof value.confidence !== "number" ||
+		typeof value.reason !== "string"
+	) {
+		return null;
+	}
+	return {
+		name: value.name,
+		confidence: value.confidence,
+		reason: value.reason,
+	};
+}
+
+function toAiEnhanceRelatedNoteApiItem(value: unknown): AiEnhanceRelatedNoteApiItem | null {
+	if (
+		!isRecord(value) ||
+		typeof value.noteId !== "string" ||
+		typeof value.slug !== "string" ||
+		typeof value.title !== "string" ||
+		typeof value.snippet !== "string" ||
+		typeof value.score !== "number" ||
+		typeof value.reason !== "string"
+	) {
+		return null;
+	}
+	return {
+		noteId: value.noteId,
+		slug: value.slug,
+		title: value.title,
+		snippet: value.snippet,
+		score: value.score,
+		reason: value.reason,
+	};
+}
+
+function toAiEnhanceLinkSuggestionApiItem(value: unknown): AiEnhanceLinkSuggestionApiItem | null {
+	if (
+		!isRecord(value) ||
+		typeof value.targetNoteId !== "string" ||
+		typeof value.slug !== "string" ||
+		typeof value.title !== "string" ||
+		typeof value.anchorText !== "string" ||
+		typeof value.score !== "number" ||
+		typeof value.reason !== "string"
+	) {
+		return null;
+	}
+	return {
+		targetNoteId: value.targetNoteId,
+		slug: value.slug,
+		title: value.title,
+		anchorText: value.anchorText,
+		score: value.score,
+		reason: value.reason,
 	};
 }
 

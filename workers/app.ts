@@ -136,6 +136,67 @@ type AiContextChunkItem = {
 	snippet: string;
 	updatedAt: string;
 };
+type AiEnhanceRequestInput = {
+	query: string | null;
+	topK: number;
+};
+type AiEnhanceTaskKey = "title" | "tags" | "semantic" | "links" | "summary" | "similar";
+type AiEnhanceTitleCandidate = {
+	title: string;
+	confidence: number;
+	reason: string;
+};
+type AiEnhanceTagSuggestion = {
+	name: string;
+	confidence: number;
+	reason: string;
+};
+type AiEnhanceRelatedNoteItem = {
+	noteId: string;
+	slug: string;
+	title: string;
+	snippet: string;
+	score: number;
+	reason: string;
+};
+type AiEnhanceLinkSuggestion = {
+	targetNoteId: string;
+	slug: string;
+	title: string;
+	anchorText: string;
+	score: number;
+	reason: string;
+};
+type AiEnhanceSummaryMode = "skip" | "mini" | "full";
+type AiEnhanceSummaryMeta = {
+	mode: AiEnhanceSummaryMode;
+	skipped: boolean;
+	reason: string | null;
+};
+type AiEnhanceResult = {
+	noteId: string;
+	query: string;
+	generatedAt: string;
+	provider: "siliconflow" | "local-fallback";
+	model: string | null;
+	warnings: string[];
+	titleCandidates: AiEnhanceTitleCandidate[];
+	tagSuggestions: AiEnhanceTagSuggestion[];
+	semanticSearch: AiEnhanceRelatedNoteItem[];
+	linkSuggestions: AiEnhanceLinkSuggestion[];
+	summary: string;
+	outline: string[];
+	summaryMeta: AiEnhanceSummaryMeta;
+	similarNotes: AiEnhanceRelatedNoteItem[];
+};
+type AiEnhancePreparedInput = {
+	note: NoteRow;
+	query: string;
+	topK: number;
+	candidates: AiContextNoteItem[];
+	linkedSlugs: Set<string>;
+	existingTagNames: string[];
+};
 
 const DEFAULT_BODY_R2_THRESHOLD_BYTES = 64 * 1024;
 const NOTE_BODY_R2_PREFIX = "note-bodies";
@@ -153,6 +214,18 @@ const DEFAULT_API_ERROR_RATE_ALERT_THRESHOLD = 0.05;
 const DEFAULT_SEARCH_P95_ALERT_THRESHOLD_MS = 800;
 const DEFAULT_INDEX_SUCCESS_RATE_ALERT_THRESHOLD = 0.95;
 const DEFAULT_INDEX_BACKLOG_ALERT_THRESHOLD = 20;
+const DEFAULT_AI_ENHANCE_TOP_K = 6;
+const DEFAULT_AI_TIMEOUT_MS = 30_000;
+const DEFAULT_AI_MAX_INPUT_CHARS = 12_000;
+const DEFAULT_AI_RETRIEVAL_KEYWORD_MAX_CHARS = 96;
+const DEFAULT_AI_PROMPT_NOTE_MAX_CHARS = 4000;
+const DEFAULT_AI_PROMPT_CANDIDATE_SNIPPET_MAX_CHARS = 160;
+const DEFAULT_AI_EXISTING_TAG_LIMIT = 200;
+const DEFAULT_AI_SUMMARY_SKIP_CHAR_THRESHOLD = 120;
+const DEFAULT_AI_SUMMARY_SKIP_WORD_THRESHOLD = 40;
+const DEFAULT_AI_SUMMARY_MINI_CHAR_THRESHOLD = 300;
+const DEFAULT_AI_SUMMARY_MINI_WORD_THRESHOLD = 80;
+const AI_ENHANCE_TASK_KEYS: AiEnhanceTaskKey[] = ["title", "tags", "semantic", "links", "summary", "similar"];
 type PresetFolder = {
 	id: string;
 	name: string;
@@ -1465,6 +1538,16 @@ app.get("/api/ops/alerts", async (c) => {
 	});
 });
 
+app.post("/api/ai/notes/:id/enhance", async (c) => handleAiEnhanceRequest(c, AI_ENHANCE_TASK_KEYS));
+
+app.post("/api/ai/notes/:id/enhance/:task", async (c) => {
+	const task = parseAiEnhanceTaskKey(c.req.param("task"));
+	if (!task) {
+		return jsonError(c, 404, "AI task not found");
+	}
+	return handleAiEnhanceRequest(c, [task]);
+});
+
 app.post("/api/ai/context", async (c) => {
 	const payload = await parseObjectBody(c);
 	if (!payload) {
@@ -1936,6 +2019,934 @@ function parseAiContextInput(payload: Record<string, unknown>): AiContextRequest
 	};
 }
 
+function parseAiEnhanceInput(payload: Record<string, unknown>): AiEnhanceRequestInput {
+	const query = readOptionalString(payload, "query");
+	const topK = clampInt(
+		typeof payload.topK === "string" ? payload.topK : String(readOptionalNumber(payload, "topK") ?? DEFAULT_AI_ENHANCE_TOP_K),
+		DEFAULT_AI_ENHANCE_TOP_K,
+		1,
+		10,
+	);
+	return {
+		query,
+		topK,
+	};
+}
+
+function parseAiEnhanceTaskKey(value: string): AiEnhanceTaskKey | null {
+	if (value === "title" || value === "tags" || value === "semantic" || value === "links" || value === "summary" || value === "similar") {
+		return value;
+	}
+	return null;
+}
+
+async function handleAiEnhanceRequest(c: AppContext, tasks: AiEnhanceTaskKey[]): Promise<Response> {
+	const noteId = c.req.param("id");
+	const note = await getNoteById(c.env.DB, noteId);
+	if (!note || note.deletedAt) {
+		return jsonError(c, 404, "Note not found");
+	}
+	const payload = (await parseObjectBody(c)) ?? {};
+	const input = parseAiEnhanceInput(payload);
+	const { prepared, warnings } = await prepareAiEnhanceInput(c.env, note, input);
+
+	let result: AiEnhanceResult;
+	try {
+		result = await generateAiEnhanceWithSiliconflow(c.env, prepared, tasks);
+	} catch (error) {
+		console.error("AI enhance fallback", error);
+		result = buildAiEnhanceFallback(prepared, tasks, String(error));
+	}
+	if (warnings.length > 0) {
+		result = {
+			...result,
+			warnings: [...warnings, ...result.warnings],
+		};
+	}
+	return jsonOk(c, result);
+}
+
+function buildAiEnhanceDefaultQuery(title: string, bodyText: string): string {
+	const condensedTitle = title.trim();
+	const bodySnippet = clipTextForAi(bodyText, 120);
+	const joined = `${condensedTitle} ${bodySnippet}`.trim();
+	return joined || "笔记增强";
+}
+
+async function prepareAiEnhanceInput(
+	env: Env,
+	note: NoteRow,
+	input: AiEnhanceRequestInput,
+): Promise<{ prepared: AiEnhancePreparedInput; warnings: string[] }> {
+	const warnings: string[] = [];
+	let hydrated = note;
+	try {
+		hydrated = await hydrateNoteBodyFromR2(env, note);
+	} catch (error) {
+		console.error("AI enhance hydrate failed, fallback to note row body", error);
+		warnings.push(`hydrate_failed: ${String(error)}`);
+	}
+
+	const sourceBody = hydrated.bodyText ?? note.bodyText ?? "";
+	const query = input.query ?? buildAiEnhanceDefaultQuery(hydrated.title, sourceBody);
+	const retrievalQuery = normalizeKeywordForLike(query);
+	let candidatePool: AiContextNoteItem[] = [];
+	try {
+		const context = await buildAiContext(env.DB, {
+			query: retrievalQuery,
+			noteId: null,
+			limit: Math.min(20, Math.max(input.topK * 2, 8)),
+			status: "active",
+		});
+		candidatePool = context.notes.filter((item) => item.noteId !== note.id);
+	} catch (error) {
+		console.error("AI enhance context build failed, continue with empty candidates", error);
+		warnings.push(`context_failed: ${String(error)}`);
+	}
+
+	let linkedSlugs = new Set<string>();
+	try {
+		linkedSlugs = await listOutboundLinkSlugs(env.DB, note.id, 128);
+	} catch (error) {
+		console.error("AI enhance link lookup failed, continue with empty links", error);
+		warnings.push(`link_lookup_failed: ${String(error)}`);
+	}
+
+	let existingTagNames: string[] = [];
+	try {
+		existingTagNames = await listExistingTagNames(env.DB, DEFAULT_AI_EXISTING_TAG_LIMIT);
+	} catch (error) {
+		console.error("AI enhance existing tags lookup failed, continue with empty tags", error);
+		warnings.push(`tags_context_failed: ${String(error)}`);
+	}
+
+	return {
+		prepared: {
+			note: hydrated,
+			query,
+			topK: input.topK,
+			candidates: candidatePool,
+			linkedSlugs,
+			existingTagNames,
+		},
+		warnings,
+	};
+}
+
+async function listOutboundLinkSlugs(db: D1Database, noteId: string, limit: number): Promise<Set<string>> {
+	const { results } = await db.prepare(
+		`SELECT n.slug AS slug
+		 FROM note_links nl
+		 JOIN notes n ON n.id = nl.target_note_id
+		 WHERE nl.source_note_id = ?
+		   AND n.deleted_at IS NULL
+		 ORDER BY n.updated_at DESC
+		 LIMIT ?`,
+	)
+		.bind(noteId, limit)
+		.all<{ slug: string }>();
+	return new Set(
+		results
+			.map((item) => item.slug)
+			.filter((item): item is string => typeof item === "string" && item.length > 0),
+	);
+}
+
+async function listExistingTagNames(db: D1Database, limit: number): Promise<string[]> {
+	const { results } = await db.prepare(
+		`SELECT name
+		 FROM tags
+		 ORDER BY name COLLATE NOCASE ASC
+		 LIMIT ?`,
+	)
+		.bind(limit)
+		.all<{ name: string }>();
+	return results
+		.map((item) => item.name.trim())
+		.filter((item) => item.length > 0);
+}
+
+async function generateAiEnhanceWithSiliconflow(
+	env: Env,
+	input: AiEnhancePreparedInput,
+	tasks: AiEnhanceTaskKey[],
+): Promise<AiEnhanceResult> {
+	const baseUrl = getAiBaseUrl(env);
+	const model = getAiChatModel(env);
+	const apiKey = getSiliconflowApiKey(env);
+	if (!baseUrl || !model || !apiKey) {
+		throw new Error("AI configuration missing: AI_BASE_URL / AI_CHAT_MODEL / SILICONFLOW_API_KEY");
+	}
+
+	const runtime = {
+		baseUrl,
+		model,
+		apiKey,
+		timeoutMs: getAiTimeoutMs(env),
+	};
+	const result = createEmptyAiEnhanceResult(input, {
+		provider: "siliconflow",
+		model,
+		warnings: [],
+	});
+	const candidatesById = new Map(input.candidates.map((item) => [item.noteId, item] as const));
+	const maxInputChars = Math.min(getAiMaxInputChars(env), DEFAULT_AI_PROMPT_NOTE_MAX_CHARS);
+	const sourceBody = clipTextForAi(input.note.bodyText ?? "", maxInputChars);
+	const candidateContext = input.candidates.slice(0, Math.max(input.topK * 2, 8)).map((item) => ({
+		noteId: item.noteId,
+		slug: item.slug,
+		title: item.title,
+		snippet: clipTextForAi(item.snippet, DEFAULT_AI_PROMPT_CANDIDATE_SNIPPET_MAX_CHARS),
+		updatedAt: item.updatedAt,
+	}));
+	const sharedContext = {
+		query: input.query,
+		current_note: {
+			noteId: input.note.id,
+			slug: input.note.slug,
+			title: input.note.title,
+			excerpt: clipTextForAi(input.note.excerpt || "", 240),
+			bodyText: sourceBody,
+		},
+		candidates: candidateContext,
+	};
+
+	const taskSet = new Set(tasks);
+	const taskPromises: Array<Promise<void>> = [];
+
+	if (taskSet.has("title")) {
+		taskPromises.push(
+			(async () => {
+				const payload = await callSiliconflowJson(runtime, {
+					systemPrompt:
+						"你是笔记命名助手。目标是给出可区分、可检索的标题候选。返回严格 JSON，不要 markdown。",
+					userPrompt: [
+						"规则：",
+						"- 输出 3-5 个标题候选，长度建议 12-32 字符。",
+						"- 风格至少覆盖：概念型、行动型、问题型。",
+						"- 避免与 original_title 仅做同义替换。",
+						"- confidence 范围 0~1。",
+						"",
+						`input: ${JSON.stringify({
+							original_title: input.note.title,
+							note_content: sourceBody,
+							query: input.query,
+						})}`,
+						"schema:",
+						JSON.stringify({
+							titleCandidates: [{ title: "string", confidence: 0.8, reason: "string" }],
+						}),
+					].join("\n"),
+				});
+				const source = isRecord(payload) ? payload : {};
+				const candidates = parseTitleCandidates(source.titleCandidates ?? source.candidates, input.topK);
+				result.titleCandidates = candidates.length > 0 ? candidates : buildFallbackTitleCandidates(input.note, input.topK);
+			})().catch((error) => {
+				result.warnings.push(`task_failed:title:${String(error)}`);
+				result.titleCandidates = buildFallbackTitleCandidates(input.note, input.topK);
+			}),
+		);
+	}
+
+	if (taskSet.has("tags")) {
+		taskPromises.push(
+			(async () => {
+				const payload = await callSiliconflowJson(runtime, {
+					systemPrompt:
+						"你是笔记标签助手。目标是生成可复用、低冗余、便于检索的层级标签。返回严格 JSON。",
+					userPrompt: [
+						"规则：",
+						"- 优先复用 existing_tags，仅在必要时创建新标签。",
+						"- 层级标签最多 3 层，使用 '/' 作为分隔。",
+						"- 输出 5-12 个标签，不要泛化标签。",
+						"- confidence 范围 0~1。",
+						"",
+						`input: ${JSON.stringify({
+							current_note: sharedContext.current_note,
+							existing_tags: input.existingTagNames,
+							query: input.query,
+						})}`,
+						"schema:",
+						JSON.stringify({
+							tagSuggestions: [{ name: "topic/subtopic", confidence: 0.8, reason: "string" }],
+						}),
+					].join("\n"),
+				});
+				const source = isRecord(payload) ? payload : {};
+				result.tagSuggestions = parseTagSuggestions(
+					source.tagSuggestions ?? source.tags,
+					input.topK,
+					getTagNameMaxLength(env),
+				);
+			})().catch((error) => {
+				result.warnings.push(`task_failed:tags:${String(error)}`);
+				result.tagSuggestions = buildFallbackTagSuggestions(input.note.bodyText ?? "", input.topK);
+			}),
+		);
+	}
+
+	if (taskSet.has("semantic")) {
+		taskPromises.push(
+			(async () => {
+				const payload = await callSiliconflowJson(runtime, {
+					systemPrompt:
+						"你是笔记语义检索助手。只允许从 candidates 中选择相关笔记，返回严格 JSON。",
+					userPrompt: [
+						"规则：",
+						"- 仅输出 candidates 中的 noteId。",
+						"- 关注同义词、缩写、错别字容错后的主题相似性。",
+						"- 每项给出 reason 和 score(0~1)。",
+						"",
+						`input: ${JSON.stringify(sharedContext)}`,
+						"schema:",
+						JSON.stringify({
+							semanticSearch: [{ noteId: "string", score: 0.8, reason: "string" }],
+						}),
+					].join("\n"),
+				});
+				const source = isRecord(payload) ? payload : {};
+				result.semanticSearch = parseRelatedNoteItems(
+					source.semanticSearch ?? source.recommendations,
+					input.topK,
+					candidatesById,
+				);
+			})().catch((error) => {
+				result.warnings.push(`task_failed:semantic:${String(error)}`);
+				result.semanticSearch = buildFallbackSemanticSearch(input.candidates, input.topK);
+			}),
+		);
+	}
+
+	if (taskSet.has("links")) {
+		taskPromises.push(
+			(async () => {
+				const payload = await callSiliconflowJson(runtime, {
+					systemPrompt:
+						"你是知识库双链助手。只允许从 candidates 选择目标，并输出推荐锚文本。返回严格 JSON。",
+					userPrompt: [
+						"规则：",
+						"- 仅输出 candidates 中的 noteId。",
+						"- 过滤 already_linked_slugs。",
+						"- 每条建议包含 anchorText、reason、score(0~1)。",
+						"",
+						`input: ${JSON.stringify({
+							...sharedContext,
+							already_linked_slugs: [...input.linkedSlugs],
+						})}`,
+						"schema:",
+						JSON.stringify({
+							linkSuggestions: [{ noteId: "string", anchorText: "string", score: 0.8, reason: "string" }],
+						}),
+					].join("\n"),
+				});
+				const source = isRecord(payload) ? payload : {};
+				result.linkSuggestions = parseLinkSuggestions(
+					source.linkSuggestions ?? source.forward_links,
+					input.topK,
+					candidatesById,
+					input.linkedSlugs,
+				);
+			})().catch((error) => {
+				result.warnings.push(`task_failed:links:${String(error)}`);
+				result.linkSuggestions = buildFallbackLinkSuggestions(
+					buildFallbackSemanticSearch(input.candidates, input.topK),
+					input.linkedSlugs,
+					input.topK,
+				);
+			}),
+		);
+	}
+
+	if (taskSet.has("summary")) {
+		taskPromises.push(
+			(async () => {
+				const summaryMode = decideSummaryMode(input.note.bodyText ?? "");
+				result.summaryMeta = summaryMode;
+				if (summaryMode.skipped) {
+					result.summary = "";
+					result.outline = [];
+					return;
+				}
+				const payload = await callSiliconflowJson(runtime, {
+					systemPrompt:
+						"你是笔记提炼助手。输出有信息增量的摘要和大纲，避免复述原文。返回严格 JSON。",
+					userPrompt: [
+						`mode: ${summaryMode.mode}`,
+						"规则：",
+						"- mini 模式：输出 1 句摘要 + 2 条关键点。",
+						"- full 模式：输出摘要、关键点、大纲、待确认问题与下一步。",
+						"- 所有输出必须可执行或可验证。",
+						"",
+						`input: ${JSON.stringify({
+							title: input.note.title,
+							bodyText: sourceBody,
+							query: input.query,
+						})}`,
+						"schema:",
+						JSON.stringify({
+							summary: "string",
+							key_points: ["string"],
+							outline: ["string"],
+							open_questions: ["string"],
+							action_items: ["string"],
+						}),
+					].join("\n"),
+				});
+				const normalized = normalizeSummaryTaskResult(payload, input.note.bodyText ?? "", summaryMode.mode);
+				result.summary = normalized.summary;
+				result.outline = normalized.outline;
+			})().catch((error) => {
+				result.warnings.push(`task_failed:summary:${String(error)}`);
+				result.summary = buildExcerpt(input.note.bodyText ?? "");
+				result.outline = buildOutlineFallback(input.note.bodyText ?? "");
+				result.summaryMeta = {
+					mode: "full",
+					skipped: false,
+					reason: "fallback",
+				};
+			}),
+		);
+	}
+
+	if (taskSet.has("similar")) {
+		taskPromises.push(
+			(async () => {
+				const payload = await callSiliconflowJson(runtime, {
+					systemPrompt:
+						"你是相似笔记发现助手。只允许从 candidates 中选择，返回严格 JSON。",
+					userPrompt: [
+						"规则：",
+						"- 仅输出 candidates 中的 noteId。",
+						"- 给出 similarity_type、reason、score(0~1)。",
+						"",
+						`input: ${JSON.stringify(sharedContext)}`,
+						"schema:",
+						JSON.stringify({
+							similarNotes: [{ noteId: "string", score: 0.8, reason: "string", similarity_type: "same_topic" }],
+						}),
+					].join("\n"),
+				});
+				const source = isRecord(payload) ? payload : {};
+				result.similarNotes = parseRelatedNoteItems(
+					source.similarNotes ?? source.recommendations,
+					input.topK,
+					candidatesById,
+				);
+			})().catch((error) => {
+				result.warnings.push(`task_failed:similar:${String(error)}`);
+				result.similarNotes = buildFallbackSemanticSearch(input.candidates, input.topK);
+			}),
+		);
+	}
+
+	await Promise.all(taskPromises);
+
+	if (result.titleCandidates.length === 0 && taskSet.has("title")) {
+		result.titleCandidates = buildFallbackTitleCandidates(input.note, input.topK);
+	}
+	if (result.tagSuggestions.length === 0 && taskSet.has("tags")) {
+		result.tagSuggestions = buildFallbackTagSuggestions(input.note.bodyText ?? "", input.topK);
+	}
+	if (result.semanticSearch.length === 0 && taskSet.has("semantic")) {
+		result.semanticSearch = buildFallbackSemanticSearch(input.candidates, input.topK);
+	}
+	if (result.linkSuggestions.length === 0 && taskSet.has("links")) {
+		result.linkSuggestions = buildFallbackLinkSuggestions(result.semanticSearch, input.linkedSlugs, input.topK);
+	}
+	if (taskSet.has("summary") && result.summaryMeta.mode !== "skip" && !result.summary.trim()) {
+		result.summary = buildExcerpt(input.note.bodyText ?? "");
+		result.outline = buildOutlineFallback(input.note.bodyText ?? "");
+	}
+	if (result.similarNotes.length === 0 && taskSet.has("similar")) {
+		result.similarNotes = taskSet.has("semantic") && result.semanticSearch.length > 0
+			? result.semanticSearch
+			: buildFallbackSemanticSearch(input.candidates, input.topK);
+	}
+
+	return result;
+}
+
+function createEmptyAiEnhanceResult(
+	input: AiEnhancePreparedInput,
+	meta: { provider: "siliconflow" | "local-fallback"; model: string | null; warnings: string[] },
+): AiEnhanceResult {
+	return {
+		noteId: input.note.id,
+		query: input.query,
+		generatedAt: new Date().toISOString(),
+		provider: meta.provider,
+		model: meta.model,
+		warnings: [...meta.warnings],
+		titleCandidates: [],
+		tagSuggestions: [],
+		semanticSearch: [],
+		linkSuggestions: [],
+		summary: "",
+		outline: [],
+		summaryMeta: {
+			mode: "full",
+			skipped: false,
+			reason: null,
+		},
+		similarNotes: [],
+	};
+}
+
+async function callSiliconflowJson(
+	runtime: {
+		baseUrl: string;
+		model: string;
+		apiKey: string;
+		timeoutMs: number;
+	},
+	input: {
+		systemPrompt: string;
+		userPrompt: string;
+	},
+): Promise<unknown> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort("timeout"), runtime.timeoutMs);
+	let content = "";
+	try {
+		const response = await fetch(`${runtime.baseUrl.replace(/\/+$/u, "")}/chat/completions`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"Authorization": `Bearer ${runtime.apiKey}`,
+			},
+			body: JSON.stringify({
+				model: runtime.model,
+				temperature: 0.2,
+				response_format: { type: "json_object" },
+				messages: [
+					{
+						role: "system",
+						content: input.systemPrompt,
+					},
+					{
+						role: "user",
+						content: input.userPrompt,
+					},
+				],
+			}),
+			signal: controller.signal,
+		});
+		if (!response.ok) {
+			const errorText = (await response.text()).slice(0, 500);
+			throw new Error(`Siliconflow request failed: ${response.status} ${errorText}`);
+		}
+		const payload = await response.json<unknown>();
+		content = readChatCompletionText(payload);
+		if (!content) {
+			throw new Error("Siliconflow response missing choices[0].message.content");
+		}
+	} finally {
+		clearTimeout(timer);
+	}
+	return parseJsonFromModelContent(content);
+}
+
+function decideSummaryMode(bodyText: string): AiEnhanceSummaryMeta {
+	const normalized = bodyText.replace(/\s+/gu, " ").trim();
+	const charCount = normalized.length;
+	const wordCount = countWords(normalized);
+	if (charCount < DEFAULT_AI_SUMMARY_SKIP_CHAR_THRESHOLD && wordCount < DEFAULT_AI_SUMMARY_SKIP_WORD_THRESHOLD) {
+		return {
+			mode: "skip",
+			skipped: true,
+			reason: "too_short",
+		};
+	}
+	if (charCount < DEFAULT_AI_SUMMARY_MINI_CHAR_THRESHOLD && wordCount < DEFAULT_AI_SUMMARY_MINI_WORD_THRESHOLD) {
+		return {
+			mode: "mini",
+			skipped: false,
+			reason: null,
+		};
+	}
+	return {
+		mode: "full",
+		skipped: false,
+		reason: null,
+	};
+}
+
+function normalizeSummaryTaskResult(
+	payload: unknown,
+	bodyText: string,
+	mode: AiEnhanceSummaryMode,
+): { summary: string; outline: string[] } {
+	const source = isRecord(payload) ? payload : {};
+	const summary = typeof source.summary === "string" && source.summary.trim()
+		? source.summary.trim()
+		: buildExcerpt(bodyText);
+	const outline = parseOutlineItems(
+		source.outline ?? source.key_points ?? source.keyPoints,
+		bodyText,
+	);
+	if (outline.length > 0) {
+		return { summary, outline };
+	}
+	return {
+		summary,
+		outline: mode === "mini"
+			? ["核心结论", "后续动作"]
+			: buildOutlineFallback(bodyText),
+	};
+}
+
+function buildFallbackTitleCandidates(note: NoteRow, topK: number): AiEnhanceTitleCandidate[] {
+	const output: AiEnhanceTitleCandidate[] = [
+		{
+			title: note.title,
+			confidence: 0.5,
+			reason: "保留原标题",
+		},
+	];
+	const fallbackTitle = buildTitle(note.bodyText ?? "");
+	if (fallbackTitle && fallbackTitle !== note.title) {
+		output.push({
+			title: fallbackTitle,
+			confidence: 0.45,
+			reason: "基于正文首行生成",
+		});
+	}
+	return output.slice(0, topK);
+}
+
+function buildFallbackTagSuggestions(bodyText: string, topK: number): AiEnhanceTagSuggestion[] {
+	return extractHashTags(bodyText)
+		.slice(0, topK)
+		.map((item) => ({
+			name: normalizeTagName(item, DEFAULT_TAG_NAME_MAX_LENGTH) || item,
+			confidence: 0.45,
+			reason: "来自正文 hashtag",
+		}));
+}
+
+function buildFallbackSemanticSearch(candidates: AiContextNoteItem[], topK: number): AiEnhanceRelatedNoteItem[] {
+	return candidates.slice(0, topK).map((item, index) => ({
+		noteId: item.noteId,
+		slug: item.slug,
+		title: item.title,
+		snippet: item.snippet,
+		score: clampFraction(0.6 - index * 0.05),
+		reason: "关键词召回",
+	}));
+}
+
+function buildFallbackLinkSuggestions(
+	semanticSearch: AiEnhanceRelatedNoteItem[],
+	linkedSlugs: Set<string>,
+	topK: number,
+): AiEnhanceLinkSuggestion[] {
+	return semanticSearch
+		.filter((item) => !linkedSlugs.has(item.slug))
+		.slice(0, topK)
+		.map((item) => ({
+			targetNoteId: item.noteId,
+			slug: item.slug,
+			title: item.title,
+			anchorText: item.slug,
+			score: item.score,
+			reason: "基于关键词建议双链",
+		}));
+}
+
+function parseTitleCandidates(value: unknown, limit: number): AiEnhanceTitleCandidate[] {
+	if (!Array.isArray(value)) {
+		return [];
+	}
+	const output: AiEnhanceTitleCandidate[] = [];
+	const seen = new Set<string>();
+	for (const item of value) {
+		if (output.length >= limit) {
+			break;
+		}
+		if (typeof item === "string") {
+			const title = item.trim();
+			if (!title || seen.has(title)) {
+				continue;
+			}
+			seen.add(title);
+			output.push({
+				title,
+				confidence: 0.6,
+				reason: "模型建议",
+			});
+			continue;
+		}
+		if (!isRecord(item)) {
+			continue;
+		}
+		const title = typeof item.title === "string" ? item.title.trim() : "";
+		if (!title || seen.has(title)) {
+			continue;
+		}
+		seen.add(title);
+		output.push({
+			title,
+			confidence: clampFraction(readFloatValue(item, "confidence") ?? 0.6),
+			reason: typeof item.reason === "string" && item.reason.trim() ? item.reason.trim() : "模型建议",
+		});
+	}
+	return output;
+}
+
+function parseTagSuggestions(value: unknown, limit: number, maxTagLength: number): AiEnhanceTagSuggestion[] {
+	if (!Array.isArray(value)) {
+		return [];
+	}
+	const output: AiEnhanceTagSuggestion[] = [];
+	const seen = new Set<string>();
+	for (const item of value) {
+		if (output.length >= limit) {
+			break;
+		}
+		const rawName = typeof item === "string"
+			? item
+			: (isRecord(item) && typeof item.name === "string" ? item.name : "");
+		const normalizedName = normalizeTagName(rawName, maxTagLength);
+		if (!normalizedName || seen.has(normalizedName.toLowerCase())) {
+			continue;
+		}
+		seen.add(normalizedName.toLowerCase());
+		output.push({
+			name: normalizedName,
+			confidence: clampFraction(isRecord(item) ? (readFloatValue(item, "confidence") ?? 0.6) : 0.6),
+			reason: isRecord(item) && typeof item.reason === "string" && item.reason.trim()
+				? item.reason.trim()
+				: "语义相关",
+		});
+	}
+	return output;
+}
+
+function parseRelatedNoteItems(
+	value: unknown,
+	limit: number,
+	candidatesById: Map<string, AiContextNoteItem>,
+): AiEnhanceRelatedNoteItem[] {
+	if (!Array.isArray(value)) {
+		return [];
+	}
+	const output: AiEnhanceRelatedNoteItem[] = [];
+	const seen = new Set<string>();
+	for (const item of value) {
+		if (output.length >= limit || !isRecord(item)) {
+			continue;
+		}
+		const noteId = typeof item.noteId === "string" ? item.noteId.trim() : "";
+		const candidate = noteId ? candidatesById.get(noteId) : null;
+		if (!candidate || seen.has(candidate.noteId)) {
+			continue;
+		}
+		seen.add(candidate.noteId);
+		output.push({
+			noteId: candidate.noteId,
+			slug: candidate.slug,
+			title: candidate.title,
+			snippet: candidate.snippet,
+			score: clampFraction(readFloatValue(item, "score") ?? readFloatValue(item, "confidence") ?? 0.6),
+			reason: typeof item.reason === "string" && item.reason.trim() ? item.reason.trim() : "语义相关",
+		});
+	}
+	return output;
+}
+
+function parseLinkSuggestions(
+	value: unknown,
+	limit: number,
+	candidatesById: Map<string, AiContextNoteItem>,
+	linkedSlugs: Set<string>,
+): AiEnhanceLinkSuggestion[] {
+	if (!Array.isArray(value)) {
+		return [];
+	}
+	const output: AiEnhanceLinkSuggestion[] = [];
+	const seen = new Set<string>();
+	for (const item of value) {
+		if (output.length >= limit || !isRecord(item)) {
+			continue;
+		}
+		const noteId = typeof item.noteId === "string" ? item.noteId.trim() : "";
+		const candidate = noteId ? candidatesById.get(noteId) : null;
+		if (!candidate || linkedSlugs.has(candidate.slug) || seen.has(candidate.noteId)) {
+			continue;
+		}
+		seen.add(candidate.noteId);
+		const anchorText = typeof item.anchorText === "string" && item.anchorText.trim()
+			? item.anchorText.trim()
+			: candidate.slug;
+		output.push({
+			targetNoteId: candidate.noteId,
+			slug: candidate.slug,
+			title: candidate.title,
+			anchorText,
+			score: clampFraction(readFloatValue(item, "score") ?? readFloatValue(item, "confidence") ?? 0.6),
+			reason: typeof item.reason === "string" && item.reason.trim() ? item.reason.trim() : "建议建立双链",
+		});
+	}
+	return output;
+}
+
+function parseOutlineItems(value: unknown, bodyText: string): string[] {
+	if (Array.isArray(value)) {
+		const lines = value.flatMap((item) => {
+			if (typeof item === "string") {
+				return [item.trim()];
+			}
+			if (isRecord(item) && typeof item.heading === "string") {
+				const output = [item.heading.trim()];
+				if (Array.isArray(item.children)) {
+					for (const child of item.children) {
+						if (typeof child === "string" && child.trim()) {
+							output.push(child.trim());
+						}
+					}
+				}
+				return output;
+			}
+			return [];
+		})
+			.filter((item) => item.length > 0)
+			.slice(0, 8);
+		if (lines.length > 0) {
+			return lines;
+		}
+	}
+	return buildOutlineFallback(bodyText);
+}
+
+function buildOutlineFallback(bodyText: string): string[] {
+	const headings = bodyText
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((line) => /^#{1,6}\s+/u.test(line))
+		.map((line) => line.replace(/^#{1,6}\s+/u, ""))
+		.slice(0, 8);
+	if (headings.length > 0) {
+		return headings;
+	}
+	const sentences = bodyText
+		.replace(/\s+/gu, " ")
+		.split(/[。！？.!?]/u)
+		.map((item) => item.trim())
+		.filter((item) => item.length > 0)
+		.slice(0, 6);
+	if (sentences.length > 0) {
+		return sentences;
+	}
+	return ["核心观点", "关键细节", "下一步"];
+}
+
+function buildAiEnhanceFallback(
+	input: AiEnhancePreparedInput,
+	tasks: AiEnhanceTaskKey[],
+	warning: string,
+): AiEnhanceResult {
+	const result = createEmptyAiEnhanceResult(input, {
+		provider: "local-fallback",
+		model: null,
+		warnings: [warning],
+	});
+	const taskSet = new Set(tasks);
+	if (taskSet.has("title")) {
+		result.titleCandidates = buildFallbackTitleCandidates(input.note, input.topK);
+	}
+	if (taskSet.has("tags")) {
+		result.tagSuggestions = buildFallbackTagSuggestions(input.note.bodyText ?? "", input.topK);
+	}
+	if (taskSet.has("semantic")) {
+		result.semanticSearch = buildFallbackSemanticSearch(input.candidates, input.topK);
+	}
+	if (taskSet.has("links")) {
+		const base = result.semanticSearch.length > 0
+			? result.semanticSearch
+			: buildFallbackSemanticSearch(input.candidates, input.topK);
+		result.linkSuggestions = buildFallbackLinkSuggestions(base, input.linkedSlugs, input.topK);
+	}
+	if (taskSet.has("summary")) {
+		const summaryMeta = decideSummaryMode(input.note.bodyText ?? "");
+		result.summaryMeta = summaryMeta;
+		if (summaryMeta.mode === "skip") {
+			result.summary = "";
+			result.outline = [];
+		} else {
+			result.summary = buildExcerpt(input.note.bodyText ?? "");
+			result.outline = buildOutlineFallback(input.note.bodyText ?? "");
+		}
+	}
+	if (taskSet.has("similar")) {
+		result.similarNotes = result.semanticSearch.length > 0
+			? result.semanticSearch
+			: buildFallbackSemanticSearch(input.candidates, input.topK);
+	}
+	return result;
+}
+
+function readChatCompletionText(payload: unknown): string {
+	if (!isRecord(payload) || !Array.isArray(payload.choices)) {
+		return "";
+	}
+	const first = payload.choices[0];
+	if (!isRecord(first) || !isRecord(first.message) || typeof first.message.content !== "string") {
+		return "";
+	}
+	return first.message.content.trim();
+}
+
+function parseJsonFromModelContent(content: string): unknown {
+	const trimmed = content.trim();
+	if (!trimmed) {
+		throw new Error("Model response is empty");
+	}
+	const withoutFence = trimmed
+		.replace(/^```json\s*/iu, "")
+		.replace(/^```\s*/u, "")
+		.replace(/\s*```$/u, "")
+		.trim();
+	try {
+		return JSON.parse(withoutFence);
+	} catch {
+		const first = withoutFence.indexOf("{");
+		const last = withoutFence.lastIndexOf("}");
+		if (first < 0 || last <= first) {
+			throw new Error("Model response is not valid JSON");
+		}
+		return JSON.parse(withoutFence.slice(first, last + 1));
+	}
+}
+
+function readFloatValue(obj: Record<string, unknown>, key: string): number | null {
+	const value = obj[key];
+	if (typeof value === "number" && Number.isFinite(value)) {
+		return value;
+	}
+	if (typeof value === "string" && value.trim()) {
+		const parsed = Number(value);
+		if (Number.isFinite(parsed)) {
+			return parsed;
+		}
+	}
+	return null;
+}
+
+function clampFraction(value: number): number {
+	if (!Number.isFinite(value)) {
+		return 0;
+	}
+	return Math.max(0, Math.min(1, value));
+}
+
+function clipTextForAi(text: string, maxChars: number): string {
+	const normalized = text.replace(/\s+/gu, " ").trim();
+	if (normalized.length <= maxChars) {
+		return normalized;
+	}
+	return `${normalized.slice(0, maxChars)}...`;
+}
+
 async function buildAiContext(
 	db: D1Database,
 	input: AiContextRequestInput,
@@ -1947,11 +2958,12 @@ async function buildAiContext(
 	notes: AiContextNoteItem[];
 	chunks: AiContextChunkItem[];
 }> {
+	const retrievalQuery = normalizeKeywordForLike(input.query);
 	const { notes, mode } = await listNotesWithSearchMode(db, {
 		folderId: null,
 		tagIds: [],
 		tagMode: "any",
-		keyword: input.query,
+		keyword: retrievalQuery,
 		status: input.status,
 		limit: input.limit * 2,
 		offset: 0,
@@ -1967,7 +2979,15 @@ async function buildAiContext(
 		updatedAt: item.updatedAt,
 		searchScore: item.searchScore,
 	}));
-	const chunkItems = await listAiContextChunks(db, input);
+	let chunkItems: AiContextChunkItem[] = [];
+	try {
+		chunkItems = await listAiContextChunks(db, {
+			...input,
+			query: retrievalQuery,
+		});
+	} catch (error) {
+		console.error("AI context chunk lookup failed, skip chunks", error);
+	}
 	return {
 		query: input.query,
 		status: input.status,
@@ -2004,9 +3024,19 @@ async function listAiContextChunks(db: D1Database, input: AiContextRequestInput)
 		ORDER BY n.updated_at DESC, nc.chunk_index ASC
 		LIMIT ?
 	`;
-	const { results } = await db.prepare(sql)
-		.bind(...params, input.limit)
-		.all<{ noteId: string; slug: string; title: string; updatedAt: string; chunkIndex: number; chunkText: string }>();
+	let results: Array<{ noteId: string; slug: string; title: string; updatedAt: string; chunkIndex: number; chunkText: string }> = [];
+	try {
+		const queryResult = await db.prepare(sql)
+			.bind(...params, input.limit)
+			.all<{ noteId: string; slug: string; title: string; updatedAt: string; chunkIndex: number; chunkText: string }>();
+		results = queryResult.results;
+	} catch (error) {
+		if (isLikePatternTooComplexError(error)) {
+			console.error("AI context chunk LIKE pattern too complex, returning empty chunks", error);
+			return [];
+		}
+		throw error;
+	}
 	return results.map((item) => ({
 		noteId: item.noteId,
 		slug: item.slug,
@@ -2019,6 +3049,42 @@ async function listAiContextChunks(db: D1Database, input: AiContextRequestInput)
 
 function getNotesBucket(env: Env): R2Bucket | null {
 	return "NOTES_BUCKET" in env && env.NOTES_BUCKET ? env.NOTES_BUCKET : null;
+}
+
+function getAiBaseUrl(env: Env): string | null {
+	const ext = env as Env & { AI_BASE_URL?: string };
+	const value = typeof ext.AI_BASE_URL === "string" ? ext.AI_BASE_URL.trim() : "";
+	return value || null;
+}
+
+function getAiChatModel(env: Env): string | null {
+	const ext = env as Env & { AI_CHAT_MODEL?: string };
+	const value = typeof ext.AI_CHAT_MODEL === "string" ? ext.AI_CHAT_MODEL.trim() : "";
+	return value || null;
+}
+
+function getSiliconflowApiKey(env: Env): string | null {
+	const ext = env as Env & { SILICONFLOW_API_KEY?: string };
+	const value = typeof ext.SILICONFLOW_API_KEY === "string" ? ext.SILICONFLOW_API_KEY.trim() : "";
+	return value || null;
+}
+
+function getAiTimeoutMs(env: Env): number {
+	const ext = env as Env & { AI_TIMEOUT_MS?: string };
+	const parsed = Number(ext.AI_TIMEOUT_MS);
+	if (Number.isFinite(parsed) && parsed >= 1000 && parsed <= 120_000) {
+		return Math.trunc(parsed);
+	}
+	return DEFAULT_AI_TIMEOUT_MS;
+}
+
+function getAiMaxInputChars(env: Env): number {
+	const ext = env as Env & { AI_MAX_INPUT_CHARS?: string };
+	const parsed = Number(ext.AI_MAX_INPUT_CHARS);
+	if (Number.isFinite(parsed) && parsed >= 500 && parsed <= 80_000) {
+		return Math.trunc(parsed);
+	}
+	return DEFAULT_AI_MAX_INPUT_CHARS;
 }
 
 function getBodyR2ThresholdBytes(env: Env): number {
@@ -2319,7 +3385,7 @@ async function listNotesWithSearchMode(
 
 	const ftsMatchQuery = buildFtsMatchQuery(input.keyword);
 	if (!ftsMatchQuery) {
-		const notes = await queryNotesWithLike(db, input, true);
+		const notes = await queryNotesWithLikeResilient(db, input, true);
 		return { notes, mode: "like-fallback" };
 	}
 
@@ -2328,8 +3394,35 @@ async function listNotesWithSearchMode(
 		return { notes, mode: "fts" };
 	} catch (error) {
 		console.error("FTS query failed, falling back to LIKE", error);
-		const notes = await queryNotesWithLike(db, input, true);
+		const notes = await queryNotesWithLikeResilient(db, input, true);
 		return { notes, mode: "like-fallback" };
+	}
+}
+
+async function queryNotesWithLikeResilient(
+	db: D1Database,
+	input: ListNotesQueryInput,
+	includeKeyword: boolean,
+): Promise<NoteRow[]> {
+	try {
+		return await queryNotesWithLike(db, input, includeKeyword);
+	} catch (error) {
+		if (!includeKeyword || !isLikePatternTooComplexError(error) || !input.keyword) {
+			throw error;
+		}
+		const reducedKeyword = normalizeKeywordForLike(input.keyword);
+		if (!reducedKeyword || reducedKeyword === input.keyword) {
+			console.error("LIKE pattern too complex and cannot reduce keyword", error);
+			return [];
+		}
+		console.error("LIKE pattern too complex, retry with reduced keyword", {
+			originalLength: input.keyword.length,
+			reducedLength: reducedKeyword.length,
+		});
+		return queryNotesWithLike(db, {
+			...input,
+			keyword: reducedKeyword,
+		}, includeKeyword);
 	}
 }
 
@@ -2498,6 +3591,24 @@ function escapeLikePattern(value: string): string {
 	return value.replace(/[\\%_]/g, "\\$&");
 }
 
+function normalizeKeywordForLike(value: string): string {
+	const trimmed = value.replace(/\s+/gu, " ").trim();
+	if (!trimmed) {
+		return "";
+	}
+	const tokens = trimmed.match(/[\p{L}\p{N}]{1,24}/gu) ?? [];
+	const candidate = tokens.length > 0 ? tokens.slice(0, 10).join(" ") : trimmed;
+	return candidate.slice(0, DEFAULT_AI_RETRIEVAL_KEYWORD_MAX_CHARS);
+}
+
+function isLikePatternTooComplexError(error: unknown): boolean {
+	if (!error) {
+		return false;
+	}
+	const message = String(error);
+	return message.includes("LIKE or GLOB pattern too complex");
+}
+
 function normalizeTagMode(value: string | undefined): TagMode {
 	return value === "all" ? "all" : "any";
 }
@@ -2574,6 +3685,28 @@ function buildExcerpt(text: string, max = 180): string {
 		return normalized;
 	}
 	return `${normalized.slice(0, max)}...`;
+}
+
+function buildTitle(content: string): string {
+	const firstLine = content
+		.split("\n")
+		.map((line) => line.replace(/^#+\s*/, "").trim())
+		.find((line) => line.length > 0);
+	if (!firstLine) {
+		return "快速记录";
+	}
+	return firstLine.length > 32 ? `${firstLine.slice(0, 32)}...` : firstLine;
+}
+
+function extractHashTags(content: string): string[] {
+	const tags = new Set<string>();
+	for (const match of content.matchAll(/#([^\s#]+)/g)) {
+		const value = match[1]?.trim();
+		if (value) {
+			tags.add(value);
+		}
+	}
+	return [...tags].slice(0, 8);
 }
 
 function byteLength(value: string): number {
