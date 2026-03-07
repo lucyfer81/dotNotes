@@ -1546,6 +1546,103 @@ app.get("/api/ops/alerts", async (c) => {
 	});
 });
 
+app.post("/api/ops/ai/probe", async (c) => {
+	const payload = (await parseObjectBody(c)) ?? {};
+	const count = clampInt(
+		typeof payload.count === "string" ? payload.count : String(readOptionalNumber(payload, "count") ?? "5"),
+		5,
+		1,
+		20,
+	);
+	const timeoutMs = clampInt(
+		typeof payload.timeoutMs === "string" ? payload.timeoutMs : String(readOptionalNumber(payload, "timeoutMs") ?? "15000"),
+		15_000,
+		1000,
+		120_000,
+	);
+	const includeModels = hasOwn(payload, "includeModels") ? parseBooleanLike(payload.includeModels) : true;
+	const includeEmbedding = hasOwn(payload, "includeEmbedding") ? parseBooleanLike(payload.includeEmbedding) : true;
+	const includeChat = hasOwn(payload, "includeChat") ? parseBooleanLike(payload.includeChat) : true;
+	const baseUrl = getAiBaseUrl(c.env);
+	const apiKey = getSiliconflowApiKey(c.env);
+	const chatModel = getAiChatModel(c.env);
+	const embeddingModel = getAiEmbeddingModel(c.env);
+	if (!baseUrl || !apiKey || !chatModel) {
+		return jsonError(c, 500, "AI probe configuration missing");
+	}
+	const colo = readRequestColo(c.req.raw);
+	const sampledAt = new Date().toISOString();
+	const probes: Record<string, unknown> = {};
+	if (includeModels) {
+		const samples = await sampleHttpProbe(count, () =>
+			runHttpTimingProbe({
+				url: `${baseUrl.replace(/\/+$/u, "")}/models`,
+				method: "GET",
+				headers: {
+					"Authorization": `Bearer ${apiKey}`,
+				},
+				timeoutMs,
+			}),
+		);
+		probes.models = summarizeProbeSamples(samples);
+	}
+	if (includeEmbedding) {
+		const samples = await sampleHttpProbe(count, () =>
+			runHttpTimingProbe({
+				url: `${baseUrl.replace(/\/+$/u, "")}/embeddings`,
+				method: "POST",
+				headers: {
+					"Authorization": `Bearer ${apiKey}`,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({
+					model: embeddingModel,
+					input: ["latency probe"],
+				}),
+				timeoutMs,
+			}),
+		);
+		probes.embedding = {
+			model: embeddingModel,
+			...summarizeProbeSamples(samples),
+		};
+	}
+	if (includeChat) {
+		const samples = await sampleHttpProbe(count, () =>
+			runHttpTimingProbe({
+				url: `${baseUrl.replace(/\/+$/u, "")}/chat/completions`,
+				method: "POST",
+				headers: {
+					"Authorization": `Bearer ${apiKey}`,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({
+					model: chatModel,
+					temperature: 0,
+					max_tokens: 16,
+					messages: [
+						{ role: "system", content: "Return short answer." },
+						{ role: "user", content: "ping" },
+					],
+				}),
+				timeoutMs,
+			}),
+		);
+		probes.chat = {
+			model: chatModel,
+			...summarizeProbeSamples(samples),
+		};
+	}
+	return jsonOk(c, {
+		sampledAt,
+		colo,
+		baseUrl,
+		count,
+		timeoutMs,
+		probes,
+	});
+});
+
 app.post("/api/ai/notes/:id/enhance", async (c) => handleAiEnhanceRequest(c, AI_ENHANCE_TASK_KEYS));
 
 app.post("/api/ai/notes/:id/enhance/:task", async (c) => {
@@ -2020,6 +2117,122 @@ function buildMetricsAlert(
 	};
 }
 
+type HttpTimingProbeSample = {
+	ok: boolean;
+	status: number | null;
+	ttfbMs: number | null;
+	totalMs: number;
+	error: string | null;
+};
+
+type HttpTimingProbeInput = {
+	url: string;
+	method: "GET" | "POST";
+	headers?: Record<string, string>;
+	body?: string;
+	timeoutMs: number;
+};
+
+function readRequestColo(request: Request): string | null {
+	const withCf = request as Request & { cf?: { colo?: string } };
+	const value = withCf.cf?.colo;
+	return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+async function sampleHttpProbe(
+	count: number,
+	run: () => Promise<HttpTimingProbeSample>,
+): Promise<HttpTimingProbeSample[]> {
+	const output: HttpTimingProbeSample[] = [];
+	for (let index = 0; index < count; index += 1) {
+		output.push(await run());
+	}
+	return output;
+}
+
+async function runHttpTimingProbe(input: HttpTimingProbeInput): Promise<HttpTimingProbeSample> {
+	const startedAt = Date.now();
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort("timeout"), input.timeoutMs);
+	try {
+		const response = await fetch(input.url, {
+			method: input.method,
+			headers: input.headers,
+			body: input.body,
+			signal: controller.signal,
+		});
+		const ttfbMs = Date.now() - startedAt;
+		await response.text().catch(() => "");
+		const totalMs = Date.now() - startedAt;
+		return {
+			ok: response.ok,
+			status: response.status,
+			ttfbMs,
+			totalMs,
+			error: response.ok ? null : `status_${response.status}`,
+		};
+	} catch (error) {
+		const totalMs = Date.now() - startedAt;
+		return {
+			ok: false,
+			status: null,
+			ttfbMs: null,
+			totalMs,
+			error: String(error),
+		};
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+function summarizeProbeSamples(samples: HttpTimingProbeSample[]): {
+	sampleCount: number;
+	successCount: number;
+	failureCount: number;
+	ttfbMs: { p50: number | null; p95: number | null; avg: number | null; min: number | null; max: number | null };
+	totalMs: { p50: number | null; p95: number | null; avg: number | null; min: number | null; max: number | null };
+	recentErrors: string[];
+} {
+	const success = samples.filter((item) => item.ok);
+	const failure = samples.filter((item) => !item.ok);
+	const ttfbValues = success
+		.map((item) => item.ttfbMs)
+		.filter((item): item is number => typeof item === "number" && Number.isFinite(item))
+		.sort((a, b) => a - b);
+	const totalValues = success
+		.map((item) => item.totalMs)
+		.filter((item) => Number.isFinite(item))
+		.sort((a, b) => a - b);
+	const average = (values: number[]): number | null =>
+		values.length > 0
+			? Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(1))
+			: null;
+
+	return {
+		sampleCount: samples.length,
+		successCount: success.length,
+		failureCount: failure.length,
+		ttfbMs: {
+			p50: percentileFromSorted(ttfbValues, 0.5),
+			p95: percentileFromSorted(ttfbValues, 0.95),
+			avg: average(ttfbValues),
+			min: ttfbValues[0] ?? null,
+			max: ttfbValues.at(-1) ?? null,
+		},
+		totalMs: {
+			p50: percentileFromSorted(totalValues, 0.5),
+			p95: percentileFromSorted(totalValues, 0.95),
+			avg: average(totalValues),
+			min: totalValues[0] ?? null,
+			max: totalValues.at(-1) ?? null,
+		},
+		recentErrors: failure
+			.map((item) => item.error ?? "unknown_error")
+			.filter((item) => item.length > 0)
+			.slice(0, 5),
+	};
+}
+
 function parseAiContextInput(payload: Record<string, unknown>): AiContextRequestInput | null {
 	const query = readRequiredString(payload, "query");
 	if (!query) {
@@ -2368,6 +2581,7 @@ async function generateAiEnhanceWithSiliconflow(
 					].join("\n"),
 					}, {
 						timeoutMs: getAiTaskTimeoutMs(env, "title"),
+						label: "task:title",
 					});
 				const source = isRecord(payload) ? payload : {};
 				const candidates = parseTitleCandidates(source.titleCandidates ?? source.candidates, input.topK);
@@ -2404,6 +2618,7 @@ async function generateAiEnhanceWithSiliconflow(
 					].join("\n"),
 					}, {
 						timeoutMs: getAiTaskTimeoutMs(env, "tags"),
+						label: "task:tags",
 					});
 				const source = isRecord(payload) ? payload : {};
 				result.tagSuggestions = parseTagSuggestions(
@@ -2438,6 +2653,7 @@ async function generateAiEnhanceWithSiliconflow(
 					].join("\n"),
 					}, {
 						timeoutMs: getAiTaskTimeoutMs(env, "semantic"),
+						label: "task:semantic",
 					});
 				const source = isRecord(payload) ? payload : {};
 				result.semanticSearch = parseRelatedNoteItems(
@@ -2475,6 +2691,7 @@ async function generateAiEnhanceWithSiliconflow(
 					].join("\n"),
 					}, {
 						timeoutMs: getAiTaskTimeoutMs(env, "links"),
+						label: "task:links",
 					});
 				const source = isRecord(payload) ? payload : {};
 				result.linkSuggestions = parseLinkSuggestions(
@@ -2530,6 +2747,7 @@ async function generateAiEnhanceWithSiliconflow(
 					].join("\n"),
 					}, {
 						timeoutMs: getAiTaskTimeoutMs(env, "summary"),
+						label: "task:summary",
 					});
 				const normalized = normalizeSummaryTaskResult(payload, input.note.bodyText ?? "", summaryMode.mode);
 				result.summary = normalized.summary;
@@ -2566,6 +2784,7 @@ async function generateAiEnhanceWithSiliconflow(
 					].join("\n"),
 					}, {
 						timeoutMs: getAiTaskTimeoutMs(env, "similar"),
+						label: "task:similar",
 					});
 				const source = isRecord(payload) ? payload : {};
 				result.similarNotes = parseRelatedNoteItems(
@@ -2646,12 +2865,16 @@ async function callSiliconflowJson(
 	},
 	options?: {
 		timeoutMs?: number;
+		label?: string;
 	},
 ): Promise<unknown> {
 	const timeoutMs = options?.timeoutMs ?? runtime.timeoutMs;
+	const startedAt = Date.now();
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
 	let content = "";
+	let statusCode: number | null = null;
+	let ttfbMs: number | null = null;
 	try {
 		const response = await fetch(`${runtime.baseUrl.replace(/\/+$/u, "")}/chat/completions`, {
 			method: "POST",
@@ -2676,6 +2899,8 @@ async function callSiliconflowJson(
 			}),
 			signal: controller.signal,
 		});
+		statusCode = response.status;
+		ttfbMs = Date.now() - startedAt;
 		if (!response.ok) {
 			const errorText = (await response.text()).slice(0, 500);
 			throw new Error(`Siliconflow request failed: ${response.status} ${errorText}`);
@@ -2685,6 +2910,13 @@ async function callSiliconflowJson(
 		if (!content) {
 			throw new Error("Siliconflow response missing choices[0].message.content");
 		}
+		console.info("AI chat timing", {
+			label: options?.label ?? null,
+			model: runtime.model,
+			statusCode,
+			ttfbMs,
+			totalMs: Date.now() - startedAt,
+		});
 	} finally {
 		clearTimeout(timer);
 	}
@@ -4766,6 +4998,7 @@ async function fetchSiliconflowEmbeddings(
 	const output: number[][] = [];
 	for (let start = 0; start < input.texts.length; start += batchSize) {
 		const batch = input.texts.slice(start, start + batchSize);
+		const startedAt = Date.now();
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
 		const response = await fetch(`${input.baseUrl.replace(/\/+$/u, "")}/embeddings`, {
@@ -4782,6 +5015,7 @@ async function fetchSiliconflowEmbeddings(
 		}).finally(() => {
 			clearTimeout(timer);
 		});
+		const ttfbMs = Date.now() - startedAt;
 		if (!response.ok) {
 			const errorText = (await response.text()).slice(0, 300);
 			throw new Error(`Siliconflow embeddings failed: ${response.status} ${errorText}`);
@@ -4815,6 +5049,13 @@ async function fetchSiliconflowEmbeddings(
 			}
 			output.push(vector);
 		}
+		console.info("AI embedding timing", {
+			model: input.model,
+			batchSize: batch.length,
+			statusCode: response.status,
+			ttfbMs,
+			totalMs: Date.now() - startedAt,
+		});
 	}
 	return output;
 }

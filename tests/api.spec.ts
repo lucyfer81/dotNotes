@@ -358,6 +358,56 @@ describe("ops metrics api", () => {
 		expect(metrics.data.index.backlog).toBeGreaterThanOrEqual(0);
 		expect(metrics.data.alerts.some((item) => item.key === "api_error_rate")).toBe(true);
 	});
+
+	it("provides ai probe latency summaries", async () => {
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = vi.fn(async (input) => {
+			const url = typeof input === "string" ? input : input instanceof Request ? input.url : "";
+			if (url.includes("/models")) {
+				return new Response(JSON.stringify({ data: [{ id: "m1" }] }), { status: 200, headers: { "Content-Type": "application/json" } });
+			}
+			if (url.includes("/embeddings")) {
+				return new Response(
+					JSON.stringify({ data: [{ index: 0, embedding: [1, 0, 0, 0] }] }),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			if (url.includes("/chat/completions")) {
+				return new Response(
+					JSON.stringify({ choices: [{ message: { content: "{\"ok\":true}" } }] }),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			return new Response("not found", { status: 404 });
+		}) as typeof fetch;
+		try {
+			const probed = await readEnvelope<{
+				count: number;
+				probes: {
+					models?: { sampleCount: number; successCount: number };
+					embedding?: { sampleCount: number; successCount: number };
+					chat?: { sampleCount: number; successCount: number };
+				};
+			}>(await api("/api/ops/ai/probe", {
+				method: "POST",
+				body: JSON.stringify({ count: 3 }),
+			}, {
+				AI_BASE_URL: "https://api.siliconflow.cn/v1",
+				AI_CHAT_MODEL: "Qwen/Qwen2.5-7B-Instruct",
+				SILICONFLOW_API_KEY: "test-key",
+				AI_EMBEDDING_MODEL: "test-embedding-model",
+			}));
+			expect(probed.data.count).toBe(3);
+			expect(probed.data.probes.models?.sampleCount).toBe(3);
+			expect(probed.data.probes.models?.successCount).toBe(3);
+			expect(probed.data.probes.embedding?.sampleCount).toBe(3);
+			expect(probed.data.probes.embedding?.successCount).toBe(3);
+			expect(probed.data.probes.chat?.sampleCount).toBe(3);
+			expect(probed.data.probes.chat?.successCount).toBe(3);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
 });
 
 describe("ai pre-integration api", () => {
