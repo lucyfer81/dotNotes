@@ -105,6 +105,52 @@ export type AiEnhanceTaskStreamProgress = {
 	task: AiEnhanceTaskApiKey;
 	stage: AiEnhanceTaskStreamStage;
 };
+export type RssItemStatus = "new" | "saved" | "ignored";
+export type RssFeedApiItem = {
+	id: string;
+	url: string;
+	title: string | null;
+	enabled: boolean;
+	lastFetchedAt: string | null;
+	lastError: string | null;
+	createdAt: string;
+	updatedAt: string;
+};
+export type RssItemApiItem = {
+	id: string;
+	feedId: string;
+	feedTitle: string | null;
+	sourceId: string | null;
+	dedupeKey: string;
+	link: string | null;
+	title: string | null;
+	author: string | null;
+	publishedAt: string | null;
+	summaryRaw: string;
+	summaryZh: string | null;
+	status: RssItemStatus;
+	noteId: string | null;
+	fetchedAt: string;
+	createdAt: string;
+	updatedAt: string;
+};
+export type RssSyncResultApiItem = {
+	processedFeeds: number;
+	totalFetchedItems: number;
+	totalCreated: number;
+	totalUpdated: number;
+	totalSkipped: number;
+	results: Array<{
+		feedId: string;
+		url: string;
+		feedTitle: string | null;
+		fetched: number;
+		created: number;
+		updated: number;
+		skipped: number;
+		errors: string[];
+	}>;
+};
 
 type ListNotesOptions = {
 	limit?: number;
@@ -159,6 +205,12 @@ type UpdateFolderInput = {
 type AiEnhanceInput = {
 	query?: string;
 	topK?: number;
+};
+type ListRssItemsOptions = {
+	feedId?: string | null;
+	statuses?: RssItemStatus[];
+	limit?: number;
+	offset?: number;
 };
 
 export async function listFolders(): Promise<FolderApiItem[]> {
@@ -566,6 +618,115 @@ export async function deleteNoteAsset(assetId: string): Promise<void> {
 	});
 }
 
+export async function listRssFeeds(): Promise<RssFeedApiItem[]> {
+	const data = await requestApiData<unknown>("/api/rss/feeds");
+	if (!Array.isArray(data)) {
+		throw new Error("Invalid rss feeds response");
+	}
+	return data
+		.map((item) => toRssFeedApiItem(item))
+		.filter((item): item is RssFeedApiItem => item !== null);
+}
+
+export async function createRssFeed(input: {
+	url: string;
+	title?: string;
+	enabled?: boolean;
+}): Promise<RssFeedApiItem> {
+	const data = await requestApiData<unknown>("/api/rss/feeds", {
+		method: "POST",
+		body: JSON.stringify({
+			url: input.url,
+			title: input.title,
+			enabled: input.enabled,
+		}),
+	});
+	const parsed = toRssFeedApiItem(data);
+	if (!parsed) {
+		throw new Error("Invalid create rss feed response");
+	}
+	return parsed;
+}
+
+export async function updateRssFeed(feedId: string, input: {
+	url?: string;
+	title?: string | null;
+	enabled?: boolean;
+}): Promise<RssFeedApiItem> {
+	const data = await requestApiData<unknown>(`/api/rss/feeds/${encodeURIComponent(feedId)}`, {
+		method: "PATCH",
+		body: JSON.stringify(input),
+	});
+	const parsed = toRssFeedApiItem(data);
+	if (!parsed) {
+		throw new Error("Invalid update rss feed response");
+	}
+	return parsed;
+}
+
+export async function deleteRssFeed(feedId: string): Promise<void> {
+	await requestApiData<unknown>(`/api/rss/feeds/${encodeURIComponent(feedId)}`, {
+		method: "DELETE",
+	});
+}
+
+export async function listRssItems(options: ListRssItemsOptions = {}): Promise<RssItemApiItem[]> {
+	const query = new URLSearchParams();
+	if (options.feedId) {
+		query.set("feedId", options.feedId);
+	}
+	if (options.statuses && options.statuses.length > 0) {
+		query.set("status", options.statuses.join(","));
+	}
+	query.set("limit", String(options.limit ?? 50));
+	query.set("offset", String(options.offset ?? 0));
+	const data = await requestApiData<unknown>(`/api/rss/items?${query.toString()}`);
+	if (!isRecord(data) || !Array.isArray(data.items)) {
+		throw new Error("Invalid rss items response");
+	}
+	return data.items
+		.map((item) => toRssItemApiItem(item))
+		.filter((item): item is RssItemApiItem => item !== null);
+}
+
+export async function updateRssItemStatus(itemId: string, status: RssItemStatus): Promise<void> {
+	await requestApiData<unknown>(`/api/rss/items/${encodeURIComponent(itemId)}`, {
+		method: "PATCH",
+		body: JSON.stringify({ status }),
+	});
+}
+
+export async function syncRssFeeds(input: {
+	feedId?: string;
+	feedLimit?: number;
+	itemLimit?: number;
+	translate?: boolean;
+} = {}): Promise<RssSyncResultApiItem> {
+	const data = await requestApiData<unknown>("/api/rss/sync", {
+		method: "POST",
+		body: JSON.stringify(input),
+	});
+	const parsed = toRssSyncResultApiItem(data);
+	if (!parsed) {
+		throw new Error("Invalid rss sync response");
+	}
+	return parsed;
+}
+
+export async function saveRssItemToReading(itemId: string): Promise<{ noteId: string; created: boolean; item: RssItemApiItem | null }> {
+	const data = await requestApiData<unknown>(`/api/rss/items/${encodeURIComponent(itemId)}/save`, {
+		method: "POST",
+	});
+	if (!isRecord(data) || typeof data.noteId !== "string" || typeof data.created !== "boolean") {
+		throw new Error("Invalid rss save response");
+	}
+	return {
+		noteId: data.noteId,
+		created: data.created,
+		item: toRssItemApiItem(data.item ?? null),
+	};
+}
+
 async function requestApiData<T>(url: string, init?: RequestInit): Promise<T> {
 	const headers = new Headers(init?.headers);
 	headers.set("Accept", "application/json");
@@ -922,6 +1083,136 @@ function toNoteAssetApiItem(value: unknown): NoteAssetApiItem | null {
 		sha256: value.sha256,
 		createdAt: value.createdAt,
 		downloadUrl: value.downloadUrl,
+	};
+}
+
+function toRssFeedApiItem(value: unknown): RssFeedApiItem | null {
+	if (!isRecord(value)) {
+		return null;
+	}
+	if (
+		typeof value.id !== "string" ||
+		typeof value.url !== "string" ||
+		(typeof value.title !== "string" && value.title !== null) ||
+		typeof value.createdAt !== "string" ||
+		typeof value.updatedAt !== "string"
+	) {
+		return null;
+	}
+	const enabled = toBooleanLike(value.enabled);
+	if (enabled === null) {
+		return null;
+	}
+	if ((typeof value.lastFetchedAt !== "string" && value.lastFetchedAt !== null) ||
+		(typeof value.lastError !== "string" && value.lastError !== null)) {
+		return null;
+	}
+	return {
+		id: value.id,
+		url: value.url,
+		title: value.title,
+		enabled,
+		lastFetchedAt: value.lastFetchedAt,
+		lastError: value.lastError,
+		createdAt: value.createdAt,
+		updatedAt: value.updatedAt,
+	};
+}
+
+function toRssItemApiItem(value: unknown): RssItemApiItem | null {
+	if (!isRecord(value)) {
+		return null;
+	}
+	const status = value.status;
+	if (
+		typeof value.id !== "string" ||
+		typeof value.feedId !== "string" ||
+		(typeof value.feedTitle !== "string" && value.feedTitle !== null) ||
+		(typeof value.sourceId !== "string" && value.sourceId !== null) ||
+		typeof value.dedupeKey !== "string" ||
+		(typeof value.link !== "string" && value.link !== null) ||
+		(typeof value.title !== "string" && value.title !== null) ||
+		(typeof value.author !== "string" && value.author !== null) ||
+		(typeof value.publishedAt !== "string" && value.publishedAt !== null) ||
+		typeof value.summaryRaw !== "string" ||
+		(typeof value.summaryZh !== "string" && value.summaryZh !== null) ||
+		(status !== "new" && status !== "saved" && status !== "ignored") ||
+		(typeof value.noteId !== "string" && value.noteId !== null) ||
+		typeof value.fetchedAt !== "string" ||
+		typeof value.createdAt !== "string" ||
+		typeof value.updatedAt !== "string"
+	) {
+		return null;
+	}
+	return {
+		id: value.id,
+		feedId: value.feedId,
+		feedTitle: value.feedTitle,
+		sourceId: value.sourceId,
+		dedupeKey: value.dedupeKey,
+		link: value.link,
+		title: value.title,
+		author: value.author,
+		publishedAt: value.publishedAt,
+		summaryRaw: value.summaryRaw,
+		summaryZh: value.summaryZh,
+		status,
+		noteId: value.noteId,
+		fetchedAt: value.fetchedAt,
+		createdAt: value.createdAt,
+		updatedAt: value.updatedAt,
+	};
+}
+
+function toRssSyncResultApiItem(value: unknown): RssSyncResultApiItem | null {
+	if (
+		!isRecord(value) ||
+		typeof value.processedFeeds !== "number" ||
+		typeof value.totalFetchedItems !== "number" ||
+		typeof value.totalCreated !== "number" ||
+		typeof value.totalUpdated !== "number" ||
+		typeof value.totalSkipped !== "number" ||
+		!Array.isArray(value.results)
+	) {
+		return null;
+	}
+	const results = value.results
+		.filter((item): item is Record<string, unknown> => isRecord(item))
+		.map((item) => {
+			if (
+				typeof item.feedId !== "string" ||
+				typeof item.url !== "string" ||
+				(typeof item.feedTitle !== "string" && item.feedTitle !== null) ||
+				typeof item.fetched !== "number" ||
+				typeof item.created !== "number" ||
+				typeof item.updated !== "number" ||
+				typeof item.skipped !== "number"
+			) {
+				return null;
+			}
+			const errors = Array.isArray(item.errors)
+				? item.errors.filter((error): error is string => typeof error === "string")
+				: [];
+			return {
+				feedId: item.feedId,
+				url: item.url,
+				feedTitle: item.feedTitle,
+				fetched: item.fetched,
+				created: item.created,
+				updated: item.updated,
+				skipped: item.skipped,
+				errors,
+			};
+		})
+		.filter((item): item is RssSyncResultApiItem["results"][number] => item !== null);
+
+	return {
+		processedFeeds: value.processedFeeds,
+		totalFetchedItems: value.totalFetchedItems,
+		totalCreated: value.totalCreated,
+		totalUpdated: value.totalUpdated,
+		totalSkipped: value.totalSkipped,
+		results,
 	};
 }
 
