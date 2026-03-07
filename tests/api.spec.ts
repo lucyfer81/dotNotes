@@ -659,6 +659,83 @@ describe("ai enhance api", () => {
 	});
 });
 
+describe("rss api", () => {
+	it("supports feed sync and saving a rss item into reading folder", async () => {
+		const feedUrl = "https://example.com/feed.xml";
+		const feedXml = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Example Feed</title>
+    <item>
+      <guid>item-001</guid>
+      <link>https://example.com/posts/1</link>
+      <title>First item</title>
+      <description><![CDATA[This is the first item summary.]]></description>
+      <pubDate>Wed, 05 Mar 2025 10:00:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>`;
+
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = vi.fn(async (input) => {
+			const url = typeof input === "string" ? input : input instanceof Request ? input.url : "";
+			if (url === feedUrl) {
+				return new Response(feedXml, {
+					status: 200,
+					headers: { "Content-Type": "application/rss+xml; charset=utf-8" },
+				});
+			}
+			return new Response("not found", { status: 404 });
+		}) as typeof fetch;
+
+		try {
+			const createdFeed = await readEnvelope<{ id: string; url: string }>(await api("/api/rss/feeds", {
+				method: "POST",
+				body: JSON.stringify({
+					url: feedUrl,
+					title: "Tech Feed",
+				}),
+			}));
+			expect(createdFeed.data.url).toBe(feedUrl);
+
+			const syncResult = await readEnvelope<{
+				processedFeeds: number;
+				totalFetchedItems: number;
+				totalCreated: number;
+			}>(await api("/api/rss/sync", {
+				method: "POST",
+				body: JSON.stringify({ translate: false }),
+			}));
+			expect(syncResult.data.processedFeeds).toBe(1);
+			expect(syncResult.data.totalFetchedItems).toBe(1);
+			expect(syncResult.data.totalCreated).toBe(1);
+
+			const itemList = await readEnvelope<{ items: Array<{ id: string; status: string; link: string | null }> }>(
+				await api("/api/rss/items?status=new"),
+			);
+			expect(itemList.data.items.length).toBe(1);
+			expect(itemList.data.items[0]?.link).toBe("https://example.com/posts/1");
+			const itemId = itemList.data.items[0]!.id;
+
+			const saved = await readEnvelope<{ noteId: string; created: boolean }>(
+				await api(`/api/rss/items/${itemId}/save`, { method: "POST" }),
+			);
+			expect(saved.data.created).toBe(true);
+
+			const note = await readEnvelope<NotePayload>(await api(`/api/notes/${saved.data.noteId}`));
+			expect(note.data.folderId).toBe("folder-20-areas-reading");
+			expect(note.data.bodyText ?? "").toContain("https://example.com/posts/1");
+
+			const savedList = await readEnvelope<{ items: Array<{ id: string; status: string; noteId: string | null }> }>(
+				await api("/api/rss/items?status=saved"),
+			);
+			expect(savedList.data.items.some((item) => item.id === itemId && item.noteId === saved.data.noteId)).toBe(true);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+});
+
 async function createNote(input: {
 	title: string;
 	folderId: string;
@@ -721,6 +798,7 @@ type NotePayload = {
 	id: string;
 	title: string;
 	slug: string;
+	folderId: string;
 	storageType: "d1" | "r2";
 	bodyText: string | null;
 	isArchived: number;
