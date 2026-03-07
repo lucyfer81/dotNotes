@@ -2052,7 +2052,7 @@ async function handleAiEnhanceRequest(c: AppContext, tasks: AiEnhanceTaskKey[]):
 	}
 	const payload = (await parseObjectBody(c)) ?? {};
 	const input = parseAiEnhanceInput(payload);
-	const { prepared, warnings } = await prepareAiEnhanceInput(c.env, note, input);
+	const { prepared, warnings } = await prepareAiEnhanceInput(c.env, note, input, tasks);
 
 	let result: AiEnhanceResult;
 	try {
@@ -2081,8 +2081,13 @@ async function prepareAiEnhanceInput(
 	env: Env,
 	note: NoteRow,
 	input: AiEnhanceRequestInput,
+	tasks: AiEnhanceTaskKey[],
 ): Promise<{ prepared: AiEnhancePreparedInput; warnings: string[] }> {
 	const warnings: string[] = [];
+	const taskSet = new Set(tasks);
+	const requiresContext = taskSet.has("semantic") || taskSet.has("links") || taskSet.has("similar");
+	const requiresLinkedSlugs = taskSet.has("links");
+	const requiresExistingTags = taskSet.has("tags");
 	let hydrated = note;
 	try {
 		hydrated = await hydrateNoteBodyFromR2(env, note);
@@ -2094,33 +2099,39 @@ async function prepareAiEnhanceInput(
 	const sourceBody = hydrated.bodyText ?? note.bodyText ?? "";
 	const query = input.query ?? buildAiEnhanceDefaultQuery(hydrated.title, sourceBody);
 	let candidatePool: AiContextNoteItem[] = [];
-	try {
-		const context = await buildAiContext(env, {
-			query,
-			noteId: null,
-			limit: Math.min(20, Math.max(input.topK * 2, 8)),
-			status: "active",
-		});
-		candidatePool = context.notes.filter((item) => item.noteId !== note.id);
-	} catch (error) {
-		console.error("AI enhance context build failed, continue with empty candidates", error);
-		warnings.push(`context_failed: ${String(error)}`);
+	if (requiresContext) {
+		try {
+			const context = await buildAiContext(env, {
+				query,
+				noteId: null,
+				limit: Math.min(20, Math.max(input.topK * 2, 8)),
+				status: "active",
+			});
+			candidatePool = context.notes.filter((item) => item.noteId !== note.id);
+		} catch (error) {
+			console.error("AI enhance context build failed, continue with empty candidates", error);
+			warnings.push(`context_failed: ${String(error)}`);
+		}
 	}
 
 	let linkedSlugs = new Set<string>();
-	try {
-		linkedSlugs = await listOutboundLinkSlugs(env.DB, note.id, 128);
-	} catch (error) {
-		console.error("AI enhance link lookup failed, continue with empty links", error);
-		warnings.push(`link_lookup_failed: ${String(error)}`);
+	if (requiresLinkedSlugs) {
+		try {
+			linkedSlugs = await listOutboundLinkSlugs(env.DB, note.id, 128);
+		} catch (error) {
+			console.error("AI enhance link lookup failed, continue with empty links", error);
+			warnings.push(`link_lookup_failed: ${String(error)}`);
+		}
 	}
 
 	let existingTagNames: string[] = [];
-	try {
-		existingTagNames = await listExistingTagNames(env.DB, DEFAULT_AI_EXISTING_TAG_LIMIT);
-	} catch (error) {
-		console.error("AI enhance existing tags lookup failed, continue with empty tags", error);
-		warnings.push(`tags_context_failed: ${String(error)}`);
+	if (requiresExistingTags) {
+		try {
+			existingTagNames = await listExistingTagNames(env.DB, DEFAULT_AI_EXISTING_TAG_LIMIT);
+		} catch (error) {
+			console.error("AI enhance existing tags lookup failed, continue with empty tags", error);
+			warnings.push(`tags_context_failed: ${String(error)}`);
+		}
 	}
 
 	return {

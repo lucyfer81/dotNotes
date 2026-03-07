@@ -511,6 +511,55 @@ describe("ai enhance api", () => {
 			globalThis.fetch = originalFetch;
 		}
 	});
+
+	it("does not call embeddings when running summary task only", async () => {
+		const created = await createNote({
+			title: "Short Note",
+			folderId: "folder-10-projects",
+			bodyText: "短笔记，不需要检索上下文。",
+		});
+		const calledUrls: string[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = vi.fn(async (input) => {
+			const url = typeof input === "string" ? input : input instanceof Request ? input.url : "";
+			calledUrls.push(url);
+			return new Response(
+				JSON.stringify({
+					choices: [
+						{
+							message: {
+								content: JSON.stringify({
+									summary: "should-not-be-used",
+									outline: ["x"],
+								}),
+							},
+						},
+					],
+				}),
+				{
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				},
+			);
+		}) as typeof fetch;
+		try {
+			const enhanced = await readEnvelope<{
+				summaryMeta: { skipped: boolean; reason: string | null };
+			}>(await api(`/api/ai/notes/${created.id}/enhance/summary`, {
+				method: "POST",
+				body: JSON.stringify({ query: "短笔记" }),
+			}, {
+				AI_BASE_URL: "https://api.siliconflow.cn/v1",
+				AI_CHAT_MODEL: "Qwen/Qwen2.5-7B-Instruct",
+				SILICONFLOW_API_KEY: "test-key",
+				AI_EMBEDDING_MODEL: "test-embedding-model",
+			}));
+			expect(enhanced.data.summaryMeta.skipped).toBe(true);
+			expect(calledUrls.some((url) => url.includes("/embeddings"))).toBe(false);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
 });
 
 async function createNote(input: {
