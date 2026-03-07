@@ -43,7 +43,7 @@ type NoteRow = {
 	updatedAt: string;
 	searchScore: number | null;
 };
-type NoteSearchMode = "none" | "fts" | "like-fallback";
+type NoteSearchMode = "none" | "fts" | "like-fallback" | "hybrid";
 type ListNotesQueryInput = {
 	folderId: string | null;
 	tagIds: string[];
@@ -220,6 +220,9 @@ const DEFAULT_AI_MAX_INPUT_CHARS = 12_000;
 const DEFAULT_AI_RETRIEVAL_KEYWORD_MAX_CHARS = 96;
 const DEFAULT_AI_PROMPT_NOTE_MAX_CHARS = 4000;
 const DEFAULT_AI_PROMPT_CANDIDATE_SNIPPET_MAX_CHARS = 160;
+const DEFAULT_AI_EMBED_BATCH_SIZE = 8;
+const DEFAULT_AI_HYBRID_VECTOR_WEIGHT = 0.55;
+const DEFAULT_AI_HYBRID_KEYWORD_WEIGHT = 0.45;
 const DEFAULT_AI_EXISTING_TAG_LIMIT = 200;
 const DEFAULT_AI_SUMMARY_SKIP_CHAR_THRESHOLD = 120;
 const DEFAULT_AI_SUMMARY_SKIP_WORD_THRESHOLD = 40;
@@ -1557,7 +1560,7 @@ app.post("/api/ai/context", async (c) => {
 	if (!input) {
 		return jsonError(c, 400, "`query` is required");
 	}
-	const context = await buildAiContext(c.env.DB, input);
+	const context = await buildAiContext(c.env, input);
 	return jsonOk(c, {
 		enabled: false,
 		phase: "before-ai",
@@ -1575,7 +1578,7 @@ app.post("/api/ai/execute", async (c) => {
 	if (!input) {
 		return jsonError(c, 400, "`query` is required");
 	}
-	const context = await buildAiContext(c.env.DB, input);
+	const context = await buildAiContext(c.env, input);
 	return jsonOk(c, {
 		enabled: false,
 		phase: "before-ai",
@@ -2089,11 +2092,10 @@ async function prepareAiEnhanceInput(
 
 	const sourceBody = hydrated.bodyText ?? note.bodyText ?? "";
 	const query = input.query ?? buildAiEnhanceDefaultQuery(hydrated.title, sourceBody);
-	const retrievalQuery = normalizeKeywordForLike(query);
 	let candidatePool: AiContextNoteItem[] = [];
 	try {
-		const context = await buildAiContext(env.DB, {
-			query: retrievalQuery,
+		const context = await buildAiContext(env, {
+			query,
 			noteId: null,
 			limit: Math.min(20, Math.max(input.topK * 2, 8)),
 			status: "active",
@@ -2948,7 +2950,7 @@ function clipTextForAi(text: string, maxChars: number): string {
 }
 
 async function buildAiContext(
-	db: D1Database,
+	env: Env,
 	input: AiContextRequestInput,
 ): Promise<{
 	query: string;
@@ -2959,14 +2961,10 @@ async function buildAiContext(
 	chunks: AiContextChunkItem[];
 }> {
 	const retrievalQuery = normalizeKeywordForLike(input.query);
-	const { notes, mode } = await listNotesWithSearchMode(db, {
-		folderId: null,
-		tagIds: [],
-		tagMode: "any",
-		keyword: retrievalQuery,
-		status: input.status,
+	const { notes, mode } = await listAiHybridNotes(env, {
+		query: retrievalQuery,
 		limit: input.limit * 2,
-		offset: 0,
+		status: input.status,
 	});
 	const filteredNotes = input.noteId
 		? notes.filter((note) => note.id === input.noteId)
@@ -2981,7 +2979,7 @@ async function buildAiContext(
 	}));
 	let chunkItems: AiContextChunkItem[] = [];
 	try {
-		chunkItems = await listAiContextChunks(db, {
+		chunkItems = await listAiContextChunks(env.DB, {
 			...input,
 			query: retrievalQuery,
 		});
@@ -2996,6 +2994,208 @@ async function buildAiContext(
 		notes: noteItems,
 		chunks: chunkItems,
 	};
+}
+
+async function listAiHybridNotes(
+	env: Env,
+	input: {
+		query: string;
+		limit: number;
+		status: NoteStatusFilter;
+	},
+): Promise<{ notes: NoteRow[]; mode: NoteSearchMode }> {
+	const { notes: keywordNotes, mode } = await listNotesWithSearchMode(env.DB, {
+		folderId: null,
+		tagIds: [],
+		tagMode: "any",
+		keyword: input.query,
+		status: input.status,
+		limit: Math.max(input.limit * 2, 24),
+		offset: 0,
+	});
+	if (!input.query) {
+		return {
+			notes: keywordNotes.slice(0, input.limit),
+			mode,
+		};
+	}
+
+	const vectorHits = await queryAiVectorCandidates(env, {
+		query: input.query,
+		limit: input.limit,
+	});
+	if (vectorHits.length === 0) {
+		return {
+			notes: keywordNotes.slice(0, input.limit),
+			mode,
+		};
+	}
+
+	const vectorRows = await fetchNotesByIdsForAiContext(
+		env.DB,
+		vectorHits.map((item) => item.noteId),
+		input.status,
+	);
+	const vectorRowsById = new Map(vectorRows.map((item) => [item.id, item] as const));
+	const keywordRowsById = new Map(keywordNotes.map((item) => [item.id, item] as const));
+	const scored = new Map<string, { note: NoteRow; keywordScore: number; vectorScore: number; combinedScore: number }>();
+
+	for (let index = 0; index < keywordNotes.length; index += 1) {
+		const note = keywordNotes[index];
+		if (!note) {
+			continue;
+		}
+		const keywordScore = clampFraction(1 - index / (keywordNotes.length + 1));
+		const existing = scored.get(note.id);
+		if (existing) {
+			existing.keywordScore = Math.max(existing.keywordScore, keywordScore);
+			continue;
+		}
+		scored.set(note.id, {
+			note,
+			keywordScore,
+			vectorScore: 0,
+			combinedScore: 0,
+		});
+	}
+	for (const hit of vectorHits) {
+		const note = vectorRowsById.get(hit.noteId) ?? keywordRowsById.get(hit.noteId);
+		if (!note) {
+			continue;
+		}
+		const vectorScore = normalizeVectorSimilarityScore(hit.score);
+		const existing = scored.get(hit.noteId);
+		if (existing) {
+			existing.vectorScore = Math.max(existing.vectorScore, vectorScore);
+			continue;
+		}
+		scored.set(hit.noteId, {
+			note,
+			keywordScore: 0,
+			vectorScore,
+			combinedScore: 0,
+		});
+	}
+
+	const merged = [...scored.values()]
+		.map((item) => ({
+			note: item.note,
+			score: clampFraction(
+				item.keywordScore * DEFAULT_AI_HYBRID_KEYWORD_WEIGHT + item.vectorScore * DEFAULT_AI_HYBRID_VECTOR_WEIGHT,
+			),
+		}))
+		.sort((a, b) => b.score - a.score || b.note.updatedAt.localeCompare(a.note.updatedAt))
+		.map((item) => ({
+			...item.note,
+			searchScore: item.note.searchScore ?? Number(item.score.toFixed(6)),
+		}))
+		.slice(0, input.limit);
+
+	return {
+		notes: merged,
+		mode: "hybrid",
+	};
+}
+
+async function queryAiVectorCandidates(
+	env: Env,
+	input: { query: string; limit: number },
+): Promise<Array<{ noteId: string; score: number }>> {
+	const vectorIndex = getNotesVectorIndex(env);
+	if (!vectorIndex || typeof vectorIndex.query !== "function") {
+		return [];
+	}
+	const query = input.query.trim();
+	if (!query) {
+		return [];
+	}
+
+	try {
+		const dimensions = getIndexVectorDimensions(env);
+		const embeddings = await buildEmbeddingsForTexts(env, [query], dimensions);
+		const vector = embeddings.vectors[0];
+		if (!vector) {
+			return [];
+		}
+		const rawMatches = await vectorIndex.query(vector, {
+			topK: Math.max(input.limit * 6, 24),
+			returnMetadata: "indexed",
+		});
+		const scoreByNoteId = new Map<string, number>();
+		const matches = Array.isArray(rawMatches?.matches) ? rawMatches.matches : [];
+		for (const match of matches) {
+			const metadata = match?.metadata;
+			if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+				continue;
+			}
+			const noteId = typeof metadata.noteId === "string" ? metadata.noteId : "";
+			if (!noteId) {
+				continue;
+			}
+			const rawScore = typeof match.score === "number" && Number.isFinite(match.score) ? match.score : 0;
+			const prev = scoreByNoteId.get(noteId);
+			if (prev === undefined || rawScore > prev) {
+				scoreByNoteId.set(noteId, rawScore);
+			}
+		}
+		return [...scoreByNoteId.entries()]
+			.map(([noteId, score]) => ({ noteId, score }))
+			.sort((a, b) => b.score - a.score)
+			.slice(0, input.limit * 2);
+	} catch (error) {
+		console.error("AI vector retrieval failed, fallback to keyword retrieval", error);
+		return [];
+	}
+}
+
+async function fetchNotesByIdsForAiContext(
+	db: D1Database,
+	noteIds: string[],
+	status: NoteStatusFilter,
+): Promise<NoteRow[]> {
+	const uniqueIds = [...new Set(noteIds.filter((item) => typeof item === "string" && item.length > 0))];
+	if (uniqueIds.length === 0) {
+		return [];
+	}
+	const marks = placeholders(uniqueIds.length);
+	const statusWhere = buildNoteStatusWhere("n", status);
+	const sql = `
+		SELECT
+			n.id,
+			n.slug,
+			n.title,
+			n.folder_id AS folderId,
+			n.storage_type AS storageType,
+			n.body_text AS bodyText,
+			n.body_r2_key AS bodyR2Key,
+			n.excerpt,
+			n.size_bytes AS sizeBytes,
+			n.word_count AS wordCount,
+			n.is_pinned AS isPinned,
+			n.is_archived AS isArchived,
+			n.deleted_at AS deletedAt,
+			n.created_at AS createdAt,
+			n.updated_at AS updatedAt,
+			NULL AS searchScore
+		FROM notes n
+		WHERE n.id IN (${marks})
+		  AND ${statusWhere}
+	`;
+	const { results } = await db.prepare(sql).bind(...uniqueIds).all<NoteRow>();
+	return results;
+}
+
+function normalizeVectorSimilarityScore(value: number): number {
+	if (!Number.isFinite(value)) {
+		return 0;
+	}
+	if (value >= 0 && value <= 1) {
+		return value;
+	}
+	if (value >= -1 && value <= 1) {
+		return (value + 1) / 2;
+	}
+	return clampFraction(value);
 }
 
 async function listAiContextChunks(db: D1Database, input: AiContextRequestInput): Promise<AiContextChunkItem[]> {
@@ -3087,6 +3287,21 @@ function getAiMaxInputChars(env: Env): number {
 	return DEFAULT_AI_MAX_INPUT_CHARS;
 }
 
+function getAiEmbeddingModel(env: Env): string | null {
+	const ext = env as Env & { AI_EMBEDDING_MODEL?: string };
+	const value = typeof ext.AI_EMBEDDING_MODEL === "string" ? ext.AI_EMBEDDING_MODEL.trim() : "";
+	return value || null;
+}
+
+function getAiEmbeddingBatchSize(env: Env): number {
+	const ext = env as Env & { AI_EMBED_BATCH_SIZE?: string };
+	const parsed = Number(ext.AI_EMBED_BATCH_SIZE);
+	if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 64) {
+		return Math.trunc(parsed);
+	}
+	return DEFAULT_AI_EMBED_BATCH_SIZE;
+}
+
 function getBodyR2ThresholdBytes(env: Env): number {
 	const value = "BODY_R2_THRESHOLD_BYTES" in env ? Number(env.BODY_R2_THRESHOLD_BYTES) : Number.NaN;
 	if (Number.isFinite(value) && value > 0) {
@@ -3164,8 +3379,18 @@ function getIndexEmbeddingModel(env: Env): string {
 	return candidate || DEFAULT_INDEX_EMBEDDING_MODEL;
 }
 
-function getNotesVectorIndex(env: Env): (Pick<VectorizeIndex, "upsert" | "deleteByIds"> | Pick<Vectorize, "upsert" | "deleteByIds">) | null {
-	const ext = env as Env & { NOTES_VECTOR_INDEX?: VectorizeIndex | Vectorize };
+function getNotesVectorIndex(
+	env: Env,
+): (
+	| Pick<VectorizeIndex, "upsert" | "deleteByIds" | "query">
+	| Pick<Vectorize, "upsert" | "deleteByIds" | "query">
+) | null {
+	const ext = env as Env & {
+		NOTES_VECTOR_INDEX?: (
+			| Pick<VectorizeIndex, "upsert" | "deleteByIds" | "query">
+			| Pick<Vectorize, "upsert" | "deleteByIds" | "query">
+		);
+	};
 	return ext.NOTES_VECTOR_INDEX ?? null;
 }
 
@@ -4283,6 +4508,133 @@ function buildHashEmbedding(text: string, dimensions: number): number[] {
 	return vector.map((value) => value / denominator);
 }
 
+function normalizeVectorL2(values: number[]): number[] {
+	let norm = 0;
+	for (const value of values) {
+		norm += value * value;
+	}
+	const denominator = Math.sqrt(norm) || 1;
+	return values.map((value) => value / denominator);
+}
+
+function projectVectorToDimensions(source: number[], targetDimensions: number): number[] {
+	if (targetDimensions <= 0) {
+		return [];
+	}
+	if (source.length === 0) {
+		return Array.from({ length: targetDimensions }, () => 0);
+	}
+	if (source.length === targetDimensions) {
+		return normalizeVectorL2(source.slice());
+	}
+	const projected = Array.from({ length: targetDimensions }, () => 0);
+	for (let index = 0; index < source.length; index += 1) {
+		const value = source[index];
+		if (!Number.isFinite(value)) {
+			continue;
+		}
+		projected[index % targetDimensions] += value;
+	}
+	return normalizeVectorL2(projected);
+}
+
+async function buildEmbeddingsForTexts(
+	env: Env,
+	texts: string[],
+	targetDimensions: number,
+): Promise<{ vectors: number[][]; model: string }> {
+	if (texts.length === 0) {
+		return {
+			vectors: [],
+			model: getIndexEmbeddingModel(env),
+		};
+	}
+	const baseUrl = getAiBaseUrl(env);
+	const apiKey = getSiliconflowApiKey(env);
+	const embeddingModel = getAiEmbeddingModel(env);
+	if (baseUrl && apiKey && embeddingModel) {
+		try {
+			const rawVectors = await fetchSiliconflowEmbeddings(env, {
+				baseUrl,
+				apiKey,
+				model: embeddingModel,
+				texts,
+			});
+			return {
+				vectors: rawVectors.map((vector) => projectVectorToDimensions(vector, targetDimensions)),
+				model: `siliconflow:${embeddingModel}`,
+			};
+		} catch (error) {
+			console.error("Siliconflow embeddings failed, fallback to hash embedding", error);
+		}
+	}
+	return {
+		vectors: texts.map((text) => buildHashEmbedding(text, targetDimensions)),
+		model: getIndexEmbeddingModel(env),
+	};
+}
+
+async function fetchSiliconflowEmbeddings(
+	env: Env,
+	input: {
+		baseUrl: string;
+		apiKey: string;
+		model: string;
+		texts: string[];
+	},
+): Promise<number[][]> {
+	const batchSize = getAiEmbeddingBatchSize(env);
+	const output: number[][] = [];
+	for (let start = 0; start < input.texts.length; start += batchSize) {
+		const batch = input.texts.slice(start, start + batchSize);
+		const response = await fetch(`${input.baseUrl.replace(/\/+$/u, "")}/embeddings`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"Authorization": `Bearer ${input.apiKey}`,
+			},
+			body: JSON.stringify({
+				model: input.model,
+				input: batch,
+			}),
+		});
+		if (!response.ok) {
+			const errorText = (await response.text()).slice(0, 300);
+			throw new Error(`Siliconflow embeddings failed: ${response.status} ${errorText}`);
+		}
+		const payload = await response.json<unknown>();
+		if (!isRecord(payload) || !Array.isArray(payload.data)) {
+			throw new Error("Siliconflow embeddings payload is invalid");
+		}
+		const vectors = payload.data
+			.filter((item): item is Record<string, unknown> => isRecord(item))
+			.sort((a, b) => {
+				const indexA = typeof a.index === "number" ? a.index : 0;
+				const indexB = typeof b.index === "number" ? b.index : 0;
+				return indexA - indexB;
+			})
+			.map((item) => {
+				const embedding = item.embedding;
+				if (!Array.isArray(embedding)) {
+					return [];
+				}
+				return embedding
+					.map((value) => (typeof value === "number" && Number.isFinite(value) ? value : 0))
+					.filter((value, index, self) => Number.isFinite(value) && index < self.length);
+			});
+		if (vectors.length !== batch.length) {
+			throw new Error("Siliconflow embeddings length mismatch");
+		}
+		for (const vector of vectors) {
+			if (vector.length === 0) {
+				throw new Error("Siliconflow embeddings contains empty vector");
+			}
+			output.push(vector);
+		}
+	}
+	return output;
+}
+
 async function buildVectorId(noteId: string, chunkIndex: number, chunkText: string): Promise<string> {
 	const digest = await sha256Hex(new TextEncoder().encode(chunkText).buffer);
 	return `${noteId}:${chunkIndex}:${digest.slice(0, 16)}`;
@@ -4315,14 +4667,23 @@ async function upsertNoteChunksToVectorIndex(
 		.all<NoteChunkRow>();
 
 	const dimensions = getIndexVectorDimensions(env);
-	const model = getIndexEmbeddingModel(env);
+	const embeddings = await buildEmbeddingsForTexts(
+		env,
+		chunks.map((item) => item.chunkText),
+		dimensions,
+	);
+	const model = embeddings.model;
 	const vectorRecords: VectorizeVector[] = [];
 	const chunkRows: Array<{ id: string; vectorId: string; chunkIndex: number; chunkText: string; tokenCount: number }> = [];
-	for (const chunk of chunks) {
+	for (let index = 0; index < chunks.length; index += 1) {
+		const chunk = chunks[index];
+		if (!chunk) {
+			continue;
+		}
 		const vectorId = await buildVectorId(note.id, chunk.chunkIndex, chunk.chunkText);
 		vectorRecords.push({
 			id: vectorId,
-			values: buildHashEmbedding(chunk.chunkText, dimensions),
+			values: embeddings.vectors[index] ?? buildHashEmbedding(chunk.chunkText, dimensions),
 			metadata: {
 				noteId: note.id,
 				slug: note.slug,

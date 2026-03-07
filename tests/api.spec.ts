@@ -390,6 +390,66 @@ describe("ai pre-integration api", () => {
 		expect(execute.data.enabled).toBe(false);
 		expect(execute.data.answer).toBeNull();
 	});
+
+	it("supports hybrid retrieval with vector candidates when keyword misses", async () => {
+		const target = await createNote({
+			title: "Hybrid Target",
+			folderId: "folder-10-projects",
+			bodyText: "latent concept alpha and retrieval strategy",
+		});
+		const noise = await createNote({
+			title: "Hybrid Noise",
+			folderId: "folder-10-projects",
+			bodyText: "totally different beta topic",
+		});
+
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = vi.fn(async (input, init) => {
+			const url = typeof input === "string" ? input : input instanceof Request ? input.url : "";
+			if (!url.includes("/embeddings")) {
+				return new Response("not found", { status: 404 });
+			}
+			const body = typeof init?.body === "string" ? JSON.parse(init.body) as { input?: string[] } : {};
+			const values = Array.isArray(body.input) ? body.input : [];
+			const vectors = values.map((text) => {
+				if (text.includes("alpha") || text.includes("目标主题")) {
+					return [1, 0, 0, 0];
+				}
+				return [0, 1, 0, 0];
+			});
+			return new Response(
+				JSON.stringify({
+					data: vectors.map((embedding, index) => ({ index, embedding })),
+				}),
+				{
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				},
+			);
+		}) as typeof fetch;
+
+		try {
+			const envOverrides = {
+				AI_BASE_URL: "https://api.siliconflow.cn/v1",
+				AI_EMBEDDING_MODEL: "test-embed-model",
+				SILICONFLOW_API_KEY: "test-key",
+			};
+			await readEnvelope(await api(`/api/notes/${target.id}/index/retry`, { method: "POST" }, envOverrides));
+			await readEnvelope(await api(`/api/notes/${noise.id}/index/retry`, { method: "POST" }, envOverrides));
+
+			const context = await readEnvelope<{
+				searchMode: string;
+				notes: Array<{ noteId: string }>;
+			}>(await api("/api/ai/context", {
+				method: "POST",
+				body: JSON.stringify({ query: "目标主题", limit: 3 }),
+			}, envOverrides));
+			expect(context.data.searchMode).toBe("hybrid");
+			expect(context.data.notes.map((item) => item.noteId)).toContain(target.id);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
 });
 
 describe("ai enhance api", () => {
