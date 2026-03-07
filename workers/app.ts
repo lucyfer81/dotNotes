@@ -221,6 +221,7 @@ const DEFAULT_AI_RETRIEVAL_KEYWORD_MAX_CHARS = 96;
 const DEFAULT_AI_PROMPT_NOTE_MAX_CHARS = 4000;
 const DEFAULT_AI_PROMPT_CANDIDATE_SNIPPET_MAX_CHARS = 160;
 const DEFAULT_AI_EMBED_BATCH_SIZE = 8;
+const DEFAULT_AI_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B";
 const DEFAULT_AI_HYBRID_VECTOR_WEIGHT = 0.55;
 const DEFAULT_AI_HYBRID_KEYWORD_WEIGHT = 0.45;
 const DEFAULT_AI_EXISTING_TAG_LIMIT = 200;
@@ -3287,10 +3288,10 @@ function getAiMaxInputChars(env: Env): number {
 	return DEFAULT_AI_MAX_INPUT_CHARS;
 }
 
-function getAiEmbeddingModel(env: Env): string | null {
+function getAiEmbeddingModel(env: Env): string {
 	const ext = env as Env & { AI_EMBEDDING_MODEL?: string };
 	const value = typeof ext.AI_EMBEDDING_MODEL === "string" ? ext.AI_EMBEDDING_MODEL.trim() : "";
-	return value || null;
+	return value || DEFAULT_AI_EMBEDDING_MODEL;
 }
 
 function getAiEmbeddingBatchSize(env: Env): number {
