@@ -560,6 +560,52 @@ describe("ai enhance api", () => {
 			globalThis.fetch = originalFetch;
 		}
 	});
+
+	it("streams task progress and final result for title task", async () => {
+		const created = await createNote({
+			title: "Stream Title",
+			folderId: "folder-10-projects",
+			bodyText: "A note for streaming task response.",
+		});
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = vi.fn(async () =>
+			new Response(
+				JSON.stringify({
+					choices: [
+						{
+							message: {
+								content: JSON.stringify({
+									titleCandidates: [{ title: "Streaming Title Candidate", confidence: 0.9, reason: "stream test" }],
+								}),
+							},
+						},
+					],
+				}),
+				{
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				},
+			),
+		) as typeof fetch;
+		try {
+			const response = await api(`/api/ai/notes/${created.id}/enhance/title/stream`, {
+				method: "POST",
+				body: JSON.stringify({ query: "stream title" }),
+			}, {
+				AI_BASE_URL: "https://api.siliconflow.cn/v1",
+				AI_CHAT_MODEL: "Qwen/Qwen2.5-7B-Instruct",
+				SILICONFLOW_API_KEY: "test-key",
+			});
+			expect(response.status).toBe(200);
+			expect(response.headers.get("content-type") ?? "").toContain("text/event-stream");
+			const text = await response.text();
+			expect(text).toContain("event: start");
+			expect(text).toContain("event: done");
+			expect(text).toContain("Streaming Title Candidate");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
 });
 
 async function createNote(input: {

@@ -100,6 +100,11 @@ export type AiEnhanceResultApiItem = {
 	similarNotes: AiEnhanceRelatedNoteApiItem[];
 };
 export type AiEnhanceTaskApiKey = "title" | "tags" | "semantic" | "links" | "summary" | "similar";
+export type AiEnhanceTaskStreamStage = "prepare" | "generate" | "processing";
+export type AiEnhanceTaskStreamProgress = {
+	task: AiEnhanceTaskApiKey;
+	stage: AiEnhanceTaskStreamStage;
+};
 
 type ListNotesOptions = {
 	limit?: number;
@@ -431,6 +436,98 @@ export async function enhanceNoteWithAiTask(
 	return parsed;
 }
 
+export async function enhanceNoteWithAiTaskStream(
+	noteId: string,
+	task: AiEnhanceTaskApiKey,
+	input: AiEnhanceInput = {},
+	handlers: {
+		onStart?: (payload: { task: AiEnhanceTaskApiKey; noteId: string }) => void;
+		onProgress?: (payload: AiEnhanceTaskStreamProgress) => void;
+		onDone?: (result: AiEnhanceResultApiItem) => void;
+	} = {},
+): Promise<AiEnhanceResultApiItem> {
+	const response = await fetch(`/api/ai/notes/${encodeURIComponent(noteId)}/enhance/${encodeURIComponent(task)}/stream`, {
+		method: "POST",
+		headers: {
+			"Accept": "text/event-stream",
+			"Content-Type": "application/json",
+		},
+		body: JSON.stringify({
+			query: input.query,
+			topK: input.topK,
+		}),
+	});
+	if (!response.ok) {
+		const payload = await response.json().catch(() => null);
+		throw new Error(readApiError(payload, response.status));
+	}
+	if (!response.body) {
+		return enhanceNoteWithAiTask(noteId, task, input);
+	}
+
+	const reader = response.body.getReader();
+	const decoder = new TextDecoder();
+	let buffer = "";
+	let result: AiEnhanceResultApiItem | null = null;
+
+	while (true) {
+		const { done, value } = await reader.read();
+		buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+		let splitIndex = buffer.indexOf("\n\n");
+		while (splitIndex >= 0) {
+			const block = buffer.slice(0, splitIndex);
+			buffer = buffer.slice(splitIndex + 2);
+			const parsed = parseSseBlock(block);
+			if (!parsed) {
+				splitIndex = buffer.indexOf("\n\n");
+				continue;
+			}
+			if (parsed.event === "start") {
+				const payload = parsed.data;
+				if (isRecord(payload) && payload.task === task && typeof payload.noteId === "string") {
+					handlers.onStart?.({ task, noteId: payload.noteId });
+				}
+			} else if (parsed.event === "progress") {
+				const payload = parsed.data;
+				if (
+					isRecord(payload) &&
+					payload.task === task &&
+					(payload.stage === "prepare" || payload.stage === "generate" || payload.stage === "processing")
+				) {
+					handlers.onProgress?.({
+						task,
+						stage: payload.stage,
+					});
+				}
+			} else if (parsed.event === "done") {
+				const payload = parsed.data;
+				if (isRecord(payload) && payload.ok === true && "data" in payload) {
+					const parsedResult = toAiEnhanceResultApiItem(payload.data);
+					if (parsedResult) {
+						result = parsedResult;
+						handlers.onDone?.(parsedResult);
+					}
+				}
+			} else if (parsed.event === "error") {
+				const payload = parsed.data;
+				if (isRecord(payload) && typeof payload.error === "string") {
+					throw new Error(payload.error);
+				}
+				throw new Error("AI stream failed");
+			}
+			splitIndex = buffer.indexOf("\n\n");
+		}
+		if (done) {
+			break;
+		}
+	}
+
+	if (!result) {
+		throw new Error("AI stream closed without result");
+	}
+	return result;
+}
+
 export async function listNoteAssets(noteId: string): Promise<NoteAssetApiItem[]> {
 	const data = await requestApiData<unknown>(`/api/notes/${encodeURIComponent(noteId)}/assets`);
 	if (!Array.isArray(data)) {
@@ -492,6 +589,45 @@ function readApiError(payload: unknown, status: number): string {
 		return payload.error;
 	}
 	return `Request failed: ${status}`;
+}
+
+function parseSseBlock(block: string): { event: string; data: unknown } | null {
+	const lines = block
+		.split(/\r?\n/u)
+		.map((line) => line.trimEnd())
+		.filter((line) => line.length > 0);
+	if (lines.length === 0) {
+		return null;
+	}
+	let event = "";
+	const dataLines: string[] = [];
+	for (const line of lines) {
+		if (line.startsWith("event:")) {
+			event = line.slice("event:".length).trim();
+			continue;
+		}
+		if (line.startsWith("data:")) {
+			dataLines.push(line.slice("data:".length).trim());
+		}
+	}
+	if (!event) {
+		return null;
+	}
+	const rawData = dataLines.join("\n");
+	if (!rawData) {
+		return { event, data: null };
+	}
+	try {
+		return {
+			event,
+			data: JSON.parse(rawData),
+		};
+	} catch {
+		return {
+			event,
+			data: rawData,
+		};
+	}
 }
 
 function toFolderApiItem(value: unknown): FolderApiItem | null {

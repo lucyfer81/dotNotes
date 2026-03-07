@@ -216,7 +216,11 @@ const DEFAULT_INDEX_SUCCESS_RATE_ALERT_THRESHOLD = 0.95;
 const DEFAULT_INDEX_BACKLOG_ALERT_THRESHOLD = 20;
 const DEFAULT_AI_ENHANCE_TOP_K = 6;
 const DEFAULT_AI_TIMEOUT_MS = 30_000;
+const DEFAULT_AI_TIMEOUT_TITLE_MS = 60_000;
+const DEFAULT_AI_TIMEOUT_TAGS_MS = 45_000;
+const DEFAULT_AI_TIMEOUT_SUMMARY_MS = 60_000;
 const DEFAULT_AI_MAX_INPUT_CHARS = 12_000;
+const DEFAULT_AI_EMBED_TIMEOUT_MS = 12_000;
 const DEFAULT_AI_RETRIEVAL_KEYWORD_MAX_CHARS = 96;
 const DEFAULT_AI_PROMPT_NOTE_MAX_CHARS = 4000;
 const DEFAULT_AI_PROMPT_CANDIDATE_SNIPPET_MAX_CHARS = 160;
@@ -1552,6 +1556,21 @@ app.post("/api/ai/notes/:id/enhance/:task", async (c) => {
 	return handleAiEnhanceRequest(c, [task]);
 });
 
+app.post("/api/ai/notes/:id/enhance/:task/stream", async (c) => {
+	const task = parseAiEnhanceTaskKey(c.req.param("task"));
+	if (!task) {
+		return jsonError(c, 404, "AI task not found");
+	}
+	const noteId = c.req.param("id");
+	const note = await getNoteById(c.env.DB, noteId);
+	if (!note || note.deletedAt) {
+		return jsonError(c, 404, "Note not found");
+	}
+	const payload = (await parseObjectBody(c)) ?? {};
+	const input = parseAiEnhanceInput(payload);
+	return streamAiEnhanceTask(c.env, note, input, task);
+});
+
 app.post("/api/ai/context", async (c) => {
 	const payload = await parseObjectBody(c);
 	if (!payload) {
@@ -2070,6 +2089,102 @@ async function handleAiEnhanceRequest(c: AppContext, tasks: AiEnhanceTaskKey[]):
 	return jsonOk(c, result);
 }
 
+function streamAiEnhanceTask(
+	env: Env,
+	note: NoteRow,
+	input: AiEnhanceRequestInput,
+	task: AiEnhanceTaskKey,
+): Response {
+	const encoder = new TextEncoder();
+	let closed = false;
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			const sendEvent = (event: "start" | "progress" | "done" | "error", data: unknown) => {
+				if (closed) {
+					return;
+				}
+				controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+			};
+
+			const heartbeat = setInterval(() => {
+				sendEvent("progress", {
+					task,
+					stage: "processing",
+				});
+			}, 4000);
+
+			const finish = () => {
+				if (closed) {
+					return;
+				}
+				closed = true;
+				clearInterval(heartbeat);
+				controller.close();
+			};
+
+			(async () => {
+				sendEvent("start", {
+					task,
+					noteId: note.id,
+				});
+				try {
+					sendEvent("progress", {
+						task,
+						stage: "prepare",
+					});
+					const { prepared, warnings } = await prepareAiEnhanceInput(env, note, input, [task]);
+					sendEvent("progress", {
+						task,
+						stage: "generate",
+					});
+					let result: AiEnhanceResult;
+					try {
+						result = await generateAiEnhanceWithSiliconflow(env, prepared, [task]);
+					} catch (error) {
+						console.error("AI enhance stream fallback", error);
+						result = buildAiEnhanceFallback(prepared, [task], String(error));
+					}
+					if (warnings.length > 0) {
+						result = {
+							...result,
+							warnings: [...warnings, ...result.warnings],
+						};
+					}
+					sendEvent("done", {
+						ok: true,
+						data: result,
+					});
+				} catch (error) {
+					sendEvent("error", {
+						ok: false,
+						error: String(error),
+					});
+				} finally {
+					finish();
+				}
+			})().catch((error) => {
+				sendEvent("error", {
+					ok: false,
+					error: String(error),
+				});
+				finish();
+			});
+		},
+		cancel() {
+			closed = true;
+		},
+	});
+
+	return new Response(stream, {
+		headers: {
+			"Content-Type": "text/event-stream; charset=utf-8",
+			"Cache-Control": "no-cache, no-transform",
+			"Connection": "keep-alive",
+			"X-Accel-Buffering": "no",
+		},
+	});
+}
+
 function buildAiEnhanceDefaultQuery(title: string, bodyText: string): string {
 	const condensedTitle = title.trim();
 	const bodySnippet = clipTextForAi(bodyText, 120);
@@ -2251,7 +2366,9 @@ async function generateAiEnhanceWithSiliconflow(
 							titleCandidates: [{ title: "string", confidence: 0.8, reason: "string" }],
 						}),
 					].join("\n"),
-				});
+					}, {
+						timeoutMs: getAiTaskTimeoutMs(env, "title"),
+					});
 				const source = isRecord(payload) ? payload : {};
 				const candidates = parseTitleCandidates(source.titleCandidates ?? source.candidates, input.topK);
 				result.titleCandidates = candidates.length > 0 ? candidates : buildFallbackTitleCandidates(input.note, input.topK);
@@ -2285,7 +2402,9 @@ async function generateAiEnhanceWithSiliconflow(
 							tagSuggestions: [{ name: "topic/subtopic", confidence: 0.8, reason: "string" }],
 						}),
 					].join("\n"),
-				});
+					}, {
+						timeoutMs: getAiTaskTimeoutMs(env, "tags"),
+					});
 				const source = isRecord(payload) ? payload : {};
 				result.tagSuggestions = parseTagSuggestions(
 					source.tagSuggestions ?? source.tags,
@@ -2317,7 +2436,9 @@ async function generateAiEnhanceWithSiliconflow(
 							semanticSearch: [{ noteId: "string", score: 0.8, reason: "string" }],
 						}),
 					].join("\n"),
-				});
+					}, {
+						timeoutMs: getAiTaskTimeoutMs(env, "semantic"),
+					});
 				const source = isRecord(payload) ? payload : {};
 				result.semanticSearch = parseRelatedNoteItems(
 					source.semanticSearch ?? source.recommendations,
@@ -2352,7 +2473,9 @@ async function generateAiEnhanceWithSiliconflow(
 							linkSuggestions: [{ noteId: "string", anchorText: "string", score: 0.8, reason: "string" }],
 						}),
 					].join("\n"),
-				});
+					}, {
+						timeoutMs: getAiTaskTimeoutMs(env, "links"),
+					});
 				const source = isRecord(payload) ? payload : {};
 				result.linkSuggestions = parseLinkSuggestions(
 					source.linkSuggestions ?? source.forward_links,
@@ -2405,7 +2528,9 @@ async function generateAiEnhanceWithSiliconflow(
 							action_items: ["string"],
 						}),
 					].join("\n"),
-				});
+					}, {
+						timeoutMs: getAiTaskTimeoutMs(env, "summary"),
+					});
 				const normalized = normalizeSummaryTaskResult(payload, input.note.bodyText ?? "", summaryMode.mode);
 				result.summary = normalized.summary;
 				result.outline = normalized.outline;
@@ -2439,7 +2564,9 @@ async function generateAiEnhanceWithSiliconflow(
 							similarNotes: [{ noteId: "string", score: 0.8, reason: "string", similarity_type: "same_topic" }],
 						}),
 					].join("\n"),
-				});
+					}, {
+						timeoutMs: getAiTaskTimeoutMs(env, "similar"),
+					});
 				const source = isRecord(payload) ? payload : {};
 				result.similarNotes = parseRelatedNoteItems(
 					source.similarNotes ?? source.recommendations,
@@ -2517,9 +2644,13 @@ async function callSiliconflowJson(
 		systemPrompt: string;
 		userPrompt: string;
 	},
+	options?: {
+		timeoutMs?: number;
+	},
 ): Promise<unknown> {
+	const timeoutMs = options?.timeoutMs ?? runtime.timeoutMs;
 	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort("timeout"), runtime.timeoutMs);
+	const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
 	let content = "";
 	try {
 		const response = await fetch(`${runtime.baseUrl.replace(/\/+$/u, "")}/chat/completions`, {
@@ -3290,6 +3421,32 @@ function getAiTimeoutMs(env: Env): number {
 	return DEFAULT_AI_TIMEOUT_MS;
 }
 
+function getAiTaskTimeoutMs(env: Env, task: AiEnhanceTaskKey): number {
+	const base = getAiTimeoutMs(env);
+	const ext = env as Env & {
+		AI_TIMEOUT_MS_TITLE?: string;
+		AI_TIMEOUT_MS_TAGS?: string;
+		AI_TIMEOUT_MS_SUMMARY?: string;
+	};
+	const read = (value: string | undefined, fallback: number): number => {
+		const parsed = Number(value);
+		if (Number.isFinite(parsed) && parsed >= 1000 && parsed <= 180_000) {
+			return Math.trunc(parsed);
+		}
+		return fallback;
+	};
+	if (task === "title") {
+		return read(ext.AI_TIMEOUT_MS_TITLE, Math.max(base, DEFAULT_AI_TIMEOUT_TITLE_MS));
+	}
+	if (task === "tags") {
+		return read(ext.AI_TIMEOUT_MS_TAGS, Math.max(base, DEFAULT_AI_TIMEOUT_TAGS_MS));
+	}
+	if (task === "summary") {
+		return read(ext.AI_TIMEOUT_MS_SUMMARY, Math.max(base, DEFAULT_AI_TIMEOUT_SUMMARY_MS));
+	}
+	return base;
+}
+
 function getAiMaxInputChars(env: Env): number {
 	const ext = env as Env & { AI_MAX_INPUT_CHARS?: string };
 	const parsed = Number(ext.AI_MAX_INPUT_CHARS);
@@ -3312,6 +3469,15 @@ function getAiEmbeddingBatchSize(env: Env): number {
 		return Math.trunc(parsed);
 	}
 	return DEFAULT_AI_EMBED_BATCH_SIZE;
+}
+
+function getAiEmbedTimeoutMs(env: Env): number {
+	const ext = env as Env & { AI_EMBED_TIMEOUT_MS?: string };
+	const parsed = Number(ext.AI_EMBED_TIMEOUT_MS);
+	if (Number.isFinite(parsed) && parsed >= 1000 && parsed <= 120_000) {
+		return Math.trunc(parsed);
+	}
+	return DEFAULT_AI_EMBED_TIMEOUT_MS;
 }
 
 function getBodyR2ThresholdBytes(env: Env): number {
@@ -4596,9 +4762,12 @@ async function fetchSiliconflowEmbeddings(
 	},
 ): Promise<number[][]> {
 	const batchSize = getAiEmbeddingBatchSize(env);
+	const timeoutMs = getAiEmbedTimeoutMs(env);
 	const output: number[][] = [];
 	for (let start = 0; start < input.texts.length; start += batchSize) {
 		const batch = input.texts.slice(start, start + batchSize);
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
 		const response = await fetch(`${input.baseUrl.replace(/\/+$/u, "")}/embeddings`, {
 			method: "POST",
 			headers: {
@@ -4609,6 +4778,9 @@ async function fetchSiliconflowEmbeddings(
 				model: input.model,
 				input: batch,
 			}),
+			signal: controller.signal,
+		}).finally(() => {
+			clearTimeout(timer);
 		});
 		if (!response.ok) {
 			const errorText = (await response.text()).slice(0, 300);

@@ -8,7 +8,7 @@ import {
 	createNote,
 	deleteNoteAsset,
 	deleteNote,
-	enhanceNoteWithAiTask,
+	enhanceNoteWithAiTaskStream,
 	getNoteLinks,
 	hardDeleteNote,
 	listFolders,
@@ -21,6 +21,7 @@ import {
 	updateNote,
 	type AiEnhanceRelatedNoteApiItem,
 	type AiEnhanceResultApiItem,
+	type AiEnhanceTaskStreamProgress,
 	type AiEnhanceTaskApiKey,
 	type FolderApiItem,
 	type NoteAssetApiItem,
@@ -111,6 +112,7 @@ export default function Home() {
 	const [aiQuery, setAiQuery] = useState("");
 	const [aiEnhanceResult, setAiEnhanceResult] = useState<AiEnhanceResultApiItem | null>(null);
 	const [runningAiTasks, setRunningAiTasks] = useState<AiEnhanceTaskApiKey[]>([]);
+	const [aiTaskStages, setAiTaskStages] = useState<Partial<Record<AiEnhanceTaskApiKey, string>>>({});
 	const [aiErrorMessage, setAiErrorMessage] = useState("");
 	const [isApplyingAiTitle, setIsApplyingAiTitle] = useState(false);
 	const [isApplyingAiTags, setIsApplyingAiTags] = useState(false);
@@ -336,6 +338,7 @@ export default function Home() {
 		setAiErrorMessage("");
 		setAiQuery("");
 		setRunningAiTasks([]);
+		setAiTaskStages({});
 		aiTaskRunIdRef.current = {
 			title: 0,
 			tags: 0,
@@ -1021,13 +1024,27 @@ export default function Home() {
 		aiTaskRunIdRef.current[task] = runId;
 		setAiErrorMessage("");
 		setRunningAiTasks((prev) => (prev.includes(task) ? prev : [...prev, task]));
+		setAiTaskStages((prev) => ({
+			...prev,
+			[task]: "准备中",
+		}));
 		setAiEnhanceResult((prev) =>
 			prev && prev.noteId === noteId ? prev : buildInitialAiEnhanceResult(noteId, query ?? ""),
 		);
 		try {
-			const partial = await enhanceNoteWithAiTask(noteId, task, {
+			const partial = await enhanceNoteWithAiTaskStream(noteId, task, {
 				query,
 				topK: 6,
+			}, {
+				onProgress: (progress) => {
+					if (aiTaskRunIdRef.current[task] !== runId) {
+						return;
+					}
+					setAiTaskStages((prev) => ({
+						...prev,
+						[task]: formatAiTaskStage(progress),
+					}));
+				},
 			});
 			if (aiTaskRunIdRef.current[task] !== runId) {
 				return;
@@ -1040,6 +1057,11 @@ export default function Home() {
 		} finally {
 			if (aiTaskRunIdRef.current[task] === runId) {
 				setRunningAiTasks((prev) => prev.filter((item) => item !== task));
+				setAiTaskStages((prev) => {
+					const next = { ...prev };
+					delete next[task];
+					return next;
+				});
 			}
 		}
 	};
@@ -2679,6 +2701,7 @@ export default function Home() {
 						onQueryChange={setAiQuery}
 						onRunTask={handleRunAiTask}
 						runningTasks={runningAiTasks}
+						taskStages={aiTaskStages}
 						errorMessage={aiErrorMessage}
 						result={aiEnhanceResult}
 						onApplyTitle={handleApplyAiTitle}
@@ -2716,6 +2739,7 @@ export default function Home() {
 							onQueryChange={setAiQuery}
 							onRunTask={handleRunAiTask}
 							runningTasks={runningAiTasks}
+							taskStages={aiTaskStages}
 							errorMessage={aiErrorMessage}
 							result={aiEnhanceResult}
 							onApplyTitle={handleApplyAiTitle}
@@ -3102,6 +3126,7 @@ function AiPanel(props: {
 	onQueryChange: (value: string) => void;
 	onRunTask: (task: AiEnhanceTaskApiKey) => void;
 	runningTasks: AiEnhanceTaskApiKey[];
+	taskStages: Partial<Record<AiEnhanceTaskApiKey, string>>;
 	errorMessage: string;
 	result: AiEnhanceResultApiItem | null;
 	onApplyTitle: (title: string) => void;
@@ -3118,6 +3143,7 @@ function AiPanel(props: {
 		onQueryChange,
 		onRunTask,
 		runningTasks,
+		taskStages,
 		errorMessage,
 		result,
 		onApplyTitle,
@@ -3168,7 +3194,7 @@ function AiPanel(props: {
 										: "cursor-not-allowed bg-slate-200 text-slate-500"
 								}`}
 							>
-								{isRunningTask ? "生成中..." : item.label}
+								{isRunningTask ? taskStages[item.key] ?? "生成中..." : item.label}
 							</button>
 						);
 					})}
@@ -3347,6 +3373,16 @@ function AiRelatedNoteList(props: {
 			))}
 		</div>
 	);
+}
+
+function formatAiTaskStage(progress: AiEnhanceTaskStreamProgress): string {
+	if (progress.stage === "prepare") {
+		return "准备中";
+	}
+	if (progress.stage === "generate") {
+		return "生成中";
+	}
+	return "处理中";
 }
 
 function buildInitialAiEnhanceResult(noteId: string, query: string): AiEnhanceResultApiItem {
