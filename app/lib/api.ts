@@ -263,6 +263,15 @@ export type RssReadingProcessApiItem = {
 	skipped: number;
 	itemIds: string[];
 };
+export type OpsRssReadingJobsApiItem = {
+	items: RssItemApiItem[];
+	paging: { limit: number; offset: number; count: number };
+	summary: {
+		queued: number;
+		processing: number;
+		failed: number;
+	};
+};
 
 type ListNotesOptions = {
 	limit?: number;
@@ -1006,6 +1015,25 @@ export async function processRssReadingQueue(input: {
 	const parsed = toRssReadingProcessApiItem(data);
 	if (!parsed) {
 		throw new Error("Invalid rss reading process response");
+	}
+	return parsed;
+}
+
+export async function listOpsRssReadingJobs(input: {
+	limit?: number;
+	offset?: number;
+	states?: Array<"queued" | "processing" | "failed">;
+} = {}): Promise<OpsRssReadingJobsApiItem> {
+	const query = new URLSearchParams();
+	query.set("limit", String(input.limit ?? 30));
+	query.set("offset", String(input.offset ?? 0));
+	if (input.states && input.states.length > 0) {
+		query.set("state", input.states.join(","));
+	}
+	const data = await requestApiData<unknown>(`/api/ops/rss/reading-jobs?${query.toString()}`);
+	const parsed = toOpsRssReadingJobsApiItem(data);
+	if (!parsed) {
+		throw new Error("Invalid ops rss reading jobs response");
 	}
 	return parsed;
 }
@@ -1829,6 +1857,34 @@ function toRssReadingProcessApiItem(value: unknown): RssReadingProcessApiItem | 
 		failed: value.failed,
 		skipped: value.skipped,
 		itemIds: value.itemIds.filter((item): item is string => typeof item === "string"),
+	};
+}
+
+function toOpsRssReadingJobsApiItem(value: unknown): OpsRssReadingJobsApiItem | null {
+	if (!isRecord(value) || !Array.isArray(value.items) || !isRecord(value.paging) || !isRecord(value.summary)) {
+		return null;
+	}
+	const paging = toPagingApiItem(value.paging);
+	if (!paging) {
+		return null;
+	}
+	if (
+		typeof value.summary.queued !== "number" ||
+		typeof value.summary.processing !== "number" ||
+		typeof value.summary.failed !== "number"
+	) {
+		return null;
+	}
+	return {
+		items: value.items
+			.map((item) => toRssItemApiItem(item))
+			.filter((item): item is RssItemApiItem => item !== null),
+		paging,
+		summary: {
+			queued: value.summary.queued,
+			processing: value.summary.processing,
+			failed: value.summary.failed,
+		},
 	};
 }
 

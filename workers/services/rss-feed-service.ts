@@ -463,6 +463,115 @@ export async function listRssItems(
 	return results;
 }
 
+export async function listRssReadingJobs(
+	db: D1Database,
+	input: { readingStateCsv?: string | null; limit?: number; offset?: number } = {},
+): Promise<{
+	items: RssItemRow[];
+	count: number;
+	summary: { queued: number; processing: number; failed: number };
+}> {
+	const states = parseCsv(input.readingStateCsv ?? undefined).filter(
+		(item): item is "queued" | "processing" | "failed" =>
+			item === "queued" || item === "processing" || item === "failed",
+	);
+	const effectiveStates = states.length > 0 ? states : ["queued", "processing", "failed"];
+	const where: string[] = [
+		"ri.note_id IS NULL",
+		`ri.reading_state IN (${effectiveStates.map(() => "?").join(", ")})`,
+	];
+	const params: Array<string | number> = [...effectiveStates];
+	const limit = clampInt(
+		typeof input.limit === "number" ? String(input.limit) : undefined,
+		DEFAULT_RSS_READING_QUEUE_LIMIT,
+		1,
+		200,
+	);
+	const offset = clampInt(
+		typeof input.offset === "number" ? String(input.offset) : undefined,
+		0,
+		0,
+		5000,
+	);
+	const { results: items } = await db.prepare(
+		`SELECT
+			ri.id,
+			ri.feed_id AS feedId,
+			rf.title AS feedTitle,
+			ri.source_id AS sourceId,
+			ri.dedupe_key AS dedupeKey,
+			ri.link,
+			ri.title,
+			ri.author,
+			ri.published_at AS publishedAt,
+			ri.summary_raw AS summaryRaw,
+			ri.summary_zh AS summaryZh,
+			ri.status,
+			ri.note_id AS noteId,
+			ri.reading_state AS readingState,
+			ri.reading_error AS readingError,
+			ri.reading_attempt_count AS readingAttemptCount,
+			ri.reading_requested_at AS readingRequestedAt,
+			ri.reading_started_at AS readingStartedAt,
+			ri.reading_completed_at AS readingCompletedAt,
+			ri.fetched_at AS fetchedAt,
+			ri.created_at AS createdAt,
+			ri.updated_at AS updatedAt
+		 FROM rss_items ri
+		 LEFT JOIN rss_feeds rf ON rf.id = ri.feed_id
+		 WHERE ${where.join(" AND ")}
+		 ORDER BY
+			CASE
+				WHEN ri.reading_state = 'processing' THEN 0
+				WHEN ri.reading_state = 'queued' THEN 1
+				WHEN ri.reading_state = 'failed' THEN 2
+				ELSE 3
+			END ASC,
+			COALESCE(ri.reading_started_at, ri.reading_requested_at, ri.updated_at) DESC,
+			ri.updated_at DESC
+		 LIMIT ? OFFSET ?`,
+	)
+		.bind(...params, limit, offset)
+		.all<RssItemRow>();
+	const countRow = await db.prepare(
+		`SELECT COUNT(*) AS count
+		 FROM rss_items ri
+		 WHERE ${where.join(" AND ")}`,
+	)
+		.bind(...params)
+		.first<{ count: number }>();
+	const { results: summaryRows } = await db.prepare(
+		`SELECT
+			ri.reading_state AS readingState,
+			COUNT(*) AS count
+		 FROM rss_items ri
+		 WHERE ri.note_id IS NULL
+		   AND ri.reading_state IN ('queued', 'processing', 'failed')
+		 GROUP BY ri.reading_state`,
+	).all<{ readingState: string; count: number }>();
+	let queued = 0;
+	let processing = 0;
+	let failed = 0;
+	for (const row of summaryRows) {
+		if (row.readingState === "queued") {
+			queued = row.count;
+		} else if (row.readingState === "processing") {
+			processing = row.count;
+		} else if (row.readingState === "failed") {
+			failed = row.count;
+		}
+	}
+	return {
+		items,
+		count: countRow?.count ?? 0,
+		summary: {
+			queued,
+			processing,
+			failed,
+		},
+	};
+}
+
 export async function getRssItemById(db: D1Database, itemId: string): Promise<RssItemRow | null> {
 	const row = await db.prepare(
 		`SELECT
