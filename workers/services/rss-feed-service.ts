@@ -181,12 +181,31 @@ export async function listFeedsForSync(
 			updated_at AS updatedAt
 		 FROM rss_feeds
 		 WHERE ${where.join(" AND ")}
-		 ORDER BY updated_at DESC
+		 ORDER BY
+			CASE WHEN last_fetched_at IS NULL THEN 0 ELSE 1 END ASC,
+			COALESCE(last_fetched_at, '1970-01-01T00:00:00.000Z') ASC,
+			updated_at ASC
 		 LIMIT ?`,
 	)
 		.bind(...params, limit)
 		.all<RssFeedRow>();
 	return results;
+}
+
+export async function upsertRssFeedTitle(db: D1Database, feedId: string, title: string | null): Promise<void> {
+	const normalized = title?.trim() ?? "";
+	if (!normalized) {
+		return;
+	}
+	await db.prepare(
+		`UPDATE rss_feeds
+		 SET title = ?,
+			 updated_at = CURRENT_TIMESTAMP
+		 WHERE id = ?
+		   AND COALESCE(title, '') <> ?`,
+	)
+		.bind(normalized, feedId, normalized)
+		.run();
 }
 
 export async function markRssFeedSyncSuccess(
@@ -451,6 +470,57 @@ export async function bindRssItemToNote(
 		 WHERE id = ?`,
 	)
 		.bind(input.noteId, input.status, itemId)
+		.run();
+	return Number(result.meta.changes ?? 0) > 0;
+}
+
+export async function listRssItemsPendingTranslation(
+	db: D1Database,
+	input: { feedId?: string | null; limit?: number },
+): Promise<Array<{ id: string; summaryRaw: string }>> {
+	const where: string[] = [
+		"rf.enabled = 1",
+		"TRIM(COALESCE(ri.summary_raw, '')) <> ''",
+		"(ri.summary_zh IS NULL OR TRIM(ri.summary_zh) = '')",
+	];
+	const params: Array<string | number> = [];
+	if (input.feedId) {
+		where.push("ri.feed_id = ?");
+		params.push(input.feedId);
+	}
+	const limit = clampInt(
+		typeof input.limit === "number" ? String(input.limit) : undefined,
+		30,
+		1,
+		200,
+	);
+	const { results } = await db.prepare(
+		`SELECT
+			ri.id,
+			ri.summary_raw AS summaryRaw
+		 FROM rss_items ri
+		 INNER JOIN rss_feeds rf ON rf.id = ri.feed_id
+		 WHERE ${where.join(" AND ")}
+		 ORDER BY COALESCE(ri.published_at, ri.created_at) DESC, ri.created_at DESC
+		 LIMIT ?`,
+	)
+		.bind(...params, limit)
+		.all<{ id: string; summaryRaw: string }>();
+	return results;
+}
+
+export async function updateRssItemSummaryZh(db: D1Database, itemId: string, summaryZh: string): Promise<boolean> {
+	const normalized = summaryZh.trim();
+	if (!normalized) {
+		return false;
+	}
+	const result = await db.prepare(
+		`UPDATE rss_items
+		 SET summary_zh = ?,
+			 updated_at = CURRENT_TIMESTAMP
+		 WHERE id = ?`,
+	)
+		.bind(normalized, itemId)
 		.run();
 	return Number(result.meta.changes ?? 0) > 0;
 }

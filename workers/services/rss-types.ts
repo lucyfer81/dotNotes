@@ -63,3 +63,10 @@ export type RssSyncResult = {
 	totalSkipped: number;
 	results: RssSyncFeedResult[];
 };
+
+export type RssTranslateResult = {
+	requested: number;
+	translated: number;
+	failed: number;
+	processedItemIds: string[];
+};

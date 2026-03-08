@@ -6,6 +6,7 @@ import {
 	listRssItems,
 	saveRssItemToReading,
 	syncRssFeeds,
+	translateRssItems,
 	updateRssFeed,
 	updateRssItemStatus,
 	type RssFeedApiItem,
@@ -30,6 +31,7 @@ export default function RssBlogWorkspace(props: {
 	const [isLoadingFeeds, setIsLoadingFeeds] = useState(false);
 	const [isLoadingItems, setIsLoadingItems] = useState(false);
 	const [isSyncing, setIsSyncing] = useState(false);
+	const [isTranslating, setIsTranslating] = useState(false);
 	const [isCreatingFeed, setIsCreatingFeed] = useState(false);
 	const [updatingFeedId, setUpdatingFeedId] = useState("");
 	const [deletingFeedId, setDeletingFeedId] = useState("");
@@ -105,20 +107,80 @@ export default function RssBlogWorkspace(props: {
 		setErrorMessage("");
 		setSuccessMessage("");
 		try {
-			const result = await syncRssFeeds({
-				feedId: selectedFeedId === "all" ? undefined : selectedFeedId,
-				feedLimit: selectedFeedId === "all" ? undefined : 1,
-				itemLimit: 40,
-				translate: true,
-			});
-			setLastSyncResult(result);
-			setSuccessMessage(`同步完成：新增 ${result.totalCreated}，更新 ${result.totalUpdated}，跳过 ${result.totalSkipped}`);
+			const targets = selectedFeedId === "all"
+				? feeds.filter((feed) => feed.enabled)
+				: feeds.filter((feed) => feed.enabled && feed.id === selectedFeedId);
+			if (targets.length === 0) {
+				setLastSyncResult(null);
+				setSuccessMessage("没有可同步的启用订阅源");
+				return;
+			}
+			const aggregate: RssSyncResultApiItem = {
+				processedFeeds: 0,
+				totalFetchedItems: 0,
+				totalCreated: 0,
+				totalUpdated: 0,
+				totalSkipped: 0,
+				results: [],
+			};
+			for (const feed of targets) {
+				try {
+					const result = await syncRssFeeds({
+						feedId: feed.id,
+						feedLimit: 1,
+						itemLimit: 10,
+						translate: false,
+						translateBudget: 0,
+					});
+					aggregate.processedFeeds += result.processedFeeds;
+					aggregate.totalFetchedItems += result.totalFetchedItems;
+					aggregate.totalCreated += result.totalCreated;
+					aggregate.totalUpdated += result.totalUpdated;
+					aggregate.totalSkipped += result.totalSkipped;
+					aggregate.results.push(...result.results);
+				} catch (error) {
+					aggregate.processedFeeds += 1;
+					aggregate.results.push({
+						feedId: feed.id,
+						url: feed.url,
+						feedTitle: feed.title,
+						fetched: 0,
+						created: 0,
+						updated: 0,
+						skipped: 0,
+						errors: [readErrorMessage(error)],
+					});
+				}
+			}
+			const failedFeeds = aggregate.results.filter((item) => item.errors.length > 0).length;
+			setLastSyncResult(aggregate);
+			setSuccessMessage(
+				`同步完成：处理 ${aggregate.processedFeeds} 源，新增 ${aggregate.totalCreated}，更新 ${aggregate.totalUpdated}，失败 ${failedFeeds}`,
+			);
 			await loadFeeds();
 			await loadItems();
 		} catch (error) {
 			setErrorMessage(readErrorMessage(error));
 		} finally {
 			setIsSyncing(false);
+		}
+	};
+
+	const handleTranslateNow = async () => {
+		setIsTranslating(true);
+		setErrorMessage("");
+		setSuccessMessage("");
+		try {
+			const result = await translateRssItems({
+				feedId: selectedFeedId === "all" ? undefined : selectedFeedId,
+				limit: 20,
+			});
+			setSuccessMessage(`翻译补全完成：处理 ${result.requested} 条，成功 ${result.translated}，失败 ${result.failed}`);
+			await loadItems();
+		} catch (error) {
+			setErrorMessage(readErrorMessage(error));
+		} finally {
+			setIsTranslating(false);
 		}
 	};
 
@@ -252,6 +314,18 @@ export default function RssBlogWorkspace(props: {
 							}`}
 						>
 							{isSyncing ? "同步中..." : "立即同步"}
+						</button>
+						<button
+							type="button"
+							onClick={handleTranslateNow}
+							disabled={isTranslating}
+							className={`rounded-lg border px-3 py-2 text-xs font-medium md:text-sm ${
+								isTranslating
+									? "cursor-not-allowed border-slate-200 text-slate-300"
+									: "border-emerald-200 text-emerald-700 hover:bg-emerald-50"
+							}`}
+						>
+							{isTranslating ? "翻译中..." : "补全翻译"}
 						</button>
 					</div>
 				</div>

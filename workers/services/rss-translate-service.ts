@@ -16,7 +16,7 @@ export function getRssTranslateEnabled(env: Env): boolean {
 	const ext = env as Env & { RSS_TRANSLATE_ENABLED?: string };
 	const value = typeof ext.RSS_TRANSLATE_ENABLED === "string" ? ext.RSS_TRANSLATE_ENABLED.trim().toLowerCase() : "";
 	if (!value) {
-		return true;
+		return false;
 	}
 	return value === "1" || value === "true" || value === "yes";
 }

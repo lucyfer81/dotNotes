@@ -151,6 +151,12 @@ export type RssSyncResultApiItem = {
 		errors: string[];
 	}>;
 };
+export type RssTranslateResultApiItem = {
+	requested: number;
+	translated: number;
+	failed: number;
+	processedItemIds: string[];
+};
 
 type ListNotesOptions = {
 	limit?: number;
@@ -701,6 +707,7 @@ export async function syncRssFeeds(input: {
 	feedLimit?: number;
 	itemLimit?: number;
 	translate?: boolean;
+	translateBudget?: number;
 } = {}): Promise<RssSyncResultApiItem> {
 	const data = await requestApiData<unknown>("/api/rss/sync", {
 		method: "POST",
@@ -709,6 +716,18 @@ export async function syncRssFeeds(input: {
 	const parsed = toRssSyncResultApiItem(data);
 	if (!parsed) {
 		throw new Error("Invalid rss sync response");
+	}
+	return parsed;
+}
+
+export async function translateRssItems(input: { feedId?: string; limit?: number } = {}): Promise<RssTranslateResultApiItem> {
+	const data = await requestApiData<unknown>("/api/rss/translate", {
+		method: "POST",
+		body: JSON.stringify(input),
+	});
+	const parsed = toRssTranslateResultApiItem(data);
+	if (!parsed) {
+		throw new Error("Invalid rss translate response");
 	}
 	return parsed;
 }
@@ -1213,6 +1232,26 @@ function toRssSyncResultApiItem(value: unknown): RssSyncResultApiItem | null {
 		totalUpdated: value.totalUpdated,
 		totalSkipped: value.totalSkipped,
 		results,
+	};
+}
+
+function toRssTranslateResultApiItem(value: unknown): RssTranslateResultApiItem | null {
+	if (
+		!isRecord(value) ||
+		typeof value.requested !== "number" ||
+		typeof value.translated !== "number" ||
+		typeof value.failed !== "number"
+	) {
+		return null;
+	}
+	const processedItemIds = Array.isArray(value.processedItemIds)
+		? value.processedItemIds.filter((item): item is string => typeof item === "string")
+		: [];
+	return {
+		requested: value.requested,
+		translated: value.translated,
+		failed: value.failed,
+		processedItemIds,
 	};
 }
 

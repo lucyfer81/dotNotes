@@ -5,6 +5,7 @@ import {
 	jsonOk,
 	parseBooleanLike,
 	parseObjectBody,
+	readOptionalNumber,
 	readOptionalString,
 	readRequiredString,
 } from "./common-service";
@@ -18,7 +19,15 @@ import {
 	updateRssFeed,
 	updateRssItemStatus,
 } from "./rss-feed-service";
-import { getRssSyncFeedLimit, getRssSyncItemLimit, saveRssItemToReading, syncRssFeeds } from "./rss-digest-service";
+import {
+	getRssSyncFeedLimit,
+	getRssSyncItemLimit,
+	getRssSyncTranslateBudget,
+	getRssTranslatePassLimit,
+	saveRssItemToReading,
+	syncRssFeeds,
+	translatePendingRssItems,
+} from "./rss-digest-service";
 import type { RssItemStatus } from "./rss-types";
 
 function parseRssItemStatus(value: string | null): RssItemStatus | null {
@@ -140,17 +149,26 @@ export function registerRssRoutes(app: Hono<{ Bindings: Env }>): void {
 	app.post("/api/rss/sync", async (c) => {
 		const payload = (await parseObjectBody(c)) ?? {};
 		await ensureRssSchema(c.env.DB);
+		const inputFeedLimit = readOptionalNumber(payload, "feedLimit");
 		const feedLimit = clampInt(
-			typeof payload.feedLimit === "string" ? payload.feedLimit : undefined,
+			inputFeedLimit === null ? undefined : String(inputFeedLimit),
 			getRssSyncFeedLimit(c.env),
 			1,
 			200,
 		);
+		const inputItemLimit = readOptionalNumber(payload, "itemLimit");
 		const itemLimit = clampInt(
-			typeof payload.itemLimit === "string" ? payload.itemLimit : undefined,
+			inputItemLimit === null ? undefined : String(inputItemLimit),
 			getRssSyncItemLimit(c.env),
 			1,
 			200,
+		);
+		const inputTranslateBudget = readOptionalNumber(payload, "translateBudget");
+		const translateBudget = clampInt(
+			inputTranslateBudget === null ? undefined : String(inputTranslateBudget),
+			getRssSyncTranslateBudget(c.env),
+			0,
+			100,
 		);
 		const feedId = readOptionalString(payload, "feedId");
 		const translate = payload.translate === undefined ? undefined : parseBooleanLike(payload.translate);
@@ -159,8 +177,26 @@ export function registerRssRoutes(app: Hono<{ Bindings: Env }>): void {
 			feedLimit,
 			itemLimit,
 			translate,
+			translateBudget,
 		});
 		return jsonOk(c, synced);
+	});
+
+	app.post("/api/rss/translate", async (c) => {
+		const payload = (await parseObjectBody(c)) ?? {};
+		await ensureRssSchema(c.env.DB);
+		const inputLimit = readOptionalNumber(payload, "limit");
+		const limit = clampInt(
+			inputLimit === null ? undefined : String(inputLimit),
+			getRssTranslatePassLimit(c.env),
+			1,
+			200,
+		);
+		const translated = await translatePendingRssItems(c.env, {
+			feedId: readOptionalString(payload, "feedId"),
+			limit,
+		});
+		return jsonOk(c, translated);
 	});
 
 	app.post("/api/rss/items/:id/save", async (c) => {
