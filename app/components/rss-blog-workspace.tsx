@@ -15,13 +15,14 @@ import {
 	type RssSyncResultApiItem,
 } from "../lib/api";
 
-type BlogTab = "inbox" | "saved" | "feeds";
+type BlogTab = "inbox" | "feeds";
 
 export default function RssBlogWorkspace(props: {
 	onOpenNote: (noteId: string) => void;
 }) {
 	const { onOpenNote } = props;
 	const [tab, setTab] = useState<BlogTab>("inbox");
+	const [showSavedOnly, setShowSavedOnly] = useState(false);
 	const [feeds, setFeeds] = useState<RssFeedApiItem[]>([]);
 	const [items, setItems] = useState<RssItemApiItem[]>([]);
 	const [selectedFeedId, setSelectedFeedId] = useState<string>("all");
@@ -42,11 +43,11 @@ export default function RssBlogWorkspace(props: {
 	const [lastSyncResult, setLastSyncResult] = useState<RssSyncResultApiItem | null>(null);
 
 	const activeStatuses = useMemo<RssItemStatus[]>(() => {
-		if (tab === "saved") {
+		if (showSavedOnly) {
 			return ["saved"];
 		}
 		return ["new"];
-	}, [tab]);
+	}, [showSavedOnly]);
 
 	const selectedItem = useMemo(
 		() => items.find((item) => item.id === selectedItemId) ?? items[0] ?? null,
@@ -100,7 +101,7 @@ export default function RssBlogWorkspace(props: {
 
 	useEffect(() => {
 		void loadItems();
-	}, [tab, selectedFeedId]);
+	}, [tab, selectedFeedId, showSavedOnly]);
 
 	const handleSyncNow = async () => {
 		setIsSyncing(true);
@@ -287,10 +288,22 @@ export default function RssBlogWorkspace(props: {
 				<div className="flex flex-wrap items-center justify-between gap-2">
 					<div className="inline-flex rounded-xl border border-slate-200 bg-slate-50 p-1">
 						<TabButton label="Inbox" active={tab === "inbox"} onClick={() => setTab("inbox")} />
-						<TabButton label="Saved" active={tab === "saved"} onClick={() => setTab("saved")} />
 						<TabButton label="Feeds" active={tab === "feeds"} onClick={() => setTab("feeds")} />
 					</div>
 					<div className="flex flex-wrap items-center gap-2">
+						{tab !== "feeds" ? (
+							<button
+								type="button"
+								onClick={() => setShowSavedOnly((prev) => !prev)}
+								className={`rounded-lg border px-3 py-2 text-xs font-medium md:text-sm ${
+									showSavedOnly
+										? "border-emerald-200 bg-emerald-50 text-emerald-700"
+										: "border-slate-200 text-slate-600 hover:bg-slate-100"
+								}`}
+							>
+								{showSavedOnly ? "仅看已保存：开" : "仅看已保存"}
+							</button>
+						) : null}
 						<select
 							value={selectedFeedId}
 							onChange={(event) => setSelectedFeedId(event.target.value)}
@@ -429,47 +442,49 @@ export default function RssBlogWorkspace(props: {
 						</div>
 					</section>
 				</div>
-			) : (
-				<div className="grid min-h-0 gap-3 lg:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
-					<section className="min-h-0 rounded-2xl border border-slate-200 bg-white p-3 shadow-sm md:p-4">
-						<div className="mb-2 flex items-center justify-between">
-							<p className="text-sm font-semibold text-slate-800">
-								{tab === "saved" ? "已保存条目" : "待阅读条目"}
-							</p>
-							<span className="text-xs text-slate-500">{items.length} 条</span>
-						</div>
-						<div className="max-h-[54dvh] space-y-2 overflow-y-auto pr-1 lg:max-h-[68dvh]">
-							{isLoadingItems ? (
-								<p className="text-xs text-slate-500">加载中...</p>
-							) : items.length === 0 ? (
-								<p className="text-xs text-slate-500">暂无条目，点“立即同步”拉取最新内容。</p>
-							) : (
-								items.map((item) => {
-									const active = selectedItem?.id === item.id;
-									return (
-										<button
-											key={item.id}
-											type="button"
-											onClick={() => setSelectedItemId(item.id)}
-											className={`w-full rounded-xl border px-3 py-3 text-left ${
-												active
-													? "border-slate-900 bg-slate-900 text-white"
-													: "border-slate-200 bg-white text-slate-800 hover:bg-slate-50"
-											}`}
-										>
-											<p className="line-clamp-2 text-sm font-medium">{item.title || "（无标题）"}</p>
-											<p className={`mt-1 text-[11px] ${active ? "text-slate-200" : "text-slate-500"}`}>
-												{item.feedTitle || "未命名源"} · {formatDateTime(item.publishedAt || item.createdAt)}
-											</p>
-											<p className={`mt-1 line-clamp-2 text-xs ${active ? "text-slate-100" : "text-slate-600"}`}>
-												{item.summaryZh || item.summaryRaw || "无摘要"}
-											</p>
-										</button>
-									);
-								})
-							)}
-						</div>
-					</section>
+				) : (
+					<div className="grid min-h-0 gap-3 lg:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
+						<section className="min-h-0 rounded-2xl border border-slate-200 bg-white p-3 shadow-sm md:p-4">
+							<div className="mb-2 flex items-center justify-between">
+								<p className="text-sm font-semibold text-slate-800">
+									{showSavedOnly ? "已保存条目" : "待阅读条目"}
+								</p>
+								<span className="text-xs text-slate-500">{items.length} 条</span>
+							</div>
+							<div className="max-h-[54dvh] space-y-2 overflow-y-auto pr-1 lg:max-h-[68dvh]">
+								{isLoadingItems ? (
+									<p className="text-xs text-slate-500">加载中...</p>
+								) : items.length === 0 ? (
+									<p className="text-xs text-slate-500">
+										{showSavedOnly ? "暂无已保存条目。" : "暂无条目，点“立即同步”拉取最新内容。"}
+									</p>
+								) : (
+									items.map((item) => {
+										const active = selectedItem?.id === item.id;
+										return (
+											<button
+												key={item.id}
+												type="button"
+												onClick={() => setSelectedItemId(item.id)}
+												className={`w-full rounded-xl border px-3 py-3 text-left ${
+													active
+														? "border-slate-900 bg-slate-900 text-white"
+														: "border-slate-200 bg-white text-slate-800 hover:bg-slate-50"
+												}`}
+											>
+												<p className="line-clamp-2 text-sm font-medium">{item.title || "（无标题）"}</p>
+												<p className={`mt-1 text-[11px] ${active ? "text-slate-200" : "text-slate-500"}`}>
+													{item.feedTitle || "未命名源"} · {formatDateTime(item.publishedAt || item.createdAt)}
+												</p>
+												<p className={`mt-1 line-clamp-2 text-xs ${active ? "text-slate-100" : "text-slate-600"}`}>
+													{item.summaryZh || item.summaryRaw || "无摘要"}
+												</p>
+											</button>
+										);
+									})
+								)}
+							</div>
+						</section>
 
 					<section className="min-h-0 rounded-2xl border border-slate-200 bg-white p-3 shadow-sm md:p-4">
 						{selectedItem ? (
@@ -506,7 +521,7 @@ export default function RssBlogWorkspace(props: {
 										>
 											{savingItemId === selectedItem.id ? "处理中..." : selectedItem.noteId ? "打开 Reading 笔记" : "保存到 Reading"}
 										</button>
-										{tab === "inbox" ? (
+										{selectedItem.status === "new" ? (
 											<button
 												type="button"
 												onClick={() => handleSetItemStatus(selectedItem, "ignored")}
@@ -520,7 +535,7 @@ export default function RssBlogWorkspace(props: {
 												忽略
 											</button>
 										) : null}
-										{tab === "saved" ? (
+										{selectedItem.status === "saved" ? (
 											<button
 												type="button"
 												onClick={() => handleSetItemStatus(selectedItem, "new")}
