@@ -1,6 +1,15 @@
+import { NodeHtmlMarkdown } from "node-html-markdown";
 import type { ParsedRssFeed, ParsedRssItem } from "./rss-types";
 
 const DEFAULT_RSS_FETCH_TIMEOUT_MS = 20_000;
+const summaryMarkdownConverter = new NodeHtmlMarkdown({
+	bulletMarker: "-",
+	emDelimiter: "*",
+	strongDelimiter: "**",
+	codeBlockStyle: "fenced",
+	maxConsecutiveNewlines: 2,
+	preferNativeParser: false,
+});
 
 export function getRssFetchTimeoutMs(env: Env): number {
 	const ext = env as Env & { RSS_FETCH_TIMEOUT_MS?: string };
@@ -77,10 +86,10 @@ function parseRssItemBlock(block: string): ParsedRssItem {
 		extractTagValue(block, "published") ||
 		extractTagValue(block, "updated"),
 	);
-	const summary = normalizeText(
-		extractTagValue(block, "description") ||
-		extractTagValue(block, "content:encoded") ||
-		extractTagValue(block, "summary"),
+	const summary = normalizeSummaryMarkdown(
+		extractTagValueRaw(block, "description") ||
+		extractTagValueRaw(block, "content:encoded") ||
+		extractTagValueRaw(block, "summary"),
 	);
 	return {
 		sourceId,
@@ -113,9 +122,9 @@ function parseAtomEntryBlock(block: string): ParsedRssItem {
 		extractTagValue(block, "published") ||
 		extractTagValue(block, "updated"),
 	);
-	const summary = normalizeText(
-		extractTagValue(block, "summary") ||
-		extractTagValue(block, "content"),
+	const summary = normalizeSummaryMarkdown(
+		extractTagValueRaw(block, "summary") ||
+		extractTagValueRaw(block, "content"),
 	);
 	return {
 		sourceId,
@@ -151,13 +160,17 @@ function collectBlocks(xml: string, tag: string): string[] {
 }
 
 function extractTagValue(xml: string, tag: string): string {
+	return stripHtmlTags(extractTagValueRaw(xml, tag));
+}
+
+function extractTagValueRaw(xml: string, tag: string): string {
 	const escaped = escapeRegex(tag);
 	const regex = new RegExp(`<${escaped}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${escaped}>`, "i");
 	const matched = regex.exec(xml);
 	if (!matched || !matched[1]) {
 		return "";
 	}
-	return decodeXmlEntities(stripHtmlTags(matched[1]));
+	return decodeXmlEntities(unwrapCdata(matched[1]));
 }
 
 function extractAtomLink(entryXml: string): string | null {
@@ -221,10 +234,30 @@ function normalizeText(value: string | null | undefined): string {
 
 function stripHtmlTags(value: string): string {
 	return value
-		.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/gi, "$1")
 		.replace(/<script[\s\S]*?<\/script>/gi, " ")
 		.replace(/<style[\s\S]*?<\/style>/gi, " ")
 		.replace(/<[^>]+>/g, " ");
+}
+
+function unwrapCdata(value: string): string {
+	return value.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/gi, "$1");
+}
+
+function normalizeSummaryMarkdown(value: string): string {
+	const source = value.trim();
+	if (!source) {
+		return "";
+	}
+	const markdown = summaryMarkdownConverter.translate(source.replace(/\r\n?/g, "\n"));
+	const text = markdown
+		.replace(/[ \t]+\n/g, "\n")
+		.replace(/\n[ \t]+/g, "\n")
+		.replace(/\n{3,}/g, "\n\n");
+
+	const lines = text
+		.split("\n")
+		.map((line) => line.trimEnd());
+	return lines.join("\n").trim();
 }
 
 function decodeXmlEntities(value: string): string {

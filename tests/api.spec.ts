@@ -734,6 +734,66 @@ describe("rss api", () => {
 			globalThis.fetch = originalFetch;
 		}
 	});
+
+	it("converts html summary into markdown format", async () => {
+		const feedUrl = "https://example.com/html-feed.xml";
+		const feedXml = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>HTML Feed</title>
+    <item>
+      <guid>html-001</guid>
+      <link>https://example.com/posts/html-1</link>
+      <title>HTML summary item</title>
+      <description>&lt;p&gt;Hello &lt;strong&gt;world&lt;/strong&gt;, read &lt;a href=&quot;https://example.com/post&quot;&gt;this post&lt;/a&gt;.&lt;/p&gt;&lt;ul&gt;&lt;li&gt;One&lt;/li&gt;&lt;li&gt;Two&lt;/li&gt;&lt;/ul&gt;</description>
+      <pubDate>Wed, 05 Mar 2025 10:00:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>`;
+
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = vi.fn(async (input) => {
+			const url = typeof input === "string" ? input : input instanceof Request ? input.url : "";
+			if (url === feedUrl) {
+				return new Response(feedXml, {
+					status: 200,
+					headers: { "Content-Type": "application/rss+xml; charset=utf-8" },
+				});
+			}
+			return new Response("not found", { status: 404 });
+		}) as typeof fetch;
+
+		try {
+			const createdFeed = await readEnvelope<{ id: string; url: string }>(await api("/api/rss/feeds", {
+				method: "POST",
+				body: JSON.stringify({
+					url: feedUrl,
+				}),
+			}));
+
+			await readEnvelope(await api("/api/rss/sync", {
+				method: "POST",
+				body: JSON.stringify({
+					feedId: createdFeed.data.id,
+					translate: false,
+				}),
+			}));
+
+			const itemList = await readEnvelope<{ items: Array<{ summaryRaw: string }> }>(
+				await api(`/api/rss/items?feedId=${encodeURIComponent(createdFeed.data.id)}&status=new`),
+			);
+			expect(itemList.data.items.length).toBe(1);
+			const summaryRaw = itemList.data.items[0]?.summaryRaw ?? "";
+			expect(summaryRaw).toContain("**world**");
+			expect(summaryRaw).toContain("[this post](https://example.com/post)");
+			expect(summaryRaw).toContain("- One");
+			expect(summaryRaw).toContain("- Two");
+			expect(summaryRaw).not.toContain("<strong>");
+			expect(summaryRaw).not.toContain("<a ");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
 });
 
 async function createNote(input: {
