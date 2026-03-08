@@ -32,7 +32,18 @@
 		"RSS_SYNC_ITEM_LIMIT": "10",
 		"RSS_TRANSLATE_ENABLED": "false",
 		"RSS_SYNC_TRANSLATE_BUDGET": "3",
-		"RSS_TRANSLATE_BATCH_LIMIT": "30"
+		"RSS_TRANSLATE_BATCH_LIMIT": "30",
+		"RSS_CRON_ENABLED": "true",
+		"RSS_CRON_AUTO_TRANSLATE": "true",
+		"RSS_CRON_SYNC_FEED_LIMIT": "20",
+		"RSS_CRON_SYNC_ITEM_LIMIT": "10",
+		"RSS_CRON_TRANSLATE_LIMIT": "20",
+		"RSS_CRON_TRANSLATE_ROUNDS": "2"
+	},
+	"triggers": {
+		"crons": [
+			"5 */4 * * *"
+		]
 	},
 	"d1_databases": [
 		{
