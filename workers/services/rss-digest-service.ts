@@ -10,21 +10,33 @@ import { resolveBodyStorageForCreate, sha256Hex } from "./note-storage-service";
 import { enqueueNoteIndexJob } from "./index-core-service";
 import {
 	bindRssItemToNote,
+	claimRssItemReadingJob,
 	ensureRssSchema,
 	findRssItemByDedupeKey,
 	getRssItemById,
 	listFeedsForSync,
+	listRssItemsQueuedForReading,
 	listRssItemsPendingTranslation,
+	markRssItemReadingFailed,
+	markRssItemReadingReady,
 	markRssFeedSyncFailure,
 	markRssFeedSyncSuccess,
+	queueRssItemForReading,
 	updateRssItemSummaryZh,
 	upsertRssFeedTitle,
 	upsertRssItem,
 } from "./rss-feed-service";
 import { fetchAndParseRssFeed } from "./rss-fetch-service";
-import { getRssTranslateEnabled, translateSummaryToChinese } from "./rss-translate-service";
+import { fetchRssArticleMarkdown } from "./rss-reading-fetch-service";
+import {
+	getRssTranslateEnabled,
+	translateLongTextToChineseStrict,
+	translateSummaryToChinese,
+	translateTextToChineseStrict,
+} from "./rss-translate-service";
 import type {
 	RssItemRow,
+	RssReadingQueueResult,
 	RssSyncFeedResult,
 	RssSyncResult,
 	RssTranslateResult,
@@ -34,6 +46,7 @@ const DEFAULT_RSS_SYNC_FEED_LIMIT = 3;
 const DEFAULT_RSS_SYNC_ITEM_LIMIT = 10;
 const DEFAULT_RSS_SYNC_TRANSLATE_BUDGET = 3;
 const DEFAULT_RSS_TRANSLATE_PASS_LIMIT = 30;
+const DEFAULT_RSS_READING_PROCESS_LIMIT = 3;
 const READING_PARENT_FOLDER_ID = "folder-20-areas";
 const READING_FOLDER_SLUG = "reading";
 const READING_FOLDER_NAME = "Reading";
@@ -73,6 +86,15 @@ export function getRssTranslatePassLimit(env: Env): number {
 		return Math.trunc(parsed);
 	}
 	return DEFAULT_RSS_TRANSLATE_PASS_LIMIT;
+}
+
+export function getRssReadingProcessLimit(env: Env): number {
+	const ext = env as Env & { RSS_READING_PROCESS_LIMIT?: string };
+	const parsed = Number(ext.RSS_READING_PROCESS_LIMIT);
+	if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 100) {
+		return Math.trunc(parsed);
+	}
+	return DEFAULT_RSS_READING_PROCESS_LIMIT;
 }
 
 export async function syncRssFeeds(
@@ -183,31 +205,108 @@ export async function translatePendingRssItems(
 	return translateRssItems(env, candidates, limit);
 }
 
-export async function saveRssItemToReading(env: Env, itemId: string): Promise<{ item: RssItemRow; noteId: string; created: boolean }> {
+export async function saveRssItemToReading(env: Env, itemId: string): Promise<RssReadingQueueResult> {
 	await ensureRssSchema(env.DB);
+	return queueRssItemForReading(env.DB, itemId);
+}
+
+export async function processQueuedRssReadingItems(
+	env: Env,
+	input: { limit?: number; itemId?: string | null } = {},
+): Promise<{ processed: number; created: number; failed: number; skipped: number; itemIds: string[] }> {
+	await ensureRssSchema(env.DB);
+	const limit = input.limit ?? getRssReadingProcessLimit(env);
+	const candidates = await listRssItemsQueuedForReading(env.DB, {
+		limit,
+		itemId: input.itemId ?? null,
+	});
+	let created = 0;
+	let failed = 0;
+	let skipped = 0;
+	const itemIds: string[] = [];
+	for (const candidate of candidates) {
+		itemIds.push(candidate.id);
+		try {
+			const outcome = await processSingleQueuedRssReadingItem(env, candidate.id);
+			if (outcome === "created") {
+				created += 1;
+			} else {
+				skipped += 1;
+			}
+		} catch (error) {
+			console.error("Process RSS reading queue item failed", { itemId: candidate.id, error });
+			failed += 1;
+		}
+	}
+	return {
+		processed: candidates.length,
+		created,
+		failed,
+		skipped,
+		itemIds,
+	};
+}
+
+async function processSingleQueuedRssReadingItem(env: Env, itemId: string): Promise<"created" | "skipped"> {
+	const claimed = await claimRssItemReadingJob(env.DB, itemId);
+	if (!claimed) {
+		return "skipped";
+	}
 	const item = await getRssItemById(env.DB, itemId);
 	if (!item) {
-		throw new Error("RSS item not found");
+		await markRssItemReadingFailed(env.DB, itemId, "RSS item not found");
+		return "skipped";
 	}
 	if (item.noteId) {
-		return {
-			item,
-			noteId: item.noteId,
-			created: false,
-		};
+		await markRssItemReadingReady(env.DB, item.id);
+		return "skipped";
 	}
+	if (!item.link || item.link.trim().length === 0) {
+		await markRssItemReadingFailed(env.DB, item.id, "RSS item link is empty");
+		return "skipped";
+	}
+	try {
+		const article = await fetchRssArticleMarkdown(env, item.link);
+		const translatedBody = await translateLongTextToChineseStrict(env, article.markdown, {
+			label: `rss:reading-body:${item.id}`,
+		});
+		const translatedTitle = item.title
+			? await translateTextToChineseStrict(env, item.title, {
+				maxChars: 300,
+				label: `rss:reading-title:${item.id}`,
+				preserveMarkdown: false,
+			}).catch(() => "")
+			: "";
+		const bodyText = buildReadingNoteBodyFromArticle(item, translatedBody, article.source);
+		const noteTitle = translatedTitle.trim() || buildTitle(translatedBody) || "RSS Reading";
+		const noteId = await createReadingNote(env, {
+			item,
+			title: noteTitle,
+			bodyText,
+		});
+		await bindRssItemToNote(env.DB, item.id, { noteId, status: "saved" });
+		await enqueueNoteIndexJob(env.DB, noteId, "upsert");
+		return "created";
+	} catch (error) {
+		await markRssItemReadingFailed(env.DB, item.id, String(error));
+		throw error;
+	}
+}
 
+async function createReadingNote(
+	env: Env,
+	input: { item: RssItemRow; title: string; bodyText: string },
+): Promise<string> {
 	const folderId = await ensureReadingFolder(env.DB);
-	const bodyText = buildReadingNoteBody(item);
 	const noteId = crypto.randomUUID();
-	const slug = await ensureUniqueSlug(env.DB, slugify(item.title || buildTitle(bodyText)));
+	const slug = await ensureUniqueSlug(env.DB, slugify(input.title || buildTitle(input.bodyText)));
 	const resolvedBody = await resolveBodyStorageForCreate(env, {
 		noteId,
 		requestedStorageType: "d1",
-		bodyText,
+		bodyText: input.bodyText,
 		bodyR2Key: null,
 	});
-	const title = item.title || buildTitle(bodyText) || "RSS Reading";
+	const excerpt = buildExcerpt(resolvedBody.plainBodyText);
 	await env.DB.prepare(
 		`INSERT INTO notes (
 			id, slug, title, folder_id, storage_type, body_text, body_r2_key, excerpt, size_bytes, word_count, is_pinned, is_archived
@@ -216,28 +315,18 @@ export async function saveRssItemToReading(env: Env, itemId: string): Promise<{ 
 		.bind(
 			noteId,
 			slug,
-			title,
+			input.title,
 			folderId,
 			resolvedBody.storageType,
 			resolvedBody.bodyText,
 			resolvedBody.bodyR2Key,
-			buildExcerpt(resolvedBody.plainBodyText),
+			excerpt,
 			resolvedBody.sizeBytes,
 			resolvedBody.wordCount,
 		)
 		.run();
-	await syncNoteFtsContent(env.DB, noteId, title, buildExcerpt(resolvedBody.plainBodyText), resolvedBody.plainBodyText);
-	await bindRssItemToNote(env.DB, item.id, { noteId, status: "saved" });
-	await enqueueNoteIndexJob(env.DB, noteId, "upsert");
-	return {
-		item: {
-			...item,
-			noteId,
-			status: "saved",
-		},
-		noteId,
-		created: true,
-	};
+	await syncNoteFtsContent(env.DB, noteId, input.title, excerpt, resolvedBody.plainBodyText);
+	return noteId;
 }
 
 async function ensureReadingFolder(db: D1Database): Promise<string> {
@@ -313,8 +402,15 @@ async function translateRssItems(
 	};
 }
 
-function buildReadingNoteBody(item: RssItemRow): string {
+function buildReadingNoteBodyFromArticle(
+	item: RssItemRow,
+	translatedBody: string,
+	contentSource: "browser-rendering" | "direct-fetch",
+): string {
 	const lines: string[] = [];
+	lines.push("## 全文（中文）");
+	lines.push(translatedBody.trim());
+	lines.push("");
 	if (item.link) {
 		lines.push(`Source: ${item.link}`);
 	}
@@ -330,18 +426,7 @@ function buildReadingNoteBody(item: RssItemRow): string {
 	if (lines.length > 0) {
 		lines.push("");
 	}
-	const zh = (item.summaryZh ?? "").trim();
-	if (zh) {
-		lines.push("## Summary (ZH)");
-		lines.push(zh);
-		lines.push("");
-	}
-	const raw = item.summaryRaw.trim();
-	if (raw) {
-		lines.push("## Summary (Raw)");
-		lines.push(raw);
-		lines.push("");
-	}
+	lines.push(`Extractor: ${contentSource}`);
 	lines.push("#rss");
 	return lines.join("\n").trim();
 }

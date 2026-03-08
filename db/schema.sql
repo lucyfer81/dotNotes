@@ -182,6 +182,12 @@ CREATE TABLE IF NOT EXISTS rss_items (
 	summary_zh TEXT,
 	status TEXT NOT NULL DEFAULT 'new' CHECK (status IN ('new', 'saved', 'ignored')),
 	note_id TEXT REFERENCES notes(id) ON DELETE SET NULL,
+	reading_state TEXT NOT NULL DEFAULT 'idle' CHECK (reading_state IN ('idle', 'queued', 'processing', 'ready', 'failed')),
+	reading_error TEXT,
+	reading_attempt_count INTEGER NOT NULL DEFAULT 0,
+	reading_requested_at TEXT,
+	reading_started_at TEXT,
+	reading_completed_at TEXT,
 	fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -211,6 +217,8 @@ CREATE INDEX IF NOT EXISTS idx_rss_items_feed_published
 	ON rss_items(feed_id, published_at DESC, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_rss_items_status_updated
 	ON rss_items(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_rss_items_reading_queue
+	ON rss_items(reading_state, reading_requested_at, updated_at);
 
 CREATE TRIGGER IF NOT EXISTS trg_folders_updated_at
 AFTER UPDATE ON folders

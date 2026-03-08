@@ -106,6 +106,7 @@ export type AiEnhanceTaskStreamProgress = {
 	stage: AiEnhanceTaskStreamStage;
 };
 export type RssItemStatus = "new" | "saved" | "ignored";
+export type RssReadingState = "idle" | "queued" | "processing" | "ready" | "failed";
 export type RssFeedApiItem = {
 	id: string;
 	url: string;
@@ -130,6 +131,12 @@ export type RssItemApiItem = {
 	summaryZh: string | null;
 	status: RssItemStatus;
 	noteId: string | null;
+	readingState: RssReadingState;
+	readingError: string | null;
+	readingAttemptCount: number;
+	readingRequestedAt: string | null;
+	readingStartedAt: string | null;
+	readingCompletedAt: string | null;
 	fetchedAt: string;
 	createdAt: string;
 	updatedAt: string;
@@ -732,17 +739,30 @@ export async function translateRssItems(input: { feedId?: string; limit?: number
 	return parsed;
 }
 
-export async function saveRssItemToReading(itemId: string): Promise<{ noteId: string; created: boolean; item: RssItemApiItem | null }> {
+export async function saveRssItemToReading(itemId: string): Promise<{
+	noteId: string | null;
+	created: boolean;
+	queued: boolean;
+	item: RssItemApiItem;
+}> {
 	const data = await requestApiData<unknown>(`/api/rss/items/${encodeURIComponent(itemId)}/save`, {
 		method: "POST",
 	});
-	if (!isRecord(data) || typeof data.noteId !== "string" || typeof data.created !== "boolean") {
+	const item = toRssItemApiItem(isRecord(data) ? data.item : null);
+	if (
+		!isRecord(data) ||
+		(typeof data.noteId !== "string" && data.noteId !== null) ||
+		typeof data.created !== "boolean" ||
+		typeof data.queued !== "boolean" ||
+		!item
+	) {
 		throw new Error("Invalid rss save response");
 	}
 	return {
 		noteId: data.noteId,
 		created: data.created,
-		item: toRssItemApiItem(data.item ?? null),
+		queued: data.queued,
+		item,
 	};
 }
 
@@ -1154,12 +1174,22 @@ function toRssItemApiItem(value: unknown): RssItemApiItem | null {
 		(typeof value.author !== "string" && value.author !== null) ||
 		(typeof value.publishedAt !== "string" && value.publishedAt !== null) ||
 		typeof value.summaryRaw !== "string" ||
-		(typeof value.summaryZh !== "string" && value.summaryZh !== null) ||
-		(status !== "new" && status !== "saved" && status !== "ignored") ||
-		(typeof value.noteId !== "string" && value.noteId !== null) ||
-		typeof value.fetchedAt !== "string" ||
-		typeof value.createdAt !== "string" ||
-		typeof value.updatedAt !== "string"
+			(typeof value.summaryZh !== "string" && value.summaryZh !== null) ||
+			(status !== "new" && status !== "saved" && status !== "ignored") ||
+			(typeof value.noteId !== "string" && value.noteId !== null) ||
+			(value.readingState !== "idle" &&
+				value.readingState !== "queued" &&
+				value.readingState !== "processing" &&
+				value.readingState !== "ready" &&
+				value.readingState !== "failed") ||
+			(typeof value.readingError !== "string" && value.readingError !== null) ||
+			typeof value.readingAttemptCount !== "number" ||
+			(typeof value.readingRequestedAt !== "string" && value.readingRequestedAt !== null) ||
+			(typeof value.readingStartedAt !== "string" && value.readingStartedAt !== null) ||
+			(typeof value.readingCompletedAt !== "string" && value.readingCompletedAt !== null) ||
+			typeof value.fetchedAt !== "string" ||
+			typeof value.createdAt !== "string" ||
+			typeof value.updatedAt !== "string"
 	) {
 		return null;
 	}
@@ -1174,12 +1204,18 @@ function toRssItemApiItem(value: unknown): RssItemApiItem | null {
 		author: value.author,
 		publishedAt: value.publishedAt,
 		summaryRaw: value.summaryRaw,
-		summaryZh: value.summaryZh,
-		status,
-		noteId: value.noteId,
-		fetchedAt: value.fetchedAt,
-		createdAt: value.createdAt,
-		updatedAt: value.updatedAt,
+			summaryZh: value.summaryZh,
+			status,
+			noteId: value.noteId,
+			readingState: value.readingState,
+			readingError: value.readingError,
+			readingAttemptCount: value.readingAttemptCount,
+			readingRequestedAt: value.readingRequestedAt,
+			readingStartedAt: value.readingStartedAt,
+			readingCompletedAt: value.readingCompletedAt,
+			fetchedAt: value.fetchedAt,
+			createdAt: value.createdAt,
+			updatedAt: value.updatedAt,
 	};
 }
 

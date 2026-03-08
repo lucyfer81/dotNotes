@@ -23,6 +23,7 @@ import {
 	getRssSyncFeedLimit,
 	getRssSyncItemLimit,
 	getRssSyncTranslateBudget,
+	processQueuedRssReadingItems,
 	getRssTranslatePassLimit,
 	saveRssItemToReading,
 	syncRssFeeds,
@@ -203,8 +204,15 @@ export function registerRssRoutes(app: Hono<{ Bindings: Env }>): void {
 		const itemId = c.req.param("id");
 		await ensureRssSchema(c.env.DB);
 		try {
-			const saved = await saveRssItemToReading(c.env, itemId);
-			return jsonOk(c, saved);
+			const queued = await saveRssItemToReading(c.env, itemId);
+			if (queued.noteId === null && queued.item.readingState === "queued") {
+				c.executionCtx?.waitUntil?.(
+					processQueuedRssReadingItems(c.env, { limit: 1, itemId }).catch((error) => {
+						console.error("Process queued rss reading item failed", { itemId, error });
+					}),
+				);
+			}
+			return jsonOk(c, queued);
 		} catch (error) {
 			const message = String(error);
 			if (message.includes("not found")) {
@@ -213,5 +221,23 @@ export function registerRssRoutes(app: Hono<{ Bindings: Env }>): void {
 			console.error("Save rss item failed", error);
 			return jsonError(c, 500, "Failed to save rss item");
 		}
+	});
+
+	app.post("/api/rss/reading/process", async (c) => {
+		await ensureRssSchema(c.env.DB);
+		const payload = (await parseObjectBody(c)) ?? {};
+		const limitInput = readOptionalNumber(payload, "limit");
+		const limit = clampInt(
+			limitInput === null ? undefined : String(limitInput),
+			3,
+			1,
+			100,
+		);
+		const itemId = readOptionalString(payload, "itemId");
+		const result = await processQueuedRssReadingItems(c.env, {
+			limit,
+			itemId,
+		});
+		return jsonOk(c, result);
 	});
 }

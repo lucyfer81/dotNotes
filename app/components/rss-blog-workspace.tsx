@@ -103,6 +103,20 @@ export default function RssBlogWorkspace(props: {
 		void loadItems();
 	}, [tab, selectedFeedId, showSavedOnly]);
 
+	useEffect(() => {
+		if (tab === "feeds") {
+			return;
+		}
+		const hasPendingReading = items.some((item) => item.readingState === "queued" || item.readingState === "processing");
+		if (!hasPendingReading) {
+			return;
+		}
+		const timer = window.setInterval(() => {
+			void loadItems();
+		}, 10_000);
+		return () => window.clearInterval(timer);
+	}, [items, tab, selectedFeedId, showSavedOnly]);
+
 	const handleSyncNow = async () => {
 		setIsSyncing(true);
 		setErrorMessage("");
@@ -255,12 +269,22 @@ export default function RssBlogWorkspace(props: {
 			onOpenNote(item.noteId);
 			return;
 		}
+		if (item.readingState === "queued" || item.readingState === "processing") {
+			setSuccessMessage("该条目正在后台处理中，请稍后刷新。");
+			return;
+		}
 		setSavingItemId(item.id);
 		setErrorMessage("");
 		setSuccessMessage("");
 		try {
 			const saved = await saveRssItemToReading(item.id);
-			setSuccessMessage(saved.created ? "已保存到 Reading" : "已关联到 Reading");
+			if (saved.noteId) {
+				setSuccessMessage(saved.created ? "已保存到 Reading" : "已关联到 Reading");
+			} else if (saved.queued) {
+				setSuccessMessage("已加入 Reading 后台处理队列");
+			} else {
+				setSuccessMessage("条目状态已更新");
+			}
 			await loadItems();
 		} catch (error) {
 			setErrorMessage(readErrorMessage(error));
@@ -476,6 +500,11 @@ export default function RssBlogWorkspace(props: {
 												<p className={`mt-1 text-[11px] ${active ? "text-slate-200" : "text-slate-500"}`}>
 													{item.feedTitle || "未命名源"} · {formatDateTime(item.publishedAt || item.createdAt)}
 												</p>
+												{item.readingState !== "idle" ? (
+													<p className={`mt-1 text-[11px] ${active ? "text-slate-300" : "text-slate-500"}`}>
+														Reading：{formatReadingState(item)}
+													</p>
+												) : null}
 												<p className={`mt-1 line-clamp-2 text-xs ${active ? "text-slate-100" : "text-slate-600"}`}>
 													{item.summaryZh || item.summaryRaw || "无摘要"}
 												</p>
@@ -507,20 +536,32 @@ export default function RssBlogWorkspace(props: {
 												打开原文
 											</a>
 										) : null}
-										<button
-											type="button"
-											onClick={() => handleSaveItem(selectedItem)}
-											disabled={savingItemId === selectedItem.id}
-											className={`rounded-lg border px-3 py-2 text-xs font-medium md:text-sm ${
-												savingItemId === selectedItem.id
-													? "cursor-not-allowed border-slate-200 text-slate-300"
+											<button
+												type="button"
+												onClick={() => handleSaveItem(selectedItem)}
+												disabled={
+													savingItemId === selectedItem.id
+													|| selectedItem.readingState === "queued"
+													|| selectedItem.readingState === "processing"
+												}
+												className={`rounded-lg border px-3 py-2 text-xs font-medium md:text-sm ${
+													savingItemId === selectedItem.id
+														? "cursor-not-allowed border-slate-200 text-slate-300"
+														: selectedItem.noteId
+															? "border-emerald-200 text-emerald-700 hover:bg-emerald-50"
+															: selectedItem.readingState === "failed"
+																? "border-amber-200 text-amber-700 hover:bg-amber-50"
+																: selectedItem.readingState === "queued" || selectedItem.readingState === "processing"
+																	? "cursor-not-allowed border-slate-200 text-slate-400"
+															: "border-sky-200 text-sky-700 hover:bg-sky-50"
+												}`}
+											>
+												{savingItemId === selectedItem.id
+													? "处理中..."
 													: selectedItem.noteId
-														? "border-emerald-200 text-emerald-700 hover:bg-emerald-50"
-														: "border-sky-200 text-sky-700 hover:bg-sky-50"
-											}`}
-										>
-											{savingItemId === selectedItem.id ? "处理中..." : selectedItem.noteId ? "打开 Reading 笔记" : "保存到 Reading"}
-										</button>
+														? "打开 Reading 笔记"
+														: getReadingActionLabel(selectedItem)}
+											</button>
 										{selectedItem.status === "new" ? (
 											<button
 												type="button"
@@ -551,9 +592,22 @@ export default function RssBlogWorkspace(props: {
 										) : null}
 									</div>
 								</div>
-								<div className="min-h-0 flex-1 space-y-3 overflow-y-auto rounded-xl border border-slate-200 bg-slate-50 p-3">
-									{selectedItem.summaryZh ? (
-										<div>
+									<div className="min-h-0 flex-1 space-y-3 overflow-y-auto rounded-xl border border-slate-200 bg-slate-50 p-3">
+										{selectedItem.noteId ? (
+											<p className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-700">
+												已生成 Reading 中文笔记
+											</p>
+										) : selectedItem.readingState === "queued" || selectedItem.readingState === "processing" ? (
+											<p className="rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-700">
+												正在后台抓取全文并翻译中文，请稍后刷新。
+											</p>
+										) : selectedItem.readingState === "failed" ? (
+											<p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+												处理失败：{selectedItem.readingError || "未知错误"}（可点击“重试生成 Reading”）
+											</p>
+										) : null}
+										{selectedItem.summaryZh ? (
+											<div>
 											<p className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-500">摘要（中文）</p>
 											<p className="whitespace-pre-wrap text-sm leading-6 text-slate-800">{selectedItem.summaryZh}</p>
 										</div>
@@ -605,6 +659,32 @@ function formatDateTime(value: string): string {
 	const hours = String(parsed.getHours()).padStart(2, "0");
 	const minutes = String(parsed.getMinutes()).padStart(2, "0");
 	return `${month}月${day}日 ${hours}:${minutes}`;
+}
+
+function getReadingActionLabel(item: RssItemApiItem): string {
+	if (item.readingState === "failed") {
+		return "重试生成 Reading";
+	}
+	if (item.readingState === "queued" || item.readingState === "processing") {
+		return "Reading 处理中...";
+	}
+	return "保存到 Reading";
+}
+
+function formatReadingState(item: RssItemApiItem): string {
+	if (item.noteId || item.readingState === "ready") {
+		return "已完成";
+	}
+	if (item.readingState === "queued") {
+		return "排队中";
+	}
+	if (item.readingState === "processing") {
+		return "处理中";
+	}
+	if (item.readingState === "failed") {
+		return "失败";
+	}
+	return "未开始";
 }
 
 function readErrorMessage(error: unknown): string {

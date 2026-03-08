@@ -1,5 +1,5 @@
 import { clampInt } from "./common-service";
-import { syncRssFeeds, translatePendingRssItems } from "./rss-digest-service";
+import { processQueuedRssReadingItems, syncRssFeeds, translatePendingRssItems } from "./rss-digest-service";
 
 const DEFAULT_RSS_CRON_ENABLED = true;
 const DEFAULT_RSS_CRON_AUTO_TRANSLATE = true;
@@ -69,6 +69,9 @@ export async function runRssCronJob(event: ScheduledController, env: Env): Promi
 	const translateRounds = getRssCronTranslateRounds(env);
 
 	try {
+		const readingResult = await processQueuedRssReadingItems(env, {
+			limit: Math.max(2, Math.min(syncFeedLimit, 20)),
+		});
 		const syncResult = await syncRssFeeds(env, {
 			feedLimit: syncFeedLimit,
 			itemLimit: syncItemLimit,
@@ -110,12 +113,16 @@ export async function runRssCronJob(event: ScheduledController, env: Env): Promi
 			totalCreated: syncResult.totalCreated,
 			totalUpdated: syncResult.totalUpdated,
 			totalSkipped: syncResult.totalSkipped,
-			translateRequested,
-			translateSuccess,
-			translateFailed,
-			completedRounds,
-			totalMs: Date.now() - startedAt,
-		});
+				translateRequested,
+				translateSuccess,
+				translateFailed,
+				completedRounds,
+				readingProcessed: readingResult.processed,
+				readingCreated: readingResult.created,
+				readingFailed: readingResult.failed,
+				readingSkipped: readingResult.skipped,
+				totalMs: Date.now() - startedAt,
+			});
 	} catch (error) {
 		console.error("RSS cron failed", {
 			cron: event.cron,

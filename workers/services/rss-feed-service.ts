@@ -2,11 +2,13 @@ import { clampInt, parseCsv } from "./common-service";
 import type {
 	RssFeedRow,
 	RssItemRow,
+	RssReadingQueueResult,
 	RssItemStatus,
 } from "./rss-types";
 
 const DEFAULT_RSS_FEED_LIMIT = 20;
 const DEFAULT_RSS_ITEM_LIMIT = 50;
+const DEFAULT_RSS_READING_QUEUE_LIMIT = 20;
 
 export async function ensureRssSchema(db: D1Database): Promise<void> {
 	await db.prepare(
@@ -32,15 +34,30 @@ export async function ensureRssSchema(db: D1Database): Promise<void> {
 			author TEXT,
 			published_at TEXT,
 			summary_raw TEXT NOT NULL DEFAULT '',
-			summary_zh TEXT,
-			status TEXT NOT NULL DEFAULT 'new' CHECK (status IN ('new', 'saved', 'ignored')),
-			note_id TEXT REFERENCES notes(id) ON DELETE SET NULL,
-			fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			UNIQUE(feed_id, dedupe_key)
-		)`,
+				summary_zh TEXT,
+				status TEXT NOT NULL DEFAULT 'new' CHECK (status IN ('new', 'saved', 'ignored')),
+				note_id TEXT REFERENCES notes(id) ON DELETE SET NULL,
+				reading_state TEXT NOT NULL DEFAULT 'idle' CHECK (reading_state IN ('idle', 'queued', 'processing', 'ready', 'failed')),
+				reading_error TEXT,
+				reading_attempt_count INTEGER NOT NULL DEFAULT 0,
+				reading_requested_at TEXT,
+				reading_started_at TEXT,
+				reading_completed_at TEXT,
+				fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				UNIQUE(feed_id, dedupe_key)
+			)`,
 	).run();
+	await addColumnIfMissing(
+		db,
+		"ALTER TABLE rss_items ADD COLUMN reading_state TEXT NOT NULL DEFAULT 'idle' CHECK (reading_state IN ('idle', 'queued', 'processing', 'ready', 'failed'))",
+	);
+	await addColumnIfMissing(db, "ALTER TABLE rss_items ADD COLUMN reading_error TEXT");
+	await addColumnIfMissing(db, "ALTER TABLE rss_items ADD COLUMN reading_attempt_count INTEGER NOT NULL DEFAULT 0");
+	await addColumnIfMissing(db, "ALTER TABLE rss_items ADD COLUMN reading_requested_at TEXT");
+	await addColumnIfMissing(db, "ALTER TABLE rss_items ADD COLUMN reading_started_at TEXT");
+	await addColumnIfMissing(db, "ALTER TABLE rss_items ADD COLUMN reading_completed_at TEXT");
 	await db.prepare(
 		"CREATE INDEX IF NOT EXISTS idx_rss_feeds_enabled_updated ON rss_feeds(enabled, updated_at DESC)",
 	).run();
@@ -49,6 +66,9 @@ export async function ensureRssSchema(db: D1Database): Promise<void> {
 	).run();
 	await db.prepare(
 		"CREATE INDEX IF NOT EXISTS idx_rss_items_status_updated ON rss_items(status, updated_at DESC)",
+	).run();
+	await db.prepare(
+		"CREATE INDEX IF NOT EXISTS idx_rss_items_reading_queue ON rss_items(reading_state, reading_requested_at, updated_at)",
 	).run();
 	await db.prepare(
 		`CREATE TRIGGER IF NOT EXISTS trg_rss_feeds_updated_at
@@ -67,7 +87,19 @@ export async function ensureRssSchema(db: D1Database): Promise<void> {
 		BEGIN
 			UPDATE rss_items SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
 		END`,
-	).run();
+		).run();
+}
+
+async function addColumnIfMissing(db: D1Database, sql: string): Promise<void> {
+	try {
+		await db.prepare(sql).run();
+	} catch (error) {
+		const message = String(error).toLowerCase();
+		if (message.includes("duplicate column name") || message.includes("already exists")) {
+			return;
+		}
+		throw error;
+	}
 }
 
 export async function listRssFeeds(db: D1Database): Promise<RssFeedRow[]> {
@@ -253,12 +285,18 @@ export async function findRssItemByDedupeKey(
 			ri.author,
 			ri.published_at AS publishedAt,
 			ri.summary_raw AS summaryRaw,
-			ri.summary_zh AS summaryZh,
-			ri.status,
-			ri.note_id AS noteId,
-			ri.fetched_at AS fetchedAt,
-			ri.created_at AS createdAt,
-			ri.updated_at AS updatedAt
+				ri.summary_zh AS summaryZh,
+				ri.status,
+				ri.note_id AS noteId,
+				ri.reading_state AS readingState,
+				ri.reading_error AS readingError,
+				ri.reading_attempt_count AS readingAttemptCount,
+				ri.reading_requested_at AS readingRequestedAt,
+				ri.reading_started_at AS readingStartedAt,
+				ri.reading_completed_at AS readingCompletedAt,
+				ri.fetched_at AS fetchedAt,
+				ri.created_at AS createdAt,
+				ri.updated_at AS updatedAt
 		 FROM rss_items ri
 		 LEFT JOIN rss_feeds rf ON rf.id = ri.feed_id
 		 WHERE ri.feed_id = ? AND ri.dedupe_key = ?
@@ -402,12 +440,18 @@ export async function listRssItems(
 			ri.author,
 			ri.published_at AS publishedAt,
 			ri.summary_raw AS summaryRaw,
-			ri.summary_zh AS summaryZh,
-			ri.status,
-			ri.note_id AS noteId,
-			ri.fetched_at AS fetchedAt,
-			ri.created_at AS createdAt,
-			ri.updated_at AS updatedAt
+				ri.summary_zh AS summaryZh,
+				ri.status,
+				ri.note_id AS noteId,
+				ri.reading_state AS readingState,
+				ri.reading_error AS readingError,
+				ri.reading_attempt_count AS readingAttemptCount,
+				ri.reading_requested_at AS readingRequestedAt,
+				ri.reading_started_at AS readingStartedAt,
+				ri.reading_completed_at AS readingCompletedAt,
+				ri.fetched_at AS fetchedAt,
+				ri.created_at AS createdAt,
+				ri.updated_at AS updatedAt
 		 FROM rss_items ri
 		 LEFT JOIN rss_feeds rf ON rf.id = ri.feed_id
 		 ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
@@ -432,12 +476,18 @@ export async function getRssItemById(db: D1Database, itemId: string): Promise<Rs
 			ri.author,
 			ri.published_at AS publishedAt,
 			ri.summary_raw AS summaryRaw,
-			ri.summary_zh AS summaryZh,
-			ri.status,
-			ri.note_id AS noteId,
-			ri.fetched_at AS fetchedAt,
-			ri.created_at AS createdAt,
-			ri.updated_at AS updatedAt
+				ri.summary_zh AS summaryZh,
+				ri.status,
+				ri.note_id AS noteId,
+				ri.reading_state AS readingState,
+				ri.reading_error AS readingError,
+				ri.reading_attempt_count AS readingAttemptCount,
+				ri.reading_requested_at AS readingRequestedAt,
+				ri.reading_started_at AS readingStartedAt,
+				ri.reading_completed_at AS readingCompletedAt,
+				ri.fetched_at AS fetchedAt,
+				ri.created_at AS createdAt,
+				ri.updated_at AS updatedAt
 		 FROM rss_items ri
 		 LEFT JOIN rss_feeds rf ON rf.id = ri.feed_id
 		 WHERE ri.id = ?
@@ -466,12 +516,160 @@ export async function bindRssItemToNote(
 ): Promise<boolean> {
 	const result = await db.prepare(
 		`UPDATE rss_items
-		 SET note_id = ?, status = ?, updated_at = CURRENT_TIMESTAMP
+		 SET note_id = ?,
+			 status = ?,
+			 reading_state = 'ready',
+			 reading_error = NULL,
+			 reading_completed_at = CURRENT_TIMESTAMP,
+			 updated_at = CURRENT_TIMESTAMP
 		 WHERE id = ?`,
 	)
 		.bind(input.noteId, input.status, itemId)
 		.run();
 	return Number(result.meta.changes ?? 0) > 0;
+}
+
+export async function queueRssItemForReading(db: D1Database, itemId: string): Promise<RssReadingQueueResult> {
+	const existing = await getRssItemById(db, itemId);
+	if (!existing) {
+		throw new Error("RSS item not found");
+	}
+	if (existing.noteId) {
+		return {
+			item: existing,
+			queued: false,
+			noteId: existing.noteId,
+			created: false,
+		};
+	}
+	if (existing.readingState === "queued" || existing.readingState === "processing") {
+		return {
+			item: existing,
+			queued: false,
+			noteId: null,
+			created: false,
+		};
+	}
+	await db.prepare(
+		`UPDATE rss_items
+		 SET reading_state = 'queued',
+			 reading_error = NULL,
+			 reading_requested_at = CURRENT_TIMESTAMP,
+			 updated_at = CURRENT_TIMESTAMP
+		 WHERE id = ?
+		   AND note_id IS NULL`,
+	)
+		.bind(itemId)
+		.run();
+	const queuedItem = await getRssItemById(db, itemId);
+	if (!queuedItem) {
+		throw new Error("RSS item not found");
+	}
+	return {
+		item: queuedItem,
+		queued: queuedItem.readingState === "queued",
+		noteId: null,
+		created: false,
+	};
+}
+
+export async function listRssItemsQueuedForReading(
+	db: D1Database,
+	input: { limit?: number; itemId?: string | null } = {},
+): Promise<RssItemRow[]> {
+	const where: string[] = [
+		"ri.note_id IS NULL",
+		"ri.reading_state = 'queued'",
+	];
+	const params: Array<string | number> = [];
+	if (input.itemId) {
+		where.push("ri.id = ?");
+		params.push(input.itemId);
+	}
+	const limit = clampInt(
+		typeof input.limit === "number" ? String(input.limit) : undefined,
+		DEFAULT_RSS_READING_QUEUE_LIMIT,
+		1,
+		200,
+	);
+	const { results } = await db.prepare(
+		`SELECT
+			ri.id,
+			ri.feed_id AS feedId,
+			rf.title AS feedTitle,
+			ri.source_id AS sourceId,
+			ri.dedupe_key AS dedupeKey,
+			ri.link,
+			ri.title,
+			ri.author,
+			ri.published_at AS publishedAt,
+			ri.summary_raw AS summaryRaw,
+			ri.summary_zh AS summaryZh,
+			ri.status,
+			ri.note_id AS noteId,
+			ri.reading_state AS readingState,
+			ri.reading_error AS readingError,
+			ri.reading_attempt_count AS readingAttemptCount,
+			ri.reading_requested_at AS readingRequestedAt,
+			ri.reading_started_at AS readingStartedAt,
+			ri.reading_completed_at AS readingCompletedAt,
+			ri.fetched_at AS fetchedAt,
+			ri.created_at AS createdAt,
+			ri.updated_at AS updatedAt
+		 FROM rss_items ri
+		 LEFT JOIN rss_feeds rf ON rf.id = ri.feed_id
+		 WHERE ${where.join(" AND ")}
+		 ORDER BY
+			COALESCE(ri.reading_requested_at, ri.updated_at) ASC,
+			ri.updated_at ASC
+		 LIMIT ?`,
+	)
+		.bind(...params, limit)
+		.all<RssItemRow>();
+	return results;
+}
+
+export async function claimRssItemReadingJob(db: D1Database, itemId: string): Promise<boolean> {
+	const result = await db.prepare(
+		`UPDATE rss_items
+		 SET reading_state = 'processing',
+			 reading_error = NULL,
+			 reading_attempt_count = COALESCE(reading_attempt_count, 0) + 1,
+			 reading_started_at = CURRENT_TIMESTAMP,
+			 updated_at = CURRENT_TIMESTAMP
+		 WHERE id = ?
+		   AND note_id IS NULL
+		   AND reading_state = 'queued'`,
+	)
+		.bind(itemId)
+		.run();
+	return Number(result.meta.changes ?? 0) > 0;
+}
+
+export async function markRssItemReadingFailed(db: D1Database, itemId: string, errorMessage: string): Promise<void> {
+	await db.prepare(
+		`UPDATE rss_items
+		 SET reading_state = 'failed',
+			 reading_error = ?,
+			 reading_completed_at = CURRENT_TIMESTAMP,
+			 updated_at = CURRENT_TIMESTAMP
+		 WHERE id = ?`,
+	)
+		.bind(errorMessage.slice(0, 1000), itemId)
+		.run();
+}
+
+export async function markRssItemReadingReady(db: D1Database, itemId: string): Promise<void> {
+	await db.prepare(
+		`UPDATE rss_items
+		 SET reading_state = 'ready',
+			 reading_error = NULL,
+			 reading_completed_at = CURRENT_TIMESTAMP,
+			 updated_at = CURRENT_TIMESTAMP
+		 WHERE id = ?`,
+	)
+		.bind(itemId)
+		.run();
 }
 
 export async function listRssItemsPendingTranslation(

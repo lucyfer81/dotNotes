@@ -1,4 +1,5 @@
 export type RssItemStatus = "new" | "saved" | "ignored";
+export type RssReadingState = "idle" | "queued" | "processing" | "ready" | "failed";
 
 export type RssFeedRow = {
 	id: string;
@@ -25,9 +26,22 @@ export type RssItemRow = {
 	summaryZh: string | null;
 	status: RssItemStatus;
 	noteId: string | null;
+	readingState: RssReadingState;
+	readingError: string | null;
+	readingAttemptCount: number;
+	readingRequestedAt: string | null;
+	readingStartedAt: string | null;
+	readingCompletedAt: string | null;
 	fetchedAt: string;
 	createdAt: string;
 	updatedAt: string;
+};
+
+export type RssReadingQueueResult = {
+	item: RssItemRow;
+	queued: boolean;
+	noteId: string | null;
+	created: boolean;
 };
 
 export type ParsedRssItem = {
