@@ -1673,13 +1673,19 @@ export default function Home() {
 						>
 							{aiOpen ? "隐藏 AI" : "打开 AI"}
 						</button>
-						<Link
-							to="/tags"
-							className="rounded-xl border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-100 md:text-sm"
-						>
-							标签治理
-						</Link>
-					</header>
+							<Link
+								to="/tags"
+								className="rounded-xl border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-100 md:text-sm"
+							>
+								标签治理
+							</Link>
+							<Link
+								to="/ops"
+								className="rounded-xl border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-100 md:text-sm"
+							>
+								运维控制台
+							</Link>
+						</header>
 
 				<div className="hidden min-h-0 flex-1 md:block">
 					{workspaceMode === "capture" ? (
