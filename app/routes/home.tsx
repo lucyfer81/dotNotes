@@ -111,6 +111,7 @@ export default function Home() {
 	const [viewportWidth, setViewportWidth] = useState(0);
 	const [aiOpen, setAiOpen] = useState(false);
 	const [aiQuery, setAiQuery] = useState("");
+	const [activeAiTask, setActiveAiTask] = useState<AiEnhanceTaskApiKey | null>(null);
 	const [aiEnhanceResult, setAiEnhanceResult] = useState<AiEnhanceResultApiItem | null>(null);
 	const [runningAiTasks, setRunningAiTasks] = useState<AiEnhanceTaskApiKey[]>([]);
 	const [aiTaskStages, setAiTaskStages] = useState<Partial<Record<AiEnhanceTaskApiKey, string>>>({});
@@ -338,6 +339,7 @@ export default function Home() {
 		setAiEnhanceResult(null);
 		setAiErrorMessage("");
 		setAiQuery("");
+		setActiveAiTask(null);
 		setRunningAiTasks([]);
 		setAiTaskStages({});
 		aiTaskRunIdRef.current = {
@@ -1024,6 +1026,7 @@ export default function Home() {
 		if (!activeNote || activeNote.deletedAt || runningAiTasks.includes(task)) {
 			return;
 		}
+		setActiveAiTask(task);
 		const noteId = activeNote.id;
 		const query = aiQuery.trim() || undefined;
 		const runId = (aiTaskRunIdRef.current[task] ?? 0) + 1;
@@ -1670,13 +1673,19 @@ export default function Home() {
 						>
 							{aiOpen ? "隐藏 AI" : "打开 AI"}
 						</button>
-						<Link
-							to="/tags"
-							className="rounded-xl border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-100 md:text-sm"
-						>
-							标签治理
-						</Link>
-					</header>
+							<Link
+								to="/tags"
+								className="rounded-xl border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-100 md:text-sm"
+							>
+								标签治理
+							</Link>
+							<Link
+								to="/ops"
+								className="rounded-xl border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-100 md:text-sm"
+							>
+								运维控制台
+							</Link>
+						</header>
 
 				<div className="hidden min-h-0 flex-1 md:block">
 					{workspaceMode === "capture" ? (
@@ -2724,6 +2733,8 @@ export default function Home() {
 						activeNote={activeNote}
 						query={aiQuery}
 						onQueryChange={setAiQuery}
+						activeTask={activeAiTask}
+						onSelectTask={setActiveAiTask}
 						onRunTask={handleRunAiTask}
 						runningTasks={runningAiTasks}
 						taskStages={aiTaskStages}
@@ -2762,6 +2773,8 @@ export default function Home() {
 							activeNote={activeNote}
 							query={aiQuery}
 							onQueryChange={setAiQuery}
+							activeTask={activeAiTask}
+							onSelectTask={setActiveAiTask}
 							onRunTask={handleRunAiTask}
 							runningTasks={runningAiTasks}
 							taskStages={aiTaskStages}
@@ -3149,6 +3162,8 @@ function AiPanel(props: {
 	activeNote: NoteItem | null;
 	query: string;
 	onQueryChange: (value: string) => void;
+	activeTask: AiEnhanceTaskApiKey | null;
+	onSelectTask: (task: AiEnhanceTaskApiKey) => void;
 	onRunTask: (task: AiEnhanceTaskApiKey) => void;
 	runningTasks: AiEnhanceTaskApiKey[];
 	taskStages: Partial<Record<AiEnhanceTaskApiKey, string>>;
@@ -3166,6 +3181,8 @@ function AiPanel(props: {
 		activeNote,
 		query,
 		onQueryChange,
+		activeTask,
+		onSelectTask,
 		onRunTask,
 		runningTasks,
 		taskStages,
@@ -3203,22 +3220,28 @@ function AiPanel(props: {
 					disabled={unavailable}
 					className="mt-3 w-full rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-700 outline-none focus:ring disabled:cursor-not-allowed disabled:bg-slate-100"
 				/>
-				<div className="mt-3 grid grid-cols-2 gap-2">
-					{AI_TASK_ITEMS.map((item) => {
-						const isRunningTask = runningTaskSet.has(item.key);
-						const canRunTask = !unavailable && !isRunningTask;
-						return (
-							<button
-								key={item.key}
-								type="button"
-								onClick={() => onRunTask(item.key)}
-								disabled={!canRunTask}
-								className={`rounded-lg px-2 py-2 text-xs font-medium ${
-									canRunTask
-										? "bg-slate-900 text-white hover:bg-slate-700"
-										: "cursor-not-allowed bg-slate-200 text-slate-500"
-								}`}
-							>
+					<div className="mt-3 grid grid-cols-2 gap-2">
+						{AI_TASK_ITEMS.map((item) => {
+							const isRunningTask = runningTaskSet.has(item.key);
+							const canRunTask = !unavailable && !isRunningTask;
+							const isActiveTask = activeTask === item.key;
+							return (
+								<button
+									key={item.key}
+									type="button"
+									onClick={() => {
+										onSelectTask(item.key);
+										onRunTask(item.key);
+									}}
+									disabled={!canRunTask}
+									className={`rounded-lg px-2 py-2 text-xs font-medium ${
+										canRunTask
+											? isActiveTask
+												? "bg-sky-600 text-white hover:bg-sky-500"
+												: "bg-slate-900 text-white hover:bg-slate-700"
+											: "cursor-not-allowed bg-slate-200 text-slate-500"
+									}`}
+								>
 								{isRunningTask ? taskStages[item.key] ?? "生成中..." : item.label}
 							</button>
 						);
@@ -3236,133 +3259,145 @@ function AiPanel(props: {
 						</div>
 					) : null}
 
-					<section className="rounded-lg border border-slate-200 bg-white p-3">
-						<div className="mb-2 flex items-center justify-between">
-							<p className="text-xs font-semibold text-slate-600">标题候选</p>
-							<span className="text-[11px] text-slate-400">{formatUpdatedAt(result.generatedAt)}</span>
-						</div>
-						<div className="space-y-2">
-							{result.titleCandidates.length === 0 ? (
-								<p className="text-xs text-slate-400">暂无建议</p>
-							) : (
-								result.titleCandidates.map((item, index) => (
-									<div key={`${item.title}-${index}`} className="rounded-md border border-slate-200 p-2">
-										<p className="text-sm text-slate-800">{item.title}</p>
-										<p className="mt-1 text-[11px] text-slate-500">{item.reason}</p>
-										<button
-											type="button"
-											onClick={() => onApplyTitle(item.title)}
-											disabled={isApplyingTitle}
-											className={`mt-2 rounded border px-2 py-1 text-[11px] ${
-												isApplyingTitle
-													? "cursor-not-allowed border-slate-200 text-slate-300"
-													: "border-slate-300 text-slate-700 hover:bg-slate-100"
-											}`}
-										>
-											{isApplyingTitle ? "应用中..." : "应用标题"}
-										</button>
-									</div>
-								))
-							)}
-						</div>
-					</section>
-
-					<section className="rounded-lg border border-slate-200 bg-white p-3">
-						<div className="mb-2 flex items-center justify-between">
-							<p className="text-xs font-semibold text-slate-600">标签建议</p>
-							<button
-								type="button"
-								onClick={onApplyTags}
-								disabled={isApplyingTags || tagNames.length === 0}
-								className={`rounded border px-2 py-1 text-[11px] ${
-									isApplyingTags || tagNames.length === 0
-										? "cursor-not-allowed border-slate-200 text-slate-300"
-										: "border-slate-300 text-slate-700 hover:bg-slate-100"
-								}`}
-							>
-								{isApplyingTags ? "应用中..." : "应用标签"}
-							</button>
-						</div>
-						<div className="flex flex-wrap gap-1">
-							{tagNames.length === 0 ? (
-								<p className="text-xs text-slate-400">暂无建议</p>
-							) : (
-								tagNames.map((name) => (
-									<span key={name} className="rounded-full bg-slate-100 px-2 py-1 text-[11px] text-slate-700">
-										#{name}
-									</span>
-								))
-							)}
-						</div>
-					</section>
-
-					<section className="rounded-lg border border-slate-200 bg-white p-3">
-						<div className="mb-2 flex items-center justify-between">
-							<p className="text-xs font-semibold text-slate-600">摘要 / 大纲</p>
-						</div>
-						{result.summaryMeta.skipped ? (
-							<p className="text-xs text-slate-500">笔记较短，已跳过摘要（阈值策略）。</p>
-						) : (
-							<p className="text-sm leading-6 text-slate-700">{result.summary || "暂无摘要"}</p>
-						)}
-						{result.outline.length > 0 ? (
-							<div className="mt-2 space-y-1">
-								{result.outline.map((item, index) => (
-									<p key={`${item}-${index}`} className="text-xs text-slate-600">
-										{index + 1}. {item}
-									</p>
-								))}
-							</div>
+						{activeTask === "title" ? (
+							<section className="rounded-lg border border-slate-200 bg-white p-3">
+								<div className="mb-2 flex items-center justify-between">
+									<p className="text-xs font-semibold text-slate-600">标题候选</p>
+									<span className="text-[11px] text-slate-400">{formatUpdatedAt(result.generatedAt)}</span>
+								</div>
+								<div className="space-y-2">
+									{result.titleCandidates.length === 0 ? (
+										<p className="text-xs text-slate-400">暂无建议</p>
+									) : (
+										result.titleCandidates.map((item, index) => (
+											<div key={`${item.title}-${index}`} className="rounded-md border border-slate-200 p-2">
+												<p className="text-sm text-slate-800">{item.title}</p>
+												<p className="mt-1 text-[11px] text-slate-500">{item.reason}</p>
+												<button
+													type="button"
+													onClick={() => onApplyTitle(item.title)}
+													disabled={isApplyingTitle}
+													className={`mt-2 rounded border px-2 py-1 text-[11px] ${
+														isApplyingTitle
+															? "cursor-not-allowed border-slate-200 text-slate-300"
+															: "border-slate-300 text-slate-700 hover:bg-slate-100"
+													}`}
+												>
+													{isApplyingTitle ? "应用中..." : "应用标题"}
+												</button>
+											</div>
+										))
+									)}
+								</div>
+							</section>
 						) : null}
-					</section>
 
-					<section className="rounded-lg border border-slate-200 bg-white p-3">
-						<div className="mb-2 flex items-center justify-between">
-							<p className="text-xs font-semibold text-slate-600">双链建议</p>
-							<button
-								type="button"
-								onClick={onApplyLinks}
-								disabled={isApplyingLinks || result.linkSuggestions.length === 0}
-								className={`rounded border px-2 py-1 text-[11px] ${
-									isApplyingLinks || result.linkSuggestions.length === 0
-										? "cursor-not-allowed border-slate-200 text-slate-300"
-										: "border-slate-300 text-slate-700 hover:bg-slate-100"
-								}`}
-							>
-								{isApplyingLinks ? "应用中..." : "应用双链"}
-							</button>
-						</div>
-						<AiRelatedNoteList
-							items={result.linkSuggestions.map((item) => ({
-								noteId: item.targetNoteId,
-								slug: item.slug,
-								title: item.title,
-								snippet: item.reason,
-								score: item.score,
-								reason: item.reason,
-							}))}
-							onOpenNote={onOpenNote}
-							emptyText="暂无双链建议"
-						/>
-					</section>
+						{activeTask === "tags" ? (
+							<section className="rounded-lg border border-slate-200 bg-white p-3">
+								<div className="mb-2 flex items-center justify-between">
+									<p className="text-xs font-semibold text-slate-600">标签建议</p>
+									<button
+										type="button"
+										onClick={onApplyTags}
+										disabled={isApplyingTags || tagNames.length === 0}
+										className={`rounded border px-2 py-1 text-[11px] ${
+											isApplyingTags || tagNames.length === 0
+												? "cursor-not-allowed border-slate-200 text-slate-300"
+												: "border-slate-300 text-slate-700 hover:bg-slate-100"
+										}`}
+									>
+										{isApplyingTags ? "应用中..." : "应用标签"}
+									</button>
+								</div>
+								<div className="flex flex-wrap gap-1">
+									{tagNames.length === 0 ? (
+										<p className="text-xs text-slate-400">暂无建议</p>
+									) : (
+										tagNames.map((name) => (
+											<span key={name} className="rounded-full bg-slate-100 px-2 py-1 text-[11px] text-slate-700">
+												#{name}
+											</span>
+										))
+									)}
+								</div>
+							</section>
+						) : null}
 
-					<section className="rounded-lg border border-slate-200 bg-white p-3">
-						<p className="mb-2 text-xs font-semibold text-slate-600">语义搜索候选</p>
-						<AiRelatedNoteList
-							items={result.semanticSearch}
-							onOpenNote={onOpenNote}
-							emptyText="暂无结果"
-						/>
-					</section>
+						{activeTask === "summary" ? (
+							<section className="rounded-lg border border-slate-200 bg-white p-3">
+								<div className="mb-2 flex items-center justify-between">
+									<p className="text-xs font-semibold text-slate-600">摘要 / 大纲</p>
+								</div>
+								{result.summaryMeta.skipped ? (
+									<p className="text-xs text-slate-500">笔记较短，已跳过摘要（阈值策略）。</p>
+								) : (
+									<p className="text-sm leading-6 text-slate-700">{result.summary || "暂无摘要"}</p>
+								)}
+								{result.outline.length > 0 ? (
+									<div className="mt-2 space-y-1">
+										{result.outline.map((item, index) => (
+											<p key={`${item}-${index}`} className="text-xs text-slate-600">
+												{index + 1}. {item}
+											</p>
+										))}
+									</div>
+								) : null}
+							</section>
+						) : null}
 
-					<section className="rounded-lg border border-slate-200 bg-white p-3">
-						<p className="mb-2 text-xs font-semibold text-slate-600">相似笔记</p>
-						<AiRelatedNoteList
-							items={result.similarNotes}
-							onOpenNote={onOpenNote}
-							emptyText="暂无相似笔记"
-						/>
-					</section>
+						{activeTask === "links" ? (
+							<section className="rounded-lg border border-slate-200 bg-white p-3">
+								<div className="mb-2 flex items-center justify-between">
+									<p className="text-xs font-semibold text-slate-600">双链建议</p>
+									<button
+										type="button"
+										onClick={onApplyLinks}
+										disabled={isApplyingLinks || result.linkSuggestions.length === 0}
+										className={`rounded border px-2 py-1 text-[11px] ${
+											isApplyingLinks || result.linkSuggestions.length === 0
+												? "cursor-not-allowed border-slate-200 text-slate-300"
+												: "border-slate-300 text-slate-700 hover:bg-slate-100"
+										}`}
+									>
+										{isApplyingLinks ? "应用中..." : "应用双链"}
+									</button>
+								</div>
+								<AiRelatedNoteList
+									items={result.linkSuggestions.map((item) => ({
+										noteId: item.targetNoteId,
+										slug: item.slug,
+										title: item.title,
+										snippet: item.reason,
+										score: item.score,
+										reason: item.reason,
+									}))}
+									onOpenNote={onOpenNote}
+									emptyText="暂无双链建议"
+								/>
+							</section>
+						) : null}
+
+						{activeTask === "semantic" ? (
+							<section className="rounded-lg border border-slate-200 bg-white p-3">
+								<p className="mb-2 text-xs font-semibold text-slate-600">语义搜索候选</p>
+								<AiRelatedNoteList
+									items={result.semanticSearch}
+									onOpenNote={onOpenNote}
+									emptyText="暂无结果"
+								/>
+							</section>
+						) : null}
+
+						{activeTask === "similar" ? (
+							<section className="rounded-lg border border-slate-200 bg-white p-3">
+								<p className="mb-2 text-xs font-semibold text-slate-600">相似笔记</p>
+								<AiRelatedNoteList
+									items={result.similarNotes}
+									onOpenNote={onOpenNote}
+									emptyText="暂无相似笔记"
+								/>
+							</section>
+						) : null}
 				</div>
 			) : null}
 		</div>

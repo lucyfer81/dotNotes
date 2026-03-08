@@ -164,6 +164,105 @@ export type RssTranslateResultApiItem = {
 	failed: number;
 	processedItemIds: string[];
 };
+export type IndexJobActionApiItem = "upsert" | "delete";
+export type IndexJobStatusApiItem = "pending" | "processing" | "success" | "failed";
+export type IndexJobApiItem = {
+	noteId: string;
+	action: IndexJobActionApiItem;
+	status: IndexJobStatusApiItem;
+	attemptCount: number;
+	chunkCount: number;
+	lastError: string | null;
+	nextRetryAt: string | null;
+	lastIndexedAt: string | null;
+	createdAt: string;
+	updatedAt: string;
+	noteTitle: string | null;
+};
+export type IndexProcessResultApiItem = {
+	noteId: string;
+	action: IndexJobActionApiItem;
+	status: "success" | "failed";
+	chunkCount: number;
+	error: string | null;
+	attemptCount: number;
+};
+export type OpsMetricsAlertApiItem = {
+	key: string;
+	label: string;
+	status: "ok" | "warn" | "no_data";
+	threshold: number;
+	value: number | null;
+	message: string;
+};
+export type OpsMetricsApiItem = {
+	windowMinutes: number;
+	generatedAt: string;
+	api: {
+		totalRequests: number;
+		errorRequests: number;
+		errorRate: number | null;
+	};
+	search: {
+		requestCount: number;
+		p50Ms: number | null;
+		p95Ms: number | null;
+		avgMs: number | null;
+	};
+	index: {
+		pending: number;
+		processing: number;
+		failed: number;
+		backlog: number;
+		recentSuccess: number;
+		recentFailed: number;
+		successRate: number | null;
+	};
+	alerts: OpsMetricsAlertApiItem[];
+};
+export type OpsAiProbeSummaryApiItem = {
+	sampleCount: number;
+	successCount: number;
+	failureCount: number;
+	ttfbMs: {
+		p50: number | null;
+		p95: number | null;
+		avg: number | null;
+		min: number | null;
+		max: number | null;
+	};
+	totalMs: {
+		p50: number | null;
+		p95: number | null;
+		avg: number | null;
+		min: number | null;
+		max: number | null;
+	};
+	recentErrors: string[];
+};
+export type OpsAiProbeApiItem = {
+	sampledAt: string;
+	colo: string | null;
+	baseUrl: string;
+	count: number;
+	timeoutMs: number;
+	probes: Record<string, OpsAiProbeSummaryApiItem & { model?: string }>;
+};
+export type NoteStorageMigrateApiItem = {
+	dryRun: boolean;
+	limit: number;
+	minBytes: number;
+	scanned: number;
+	migrated: number;
+	noteIds: string[];
+};
+export type RssReadingProcessApiItem = {
+	processed: number;
+	created: number;
+	failed: number;
+	skipped: number;
+	itemIds: string[];
+};
 
 type ListNotesOptions = {
 	limit?: number;
@@ -222,6 +321,11 @@ type AiEnhanceInput = {
 type ListRssItemsOptions = {
 	feedId?: string | null;
 	statuses?: RssItemStatus[];
+	limit?: number;
+	offset?: number;
+};
+type ListIndexJobsOptions = {
+	statuses?: IndexJobStatusApiItem[];
 	limit?: number;
 	offset?: number;
 };
@@ -766,6 +870,146 @@ export async function saveRssItemToReading(itemId: string): Promise<{
 	};
 }
 
+export async function listIndexJobs(options: ListIndexJobsOptions = {}): Promise<{
+	items: IndexJobApiItem[];
+	paging: { limit: number; offset: number; count: number };
+}> {
+	const query = new URLSearchParams();
+	if (options.statuses && options.statuses.length > 0) {
+		query.set("status", options.statuses.join(","));
+	}
+	query.set("limit", String(options.limit ?? 50));
+	query.set("offset", String(options.offset ?? 0));
+	const data = await requestApiData<unknown>(`/api/index/jobs?${query.toString()}`);
+	if (!isRecord(data) || !Array.isArray(data.items) || !isRecord(data.paging)) {
+		throw new Error("Invalid index jobs response");
+	}
+	const items = data.items
+		.map((item) => toIndexJobApiItem(item))
+		.filter((item): item is IndexJobApiItem => item !== null);
+	const paging = toPagingApiItem(data.paging);
+	if (!paging) {
+		throw new Error("Invalid index jobs paging");
+	}
+	return { items, paging };
+}
+
+export async function processIndexJobs(limit = 5): Promise<{
+	limit: number;
+	processed: number;
+	results: IndexProcessResultApiItem[];
+}> {
+	const data = await requestApiData<unknown>("/api/index/process", {
+		method: "POST",
+		body: JSON.stringify({ limit }),
+	});
+	if (!isRecord(data) || typeof data.limit !== "number" || typeof data.processed !== "number" || !Array.isArray(data.results)) {
+		throw new Error("Invalid index process response");
+	}
+	return {
+		limit: data.limit,
+		processed: data.processed,
+		results: data.results
+			.map((item) => toIndexProcessResultApiItem(item))
+			.filter((item): item is IndexProcessResultApiItem => item !== null),
+	};
+}
+
+export async function rebuildIndex(input: {
+	dryRun?: boolean;
+	includeDeleted?: boolean;
+	includeArchived?: boolean;
+	limit?: number;
+	noteId?: string;
+} = {}): Promise<{
+	dryRun: boolean;
+	limit: number;
+	enqueued: number;
+	items: Array<{ noteId: string; action: IndexJobActionApiItem }>;
+}> {
+	const data = await requestApiData<unknown>("/api/index/rebuild", {
+		method: "POST",
+		body: JSON.stringify(input),
+	});
+	if (
+		!isRecord(data) ||
+		typeof data.dryRun !== "boolean" ||
+		typeof data.limit !== "number" ||
+		typeof data.enqueued !== "number" ||
+		!Array.isArray(data.items)
+	) {
+		throw new Error("Invalid index rebuild response");
+	}
+	const items = data.items
+		.map((item) => toIndexRebuildItem(item))
+		.filter((item): item is { noteId: string; action: IndexJobActionApiItem } => item !== null);
+	return {
+		dryRun: data.dryRun,
+		limit: data.limit,
+		enqueued: data.enqueued,
+		items,
+	};
+}
+
+export async function listOpsMetrics(windowMinutes = 60): Promise<OpsMetricsApiItem> {
+	const data = await requestApiData<unknown>(`/api/ops/metrics?windowMinutes=${encodeURIComponent(String(windowMinutes))}`);
+	const parsed = toOpsMetricsApiItem(data);
+	if (!parsed) {
+		throw new Error("Invalid ops metrics response");
+	}
+	return parsed;
+}
+
+export async function probeOpsAi(input: {
+	count?: number;
+	timeoutMs?: number;
+	includeModels?: boolean;
+	includeEmbedding?: boolean;
+	includeChat?: boolean;
+	chatModel?: string;
+} = {}): Promise<OpsAiProbeApiItem> {
+	const data = await requestApiData<unknown>("/api/ops/ai/probe", {
+		method: "POST",
+		body: JSON.stringify(input),
+	});
+	const parsed = toOpsAiProbeApiItem(data);
+	if (!parsed) {
+		throw new Error("Invalid ops ai probe response");
+	}
+	return parsed;
+}
+
+export async function migrateNoteStorage(input: {
+	dryRun?: boolean;
+	limit?: number;
+	minBytes?: number;
+} = {}): Promise<NoteStorageMigrateApiItem> {
+	const data = await requestApiData<unknown>("/api/notes/storage/migrate", {
+		method: "POST",
+		body: JSON.stringify(input),
+	});
+	const parsed = toNoteStorageMigrateApiItem(data);
+	if (!parsed) {
+		throw new Error("Invalid note storage migrate response");
+	}
+	return parsed;
+}
+
+export async function processRssReadingQueue(input: {
+	limit?: number;
+	itemId?: string;
+} = {}): Promise<RssReadingProcessApiItem> {
+	const data = await requestApiData<unknown>("/api/rss/reading/process", {
+		method: "POST",
+		body: JSON.stringify(input),
+	});
+	const parsed = toRssReadingProcessApiItem(data);
+	if (!parsed) {
+		throw new Error("Invalid rss reading process response");
+	}
+	return parsed;
+}
+
 async function requestApiData<T>(url: string, init?: RequestInit): Promise<T> {
 	const headers = new Headers(init?.headers);
 	headers.set("Accept", "application/json");
@@ -1288,6 +1532,303 @@ function toRssTranslateResultApiItem(value: unknown): RssTranslateResultApiItem 
 		translated: value.translated,
 		failed: value.failed,
 		processedItemIds,
+	};
+}
+
+function toIndexJobApiItem(value: unknown): IndexJobApiItem | null {
+	if (!isRecord(value)) {
+		return null;
+	}
+	if (
+		typeof value.noteId !== "string" ||
+		(value.action !== "upsert" && value.action !== "delete") ||
+		(value.status !== "pending" && value.status !== "processing" && value.status !== "success" && value.status !== "failed") ||
+		typeof value.attemptCount !== "number" ||
+		typeof value.chunkCount !== "number" ||
+		(typeof value.lastError !== "string" && value.lastError !== null) ||
+		(typeof value.nextRetryAt !== "string" && value.nextRetryAt !== null) ||
+		(typeof value.lastIndexedAt !== "string" && value.lastIndexedAt !== null) ||
+		typeof value.createdAt !== "string" ||
+		typeof value.updatedAt !== "string" ||
+		(typeof value.noteTitle !== "string" && value.noteTitle !== null)
+	) {
+		return null;
+	}
+	return {
+		noteId: value.noteId,
+		action: value.action,
+		status: value.status,
+		attemptCount: value.attemptCount,
+		chunkCount: value.chunkCount,
+		lastError: value.lastError,
+		nextRetryAt: value.nextRetryAt,
+		lastIndexedAt: value.lastIndexedAt,
+		createdAt: value.createdAt,
+		updatedAt: value.updatedAt,
+		noteTitle: value.noteTitle,
+	};
+}
+
+function toIndexProcessResultApiItem(value: unknown): IndexProcessResultApiItem | null {
+	if (!isRecord(value)) {
+		return null;
+	}
+	if (
+		typeof value.noteId !== "string" ||
+		(value.action !== "upsert" && value.action !== "delete") ||
+		(value.status !== "success" && value.status !== "failed") ||
+		typeof value.chunkCount !== "number" ||
+		(typeof value.error !== "string" && value.error !== null) ||
+		typeof value.attemptCount !== "number"
+	) {
+		return null;
+	}
+	return {
+		noteId: value.noteId,
+		action: value.action,
+		status: value.status,
+		chunkCount: value.chunkCount,
+		error: value.error,
+		attemptCount: value.attemptCount,
+	};
+}
+
+function toIndexRebuildItem(value: unknown): { noteId: string; action: IndexJobActionApiItem } | null {
+	if (!isRecord(value) || typeof value.noteId !== "string" || (value.action !== "upsert" && value.action !== "delete")) {
+		return null;
+	}
+	return {
+		noteId: value.noteId,
+		action: value.action,
+	};
+}
+
+function toPagingApiItem(value: unknown): { limit: number; offset: number; count: number } | null {
+	if (!isRecord(value) || typeof value.limit !== "number" || typeof value.offset !== "number" || typeof value.count !== "number") {
+		return null;
+	}
+	return {
+		limit: value.limit,
+		offset: value.offset,
+		count: value.count,
+	};
+}
+
+function toOpsMetricsAlertApiItem(value: unknown): OpsMetricsAlertApiItem | null {
+	if (!isRecord(value)) {
+		return null;
+	}
+	if (
+		typeof value.key !== "string" ||
+		typeof value.label !== "string" ||
+		(value.status !== "ok" && value.status !== "warn" && value.status !== "no_data") ||
+		typeof value.threshold !== "number" ||
+		(typeof value.value !== "number" && value.value !== null) ||
+		typeof value.message !== "string"
+	) {
+		return null;
+	}
+	return {
+		key: value.key,
+		label: value.label,
+		status: value.status,
+		threshold: value.threshold,
+		value: value.value,
+		message: value.message,
+	};
+}
+
+function toOpsMetricsApiItem(value: unknown): OpsMetricsApiItem | null {
+	if (!isRecord(value) || typeof value.windowMinutes !== "number" || typeof value.generatedAt !== "string") {
+		return null;
+	}
+	if (!isRecord(value.api) || !isRecord(value.search) || !isRecord(value.index)) {
+		return null;
+	}
+	if (
+		typeof value.api.totalRequests !== "number" ||
+		typeof value.api.errorRequests !== "number" ||
+		(typeof value.api.errorRate !== "number" && value.api.errorRate !== null)
+	) {
+		return null;
+	}
+	if (
+		typeof value.search.requestCount !== "number" ||
+		(typeof value.search.p50Ms !== "number" && value.search.p50Ms !== null) ||
+		(typeof value.search.p95Ms !== "number" && value.search.p95Ms !== null) ||
+		(typeof value.search.avgMs !== "number" && value.search.avgMs !== null)
+	) {
+		return null;
+	}
+	if (
+		typeof value.index.pending !== "number" ||
+		typeof value.index.processing !== "number" ||
+		typeof value.index.failed !== "number" ||
+		typeof value.index.backlog !== "number" ||
+		typeof value.index.recentSuccess !== "number" ||
+		typeof value.index.recentFailed !== "number" ||
+		(typeof value.index.successRate !== "number" && value.index.successRate !== null)
+	) {
+		return null;
+	}
+	const alerts = Array.isArray(value.alerts)
+		? value.alerts
+				.map((item) => toOpsMetricsAlertApiItem(item))
+				.filter((item): item is OpsMetricsAlertApiItem => item !== null)
+		: [];
+	return {
+		windowMinutes: value.windowMinutes,
+		generatedAt: value.generatedAt,
+		api: {
+			totalRequests: value.api.totalRequests,
+			errorRequests: value.api.errorRequests,
+			errorRate: value.api.errorRate,
+		},
+		search: {
+			requestCount: value.search.requestCount,
+			p50Ms: value.search.p50Ms,
+			p95Ms: value.search.p95Ms,
+			avgMs: value.search.avgMs,
+		},
+		index: {
+			pending: value.index.pending,
+			processing: value.index.processing,
+			failed: value.index.failed,
+			backlog: value.index.backlog,
+			recentSuccess: value.index.recentSuccess,
+			recentFailed: value.index.recentFailed,
+			successRate: value.index.successRate,
+		},
+		alerts,
+	};
+}
+
+function toOpsProbeLatencyApiItem(value: unknown): {
+	p50: number | null;
+	p95: number | null;
+	avg: number | null;
+	min: number | null;
+	max: number | null;
+} | null {
+	if (
+		!isRecord(value) ||
+		(typeof value.p50 !== "number" && value.p50 !== null) ||
+		(typeof value.p95 !== "number" && value.p95 !== null) ||
+		(typeof value.avg !== "number" && value.avg !== null) ||
+		(typeof value.min !== "number" && value.min !== null) ||
+		(typeof value.max !== "number" && value.max !== null)
+	) {
+		return null;
+	}
+	return {
+		p50: value.p50,
+		p95: value.p95,
+		avg: value.avg,
+		min: value.min,
+		max: value.max,
+	};
+}
+
+function toOpsAiProbeSummaryApiItem(value: unknown): OpsAiProbeSummaryApiItem | null {
+	if (
+		!isRecord(value) ||
+		typeof value.sampleCount !== "number" ||
+		typeof value.successCount !== "number" ||
+		typeof value.failureCount !== "number" ||
+		!Array.isArray(value.recentErrors)
+	) {
+		return null;
+	}
+	const ttfbMs = toOpsProbeLatencyApiItem(value.ttfbMs);
+	const totalMs = toOpsProbeLatencyApiItem(value.totalMs);
+	if (!ttfbMs || !totalMs) {
+		return null;
+	}
+	return {
+		sampleCount: value.sampleCount,
+		successCount: value.successCount,
+		failureCount: value.failureCount,
+		ttfbMs,
+		totalMs,
+		recentErrors: value.recentErrors.filter((item): item is string => typeof item === "string"),
+	};
+}
+
+function toOpsAiProbeApiItem(value: unknown): OpsAiProbeApiItem | null {
+	if (
+		!isRecord(value) ||
+		typeof value.sampledAt !== "string" ||
+		(typeof value.colo !== "string" && value.colo !== null) ||
+		typeof value.baseUrl !== "string" ||
+		typeof value.count !== "number" ||
+		typeof value.timeoutMs !== "number" ||
+		!isRecord(value.probes)
+	) {
+		return null;
+	}
+	const probes: Record<string, OpsAiProbeSummaryApiItem & { model?: string }> = {};
+	for (const [key, rawProbe] of Object.entries(value.probes)) {
+		if (!isRecord(rawProbe)) {
+			continue;
+		}
+		const summary = toOpsAiProbeSummaryApiItem(rawProbe);
+		if (!summary) {
+			continue;
+		}
+		probes[key] = {
+			...summary,
+			...(typeof rawProbe.model === "string" ? { model: rawProbe.model } : {}),
+		};
+	}
+	return {
+		sampledAt: value.sampledAt,
+		colo: value.colo,
+		baseUrl: value.baseUrl,
+		count: value.count,
+		timeoutMs: value.timeoutMs,
+		probes,
+	};
+}
+
+function toNoteStorageMigrateApiItem(value: unknown): NoteStorageMigrateApiItem | null {
+	if (
+		!isRecord(value) ||
+		typeof value.dryRun !== "boolean" ||
+		typeof value.limit !== "number" ||
+		typeof value.minBytes !== "number" ||
+		typeof value.scanned !== "number" ||
+		typeof value.migrated !== "number" ||
+		!Array.isArray(value.noteIds)
+	) {
+		return null;
+	}
+	return {
+		dryRun: value.dryRun,
+		limit: value.limit,
+		minBytes: value.minBytes,
+		scanned: value.scanned,
+		migrated: value.migrated,
+		noteIds: value.noteIds.filter((item): item is string => typeof item === "string"),
+	};
+}
+
+function toRssReadingProcessApiItem(value: unknown): RssReadingProcessApiItem | null {
+	if (
+		!isRecord(value) ||
+		typeof value.processed !== "number" ||
+		typeof value.created !== "number" ||
+		typeof value.failed !== "number" ||
+		typeof value.skipped !== "number" ||
+		!Array.isArray(value.itemIds)
+	) {
+		return null;
+	}
+	return {
+		processed: value.processed,
+		created: value.created,
+		failed: value.failed,
+		skipped: value.skipped,
+		itemIds: value.itemIds.filter((item): item is string => typeof item === "string"),
 	};
 }
 
