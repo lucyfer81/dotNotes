@@ -14,6 +14,7 @@ import {
 	type RssItemStatus,
 	type RssSyncResultApiItem,
 } from "../lib/api";
+import { formatMonthDayTime } from "../lib/datetime";
 
 type BlogTab = "inbox" | "feeds";
 
@@ -650,15 +651,7 @@ function TabButton(props: {
 }
 
 function formatDateTime(value: string): string {
-	const parsed = new Date(value);
-	if (Number.isNaN(parsed.getTime())) {
-		return value;
-	}
-	const month = parsed.getMonth() + 1;
-	const day = parsed.getDate();
-	const hours = String(parsed.getHours()).padStart(2, "0");
-	const minutes = String(parsed.getMinutes()).padStart(2, "0");
-	return `${month}月${day}日 ${hours}:${minutes}`;
+	return formatMonthDayTime(value);
 }
 
 function getReadingActionLabel(item: RssItemApiItem): string {

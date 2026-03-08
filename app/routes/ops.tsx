@@ -15,6 +15,7 @@ import {
 	type OpsMetricsApiItem,
 	type RssItemApiItem,
 } from "../lib/api";
+import { formatMonthDayTime } from "../lib/datetime";
 import type { Route } from "./+types/ops";
 
 const INDEX_STATUSES: IndexJobStatusApiItem[] = ["failed", "pending", "processing", "success"];
@@ -618,16 +619,7 @@ function formatRssReadingState(value: RssItemApiItem["readingState"]): string {
 }
 
 function formatDateTime(value: string): string {
-	const parsed = new Date(value);
-	if (Number.isNaN(parsed.getTime())) {
-		return value;
-	}
-	return parsed.toLocaleString("zh-CN", {
-		month: "2-digit",
-		day: "2-digit",
-		hour: "2-digit",
-		minute: "2-digit",
-	});
+	return formatMonthDayTime(value);
 }
 
 function readErrorMessage(error: unknown): string {
