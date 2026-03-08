@@ -22,6 +22,7 @@ import {
 	markRssFeedSyncFailure,
 	markRssFeedSyncSuccess,
 	queueRssItemForReading,
+	requeueStaleRssReadingJobs,
 	updateRssItemSummaryZh,
 	upsertRssFeedTitle,
 	upsertRssItem,
@@ -47,6 +48,7 @@ const DEFAULT_RSS_SYNC_ITEM_LIMIT = 10;
 const DEFAULT_RSS_SYNC_TRANSLATE_BUDGET = 3;
 const DEFAULT_RSS_TRANSLATE_PASS_LIMIT = 30;
 const DEFAULT_RSS_READING_PROCESS_LIMIT = 3;
+const DEFAULT_RSS_READING_STALE_MINUTES = 10;
 const READING_PARENT_FOLDER_ID = "folder-20-areas";
 const READING_FOLDER_SLUG = "reading";
 const READING_FOLDER_NAME = "Reading";
@@ -95,6 +97,15 @@ export function getRssReadingProcessLimit(env: Env): number {
 		return Math.trunc(parsed);
 	}
 	return DEFAULT_RSS_READING_PROCESS_LIMIT;
+}
+
+export function getRssReadingStaleMinutes(env: Env): number {
+	const ext = env as Env & { RSS_READING_STALE_MINUTES?: string };
+	const parsed = Number(ext.RSS_READING_STALE_MINUTES);
+	if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 24 * 60) {
+		return Math.trunc(parsed);
+	}
+	return DEFAULT_RSS_READING_STALE_MINUTES;
 }
 
 export async function syncRssFeeds(
@@ -216,6 +227,12 @@ export async function processQueuedRssReadingItems(
 ): Promise<{ processed: number; created: number; failed: number; skipped: number; itemIds: string[] }> {
 	await ensureRssSchema(env.DB);
 	const limit = input.limit ?? getRssReadingProcessLimit(env);
+	const recovered = await requeueStaleRssReadingJobs(env.DB, {
+		staleMinutes: getRssReadingStaleMinutes(env),
+	});
+	if (recovered > 0) {
+		console.warn("Recovered stale rss reading jobs", { recovered });
+	}
 	const candidates = await listRssItemsQueuedForReading(env.DB, {
 		limit,
 		itemId: input.itemId ?? null,

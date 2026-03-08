@@ -646,6 +646,28 @@ export async function claimRssItemReadingJob(db: D1Database, itemId: string): Pr
 	return Number(result.meta.changes ?? 0) > 0;
 }
 
+export async function requeueStaleRssReadingJobs(
+	db: D1Database,
+	input: { staleMinutes: number },
+): Promise<number> {
+	const staleMinutes = clampInt(String(input.staleMinutes), 10, 1, 24 * 60);
+	const staleBeforeExpr = `-${staleMinutes} minutes`;
+	const result = await db.prepare(
+		`UPDATE rss_items
+		 SET reading_state = 'queued',
+			 reading_error = 'Recovered stale processing job',
+			 reading_requested_at = CURRENT_TIMESTAMP,
+			 updated_at = CURRENT_TIMESTAMP
+		 WHERE note_id IS NULL
+		   AND reading_state = 'processing'
+		   AND reading_started_at IS NOT NULL
+		   AND reading_started_at <= datetime('now', ?)`,
+	)
+		.bind(staleBeforeExpr)
+		.run();
+	return Number(result.meta.changes ?? 0);
+}
+
 export async function markRssItemReadingFailed(db: D1Database, itemId: string, errorMessage: string): Promise<void> {
 	await db.prepare(
 		`UPDATE rss_items

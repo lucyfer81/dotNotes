@@ -83,17 +83,24 @@ export async function fetchRssArticleMarkdown(
 			try {
 				const markdown = await fetchMarkdownWithBrowserRendering(env, auth, normalizedUrl);
 				if (markdown.trim().length > 0) {
+					console.info("RSS reading fetch via browser-rendering succeeded", { url: normalizedUrl });
 					return {
 						markdown,
 						source: "browser-rendering",
 					};
 				}
 			} catch (error) {
-				console.error("Browser rendering markdown fetch failed", { url: normalizedUrl, error: String(error) });
+				console.warn("Browser rendering markdown fetch failed, fallback to direct-fetch", {
+					url: normalizedUrl,
+					error: String(error),
+				});
 			}
+		} else {
+			console.warn("Browser rendering auth missing, fallback to direct-fetch", { url: normalizedUrl });
 		}
 	}
 	const markdown = await fetchMarkdownWithDirectRequest(env, normalizedUrl);
+	console.info("RSS reading fetch via direct-fetch succeeded", { url: normalizedUrl });
 	return {
 		markdown,
 		source: "direct-fetch",

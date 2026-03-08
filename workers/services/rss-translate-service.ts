@@ -3,7 +3,9 @@ import { isRecord } from "./common-service";
 
 const DEFAULT_RSS_TRANSLATE_MAX_CHARS = 1600;
 const DEFAULT_RSS_READING_TRANSLATE_CHUNK_CHARS = 3200;
-const DEFAULT_RSS_READING_TRANSLATE_MAX_CHUNKS = 24;
+const DEFAULT_RSS_READING_TRANSLATE_MAX_CHUNKS = 8;
+const DEFAULT_RSS_READING_TRANSLATE_TIMEOUT_MS = 180_000;
+const DEFAULT_RSS_READING_TRANSLATE_CHUNK_TIMEOUT_MS = 30_000;
 
 export function getRssTranslateMaxChars(env: Env): number {
 	const ext = env as Env & { RSS_TRANSLATE_MAX_CHARS?: string };
@@ -39,6 +41,24 @@ export function getRssReadingTranslateMaxChunks(env: Env): number {
 		return Math.trunc(parsed);
 	}
 	return DEFAULT_RSS_READING_TRANSLATE_MAX_CHUNKS;
+}
+
+export function getRssReadingTranslateTimeoutMs(env: Env): number {
+	const ext = env as Env & { RSS_READING_TRANSLATE_TIMEOUT_MS?: string };
+	const parsed = Number(ext.RSS_READING_TRANSLATE_TIMEOUT_MS);
+	if (Number.isFinite(parsed) && parsed >= 10_000 && parsed <= 600_000) {
+		return Math.trunc(parsed);
+	}
+	return DEFAULT_RSS_READING_TRANSLATE_TIMEOUT_MS;
+}
+
+export function getRssReadingTranslateChunkTimeoutMs(env: Env): number {
+	const ext = env as Env & { RSS_READING_TRANSLATE_CHUNK_TIMEOUT_MS?: string };
+	const parsed = Number(ext.RSS_READING_TRANSLATE_CHUNK_TIMEOUT_MS);
+	if (Number.isFinite(parsed) && parsed >= 3000 && parsed <= 120_000) {
+		return Math.trunc(parsed);
+	}
+	return DEFAULT_RSS_READING_TRANSLATE_CHUNK_TIMEOUT_MS;
 }
 
 export async function translateSummaryToChinese(env: Env, rawText: string): Promise<string> {
@@ -95,6 +115,7 @@ export async function translateTextToChineseStrict(
 		maxChars?: number;
 		label?: string;
 		preserveMarkdown?: boolean;
+		timeoutMs?: number;
 	} = {},
 ): Promise<string> {
 	const normalized = rawText.replace(/\s+/gu, " ").trim();
@@ -120,7 +141,7 @@ export async function translateTextToChineseStrict(
 			].join("\n"),
 		},
 		{
-			timeoutMs: getAiTaskTimeoutMs(env, "summary"),
+			timeoutMs: options.timeoutMs ?? getAiTaskTimeoutMs(env, "summary"),
 			label: options.label ?? "rss:translate-strict",
 		},
 	);
@@ -145,6 +166,8 @@ export async function translateLongTextToChineseStrict(
 		chunkChars?: number;
 		maxChunks?: number;
 		label?: string;
+		timeoutMs?: number;
+		chunkTimeoutMs?: number;
 	} = {},
 ): Promise<string> {
 	const normalized = rawText
@@ -159,14 +182,21 @@ export async function translateLongTextToChineseStrict(
 	}
 	const chunkChars = options.chunkChars ?? getRssReadingTranslateChunkChars(env);
 	const maxChunks = options.maxChunks ?? getRssReadingTranslateMaxChunks(env);
+	const timeoutMs = options.timeoutMs ?? getRssReadingTranslateTimeoutMs(env);
+	const chunkTimeoutMs = options.chunkTimeoutMs ?? getRssReadingTranslateChunkTimeoutMs(env);
 	const chunks = buildChunksByParagraph(normalized, chunkChars, maxChunks);
 	const translatedChunks: string[] = [];
+	const startedAt = Date.now();
 	for (let index = 0; index < chunks.length; index += 1) {
+		if (Date.now() - startedAt > timeoutMs) {
+			throw new Error(`RSS reading translation timed out (${timeoutMs}ms)`);
+		}
 		const chunk = chunks[index];
 		const translated = await translateTextToChineseStrict(env, chunk, {
 			maxChars: chunkChars + 200,
 			label: `${options.label ?? "rss:translate-reading"}#${index + 1}`,
 			preserveMarkdown: true,
+			timeoutMs: chunkTimeoutMs,
 		});
 		translatedChunks.push(translated);
 	}
