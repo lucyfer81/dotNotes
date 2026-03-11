@@ -49,11 +49,6 @@
 		"RSS_CRON_TRANSLATE_LIMIT": "20",
 		"RSS_CRON_TRANSLATE_ROUNDS": "2"
 	},
-	"triggers": {
-		"crons": [
-			"5 */4 * * *"
-		]
-	},
 	"d1_databases": [
 		{
 			"binding": "DB",

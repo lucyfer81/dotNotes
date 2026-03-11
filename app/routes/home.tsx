@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState, type ComponentType, type ReactNod
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Link } from "react-router";
-import RssBlogWorkspace from "../components/rss-blog-workspace";
 import {
 	archiveNote,
 	createFolder,
@@ -49,7 +48,7 @@ type NoteItem = {
 	deletedAt: string | null;
 };
 
-type WorkspaceMode = "capture" | "organize" | "focus" | "blog";
+type WorkspaceMode = "capture" | "organize" | "focus";
 type EditorMode = "edit" | "preview" | "split";
 type CommandAction = {
 	id: string;
@@ -394,8 +393,7 @@ export default function Home() {
 		if (
 			storedWorkspaceMode === "capture" ||
 			storedWorkspaceMode === "organize" ||
-			storedWorkspaceMode === "focus" ||
-			storedWorkspaceMode === "blog"
+			storedWorkspaceMode === "focus"
 		) {
 			setWorkspaceMode(storedWorkspaceMode);
 		}
@@ -1499,13 +1497,6 @@ export default function Home() {
 				run: () => setWorkspaceMode("focus"),
 			},
 			{
-				id: "action-blog",
-				label: "切换到 Blog",
-				description: "打开 RSS 订阅管理与待读列表",
-				keywords: ["blog", "rss", "feed", "订阅", "阅读", "收件箱"],
-				run: () => setWorkspaceMode("blog"),
-			},
-			{
 				id: "action-clear-tags",
 				label: "清空标签筛选",
 				description: "移除当前所有标签过滤",
@@ -1666,7 +1657,6 @@ export default function Home() {
 						<ModeButton label="Capture" active={workspaceMode === "capture"} onClick={() => setWorkspaceMode("capture")} />
 						<ModeButton label="Organize" active={workspaceMode === "organize"} onClick={() => setWorkspaceMode("organize")} />
 						<ModeButton label="Focus" active={workspaceMode === "focus"} onClick={() => setWorkspaceMode("focus")} />
-						<ModeButton label="Blog" active={workspaceMode === "blog"} onClick={() => setWorkspaceMode("blog")} />
 					</div>
 						<button
 							onClick={() => setAiOpen((v) => !v)}
@@ -1933,12 +1923,6 @@ export default function Home() {
 									))}
 								</div>
 							</section>
-						</div>
-					) : null}
-
-					{workspaceMode === "blog" ? (
-						<div className="h-full">
-							<RssBlogWorkspace onOpenNote={focusNote} />
 						</div>
 					) : null}
 
@@ -2262,11 +2246,10 @@ export default function Home() {
 
 				<div className="space-y-3 md:hidden">
 					<div className="rounded-2xl border border-slate-200 bg-white p-2">
-						<div className="grid grid-cols-4 gap-2">
+						<div className="grid grid-cols-3 gap-2">
 							<ModeButton label="Capture" active={workspaceMode === "capture"} onClick={() => setWorkspaceMode("capture")} />
 							<ModeButton label="Organize" active={workspaceMode === "organize"} onClick={() => setWorkspaceMode("organize")} />
 							<ModeButton label="Focus" active={workspaceMode === "focus"} onClick={() => setWorkspaceMode("focus")} />
-							<ModeButton label="Blog" active={workspaceMode === "blog"} onClick={() => setWorkspaceMode("blog")} />
 						</div>
 					</div>
 
@@ -2444,10 +2427,6 @@ export default function Home() {
 								</div>
 							</section>
 						</div>
-					) : null}
-
-					{workspaceMode === "blog" ? (
-						<RssBlogWorkspace onOpenNote={focusNote} />
 					) : null}
 
 						{workspaceMode === "focus" ? (
