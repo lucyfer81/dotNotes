@@ -204,15 +204,8 @@ export function registerRssRoutes(app: Hono<{ Bindings: Env }>): void {
 		const itemId = c.req.param("id");
 		await ensureRssSchema(c.env.DB);
 		try {
-			const queued = await saveRssItemToReading(c.env, itemId);
-			if (queued.noteId === null && queued.item.readingState === "queued") {
-				c.executionCtx?.waitUntil?.(
-					processQueuedRssReadingItems(c.env, { limit: 1, itemId }).catch((error) => {
-						console.error("Process queued rss reading item failed", { itemId, error });
-					}),
-				);
-			}
-			return jsonOk(c, queued);
+			const saved = await saveRssItemToReading(c.env, itemId);
+			return jsonOk(c, saved);
 		} catch (error) {
 			const message = String(error);
 			if (message.includes("not found")) {
