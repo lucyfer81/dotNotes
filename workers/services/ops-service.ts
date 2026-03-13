@@ -22,7 +22,6 @@ import {
 	getAiEmbeddingModel,
 	getSiliconflowApiKey,
 } from "./ai-core-service";
-import { ensureRssSchema, listRssReadingJobs } from "./rss-feed-service";
 
 const DEFAULT_OPS_WINDOW_MINUTES = 60;
 
@@ -40,27 +39,6 @@ export function registerOpsRoutes(app: Hono<{ Bindings: Env }>): void {
 			windowMinutes,
 			generatedAt: metrics.generatedAt,
 			alerts: metrics.alerts,
-		});
-	});
-
-	app.get("/api/ops/rss/reading-jobs", async (c) => {
-		await ensureRssSchema(c.env.DB);
-		const limit = clampInt(c.req.query("limit"), 30, 1, 200);
-		const offset = clampInt(c.req.query("offset"), 0, 0, 5000);
-		const stateCsv = c.req.query("state");
-		const result = await listRssReadingJobs(c.env.DB, {
-			readingStateCsv: typeof stateCsv === "string" ? stateCsv : null,
-			limit,
-			offset,
-		});
-		return jsonOk(c, {
-			items: result.items,
-			paging: {
-				limit,
-				offset,
-				count: result.count,
-			},
-			summary: result.summary,
 		});
 	});
 

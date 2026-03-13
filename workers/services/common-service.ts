@@ -6,7 +6,7 @@ export function jsonOk<T>(c: AppContext, data: T, status: 200 | 201 = 200) {
 	return c.json({ ok: true, data }, status);
 }
 
-export function jsonError(c: AppContext, status: 400 | 404 | 409 | 500, error: string, details?: string) {
+export function jsonError(c: AppContext, status: 400 | 401 | 404 | 409 | 500, error: string, details?: string) {
 	return c.json({ ok: false, error, details }, status);
 }
 

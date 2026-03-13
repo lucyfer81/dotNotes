@@ -17,6 +17,7 @@ import {
 import { formatMonthDayTime } from "../lib/datetime";
 
 type BlogTab = "inbox" | "feeds";
+const RSS_ITEMS_PAGE_SIZE = 50;
 
 export default function RssBlogWorkspace(props: {
 	onOpenNote: (noteId: string) => void;
@@ -32,6 +33,8 @@ export default function RssBlogWorkspace(props: {
 	const [newFeedTitle, setNewFeedTitle] = useState("");
 	const [isLoadingFeeds, setIsLoadingFeeds] = useState(false);
 	const [isLoadingItems, setIsLoadingItems] = useState(false);
+	const [isLoadingMoreItems, setIsLoadingMoreItems] = useState(false);
+	const [hasMoreItems, setHasMoreItems] = useState(false);
 	const [isSyncing, setIsSyncing] = useState(false);
 	const [isTranslating, setIsTranslating] = useState(false);
 	const [isCreatingFeed, setIsCreatingFeed] = useState(false);
@@ -70,30 +73,56 @@ export default function RssBlogWorkspace(props: {
 		}
 	};
 
-	const loadItems = async () => {
+	const loadItems = async (options: { append?: boolean } = {}) => {
 		if (tab === "feeds") {
 			return;
 		}
-		setIsLoadingItems(true);
+		const append = options.append === true;
+		if (append) {
+			setIsLoadingMoreItems(true);
+		} else {
+			setIsLoadingItems(true);
+		}
 		try {
 			const next = await listRssItems({
 				feedId: selectedFeedId === "all" ? null : selectedFeedId,
 				statuses: activeStatuses,
-				limit: 80,
-				offset: 0,
+				limit: RSS_ITEMS_PAGE_SIZE,
+				offset: append ? items.length : 0,
 			});
-			setItems(next);
-			setSelectedItemId((prev) => {
-				if (next.some((item) => item.id === prev)) {
-					return prev;
-				}
-				return next[0]?.id ?? "";
-			});
+			setHasMoreItems(next.length === RSS_ITEMS_PAGE_SIZE);
+			if (append) {
+				setItems((prev) => [...prev, ...next]);
+				setSelectedItemId((prev) => prev || next[0]?.id || "");
+			} else {
+				setItems(next);
+				setSelectedItemId((prev) => {
+					if (next.some((item) => item.id === prev)) {
+						return prev;
+					}
+					return next[0]?.id ?? "";
+				});
+			}
 		} catch (error) {
 			setErrorMessage(readErrorMessage(error));
 		} finally {
-			setIsLoadingItems(false);
+			if (append) {
+				setIsLoadingMoreItems(false);
+			} else {
+				setIsLoadingItems(false);
+			}
 		}
+	};
+
+	const handleLoadMoreItems = async () => {
+		if (isLoadingItems || isLoadingMoreItems || !hasMoreItems) {
+			return;
+		}
+		await loadItems({ append: true });
+	};
+
+	const refreshItemsFromStart = async () => {
+		await loadItems({ append: false });
 	};
 
 	useEffect(() => {
@@ -101,7 +130,7 @@ export default function RssBlogWorkspace(props: {
 	}, []);
 
 	useEffect(() => {
-		void loadItems();
+		void refreshItemsFromStart();
 	}, [tab, selectedFeedId, showSavedOnly]);
 
 	useEffect(() => {
@@ -113,7 +142,7 @@ export default function RssBlogWorkspace(props: {
 			return;
 		}
 		const timer = window.setInterval(() => {
-			void loadItems();
+			void refreshItemsFromStart();
 		}, 10_000);
 		return () => window.clearInterval(timer);
 	}, [items, tab, selectedFeedId, showSavedOnly]);
@@ -174,7 +203,7 @@ export default function RssBlogWorkspace(props: {
 				`同步完成：处理 ${aggregate.processedFeeds} 源，新增 ${aggregate.totalCreated}，更新 ${aggregate.totalUpdated}，失败 ${failedFeeds}`,
 			);
 			await loadFeeds();
-			await loadItems();
+			await refreshItemsFromStart();
 		} catch (error) {
 			setErrorMessage(readErrorMessage(error));
 		} finally {
@@ -192,7 +221,7 @@ export default function RssBlogWorkspace(props: {
 				limit: 20,
 			});
 			setSuccessMessage(`翻译补全完成：处理 ${result.requested} 条，成功 ${result.translated}，失败 ${result.failed}`);
-			await loadItems();
+			await refreshItemsFromStart();
 		} catch (error) {
 			setErrorMessage(readErrorMessage(error));
 		} finally {
@@ -257,7 +286,7 @@ export default function RssBlogWorkspace(props: {
 				setSelectedFeedId("all");
 			}
 			await loadFeeds();
-			await loadItems();
+			await refreshItemsFromStart();
 		} catch (error) {
 			setErrorMessage(readErrorMessage(error));
 		} finally {
@@ -286,7 +315,7 @@ export default function RssBlogWorkspace(props: {
 			} else {
 				setSuccessMessage("条目状态已更新");
 			}
-			await loadItems();
+			await refreshItemsFromStart();
 		} catch (error) {
 			setErrorMessage(readErrorMessage(error));
 		} finally {
@@ -299,7 +328,7 @@ export default function RssBlogWorkspace(props: {
 		setErrorMessage("");
 		try {
 			await updateRssItemStatus(item.id, status);
-			await loadItems();
+			await refreshItemsFromStart();
 		} catch (error) {
 			setErrorMessage(readErrorMessage(error));
 		} finally {
@@ -514,6 +543,22 @@ export default function RssBlogWorkspace(props: {
 									})
 								)}
 							</div>
+							{!isLoadingItems && items.length > 0 ? (
+								<div className="mt-3 flex justify-center">
+									<button
+										type="button"
+										onClick={handleLoadMoreItems}
+										disabled={!hasMoreItems || isLoadingMoreItems}
+										className={`rounded-lg border px-3 py-2 text-xs font-medium md:text-sm ${
+											!hasMoreItems || isLoadingMoreItems
+												? "cursor-not-allowed border-slate-200 text-slate-300"
+												: "border-slate-200 text-slate-700 hover:bg-slate-100"
+										}`}
+									>
+										{isLoadingMoreItems ? "加载中..." : hasMoreItems ? "加载更多" : "已加载全部"}
+									</button>
+								</div>
+							) : null}
 						</section>
 
 					<section className="min-h-0 rounded-2xl border border-slate-200 bg-white p-3 shadow-sm md:p-4">

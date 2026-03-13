@@ -3,17 +3,14 @@ import { Link } from "react-router";
 import {
 	listIndexJobs,
 	listOpsMetrics,
-	listOpsRssReadingJobs,
 	migrateNoteStorage,
 	processIndexJobs,
-	processRssReadingQueue,
 	probeOpsAi,
 	rebuildIndex,
 	type IndexJobApiItem,
 	type IndexJobStatusApiItem,
 	type OpsAiProbeApiItem,
 	type OpsMetricsApiItem,
-	type RssItemApiItem,
 } from "../lib/api";
 import { formatMonthDayTime } from "../lib/datetime";
 import type { Route } from "./+types/ops";
@@ -46,9 +43,6 @@ export default function OpsPage() {
 	const [migrateLimitInput, setMigrateLimitInput] = useState("50");
 	const [migrateMinBytesInput, setMigrateMinBytesInput] = useState("65536");
 
-	const [rssProcessLimitInput, setRssProcessLimitInput] = useState("3");
-	const [rssJobsLimitInput, setRssJobsLimitInput] = useState("30");
-
 	const [probeCountInput, setProbeCountInput] = useState("3");
 	const [probeTimeoutInput, setProbeTimeoutInput] = useState("15000");
 	const [probeIncludeModels, setProbeIncludeModels] = useState(true);
@@ -58,7 +52,6 @@ export default function OpsPage() {
 
 	const [isLoadingMetrics, setIsLoadingMetrics] = useState(false);
 	const [isLoadingJobs, setIsLoadingJobs] = useState(false);
-	const [isLoadingRssJobs, setIsLoadingRssJobs] = useState(false);
 	const [pendingAction, setPendingAction] = useState("");
 	const [errorMessage, setErrorMessage] = useState("");
 	const [successMessage, setSuccessMessage] = useState("");
@@ -66,14 +59,6 @@ export default function OpsPage() {
 	const [lastIndexProcess, setLastIndexProcess] = useState<{ processed: number; success: number; failed: number } | null>(null);
 	const [lastRebuild, setLastRebuild] = useState<{ dryRun: boolean; enqueued: number } | null>(null);
 	const [lastMigrate, setLastMigrate] = useState<{ dryRun: boolean; scanned: number; migrated: number } | null>(null);
-	const [lastRssProcess, setLastRssProcess] = useState<{ processed: number; created: number; failed: number; skipped: number } | null>(null);
-	const [rssReadingJobs, setRssReadingJobs] = useState<RssItemApiItem[]>([]);
-	const [rssReadingJobsCount, setRssReadingJobsCount] = useState(0);
-	const [rssReadingSummary, setRssReadingSummary] = useState<{ queued: number; processing: number; failed: number }>({
-		queued: 0,
-		processing: 0,
-		failed: 0,
-	});
 
 	const activeAlerts = useMemo(
 		() => (metrics?.alerts ?? []).filter((item) => item.status === "warn"),
@@ -82,20 +67,9 @@ export default function OpsPage() {
 
 	useEffect(() => {
 		void (async () => {
-			await Promise.all([refreshMetrics(), refreshJobs(), refreshRssReadingJobs()]);
+			await Promise.all([refreshMetrics(), refreshJobs()]);
 		})();
 	}, []);
-
-	useEffect(() => {
-		const hasPending = rssReadingSummary.queued > 0 || rssReadingSummary.processing > 0;
-		if (!hasPending) {
-			return;
-		}
-		const timer = window.setInterval(() => {
-			void refreshRssReadingJobs();
-		}, 10_000);
-		return () => window.clearInterval(timer);
-	}, [rssReadingSummary.queued, rssReadingSummary.processing, rssJobsLimitInput]);
 
 	const refreshMetrics = async () => {
 		const windowMinutes = parseIntInRange(windowMinutesInput, 60, 5, 24 * 60);
@@ -197,47 +171,6 @@ export default function OpsPage() {
 		}
 	};
 
-	const runRssReadingProcess = async () => {
-		const limit = parseIntInRange(rssProcessLimitInput, 3, 1, 100);
-		setPendingAction("rss-process");
-		setErrorMessage("");
-		setSuccessMessage("");
-		try {
-			const result = await processRssReadingQueue({ limit });
-			setLastRssProcess({
-				processed: result.processed,
-				created: result.created,
-				failed: result.failed,
-				skipped: result.skipped,
-			});
-			setSuccessMessage(`RSS 阅读队列处理完成：处理 ${result.processed}，新增 ${result.created}，失败 ${result.failed}`);
-			await refreshRssReadingJobs();
-		} catch (error) {
-			setErrorMessage(readErrorMessage(error));
-		} finally {
-			setPendingAction("");
-		}
-	};
-
-	const refreshRssReadingJobs = async () => {
-		const limit = parseIntInRange(rssJobsLimitInput, 30, 1, 200);
-		setIsLoadingRssJobs(true);
-		try {
-			const next = await listOpsRssReadingJobs({
-				limit,
-				offset: 0,
-				states: ["processing", "queued", "failed"],
-			});
-			setRssReadingJobs(next.items);
-			setRssReadingJobsCount(next.paging.count);
-			setRssReadingSummary(next.summary);
-		} catch (error) {
-			setErrorMessage(readErrorMessage(error));
-		} finally {
-			setIsLoadingRssJobs(false);
-		}
-	};
-
 	const runAiProbe = async () => {
 		const count = parseIntInRange(probeCountInput, 3, 1, 20);
 		const timeoutMs = parseIntInRange(probeTimeoutInput, 15000, 1000, 120000);
@@ -275,7 +208,7 @@ export default function OpsPage() {
 			<div className="mb-5 flex flex-wrap items-center justify-between gap-3">
 				<div>
 					<h1 className="text-2xl font-semibold tracking-tight text-slate-900">运维控制台</h1>
-					<p className="mt-1 text-sm text-slate-500">用于监控与手动处置索引、RSS 队列和 AI 连通性。</p>
+					<p className="mt-1 text-sm text-slate-500">用于监控与手动处置索引、存储维护和 AI 连通性。</p>
 				</div>
 				<div className="flex items-center gap-2">
 					<Link to="/" className="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 hover:bg-slate-50">返回工作台</Link>
@@ -459,76 +392,6 @@ export default function OpsPage() {
 				{lastMigrate ? <p className="mt-2 text-xs text-slate-600">最近迁移：{lastMigrate.dryRun ? "预览" : "执行"}，扫描 {lastMigrate.scanned}，迁移 {lastMigrate.migrated}</p> : null}
 			</section>
 
-			<section className="mb-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-				<h2 className="mb-3 text-lg font-semibold text-slate-900">RSS 阅读队列</h2>
-				<div className="flex flex-wrap items-center gap-2 text-sm">
-					<input value={rssProcessLimitInput} onChange={(event) => setRssProcessLimitInput(event.target.value)} className="w-24 rounded-lg border border-slate-200 px-2 py-1.5" />
-					<button
-						type="button"
-						disabled={pendingAction !== ""}
-						onClick={() => void runRssReadingProcess()}
-						className="rounded-lg border border-emerald-200 px-3 py-1.5 text-emerald-700 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:border-slate-200 disabled:text-slate-300"
-					>
-						处理队列
-					</button>
-					<input value={rssJobsLimitInput} onChange={(event) => setRssJobsLimitInput(event.target.value)} className="w-24 rounded-lg border border-slate-200 px-2 py-1.5" />
-					<button
-						type="button"
-						disabled={isLoadingRssJobs}
-						onClick={() => void refreshRssReadingJobs()}
-						className="rounded-lg border border-sky-200 px-3 py-1.5 text-sky-700 hover:bg-sky-50 disabled:cursor-not-allowed disabled:border-slate-200 disabled:text-slate-300"
-					>
-						{isLoadingRssJobs ? "刷新中..." : "刷新队列详情"}
-					</button>
-				</div>
-				{lastRssProcess ? <p className="mt-2 text-xs text-slate-600">最近处理：处理 {lastRssProcess.processed}，新增 {lastRssProcess.created}，失败 {lastRssProcess.failed}，跳过 {lastRssProcess.skipped}</p> : null}
-				<p className="mt-2 text-xs text-slate-600">
-					队列概览：处理中 {rssReadingSummary.processing}，排队 {rssReadingSummary.queued}，失败 {rssReadingSummary.failed}
-				</p>
-				<p className="mt-1 text-xs text-slate-500">当前列表数量：{rssReadingJobs.length}/{rssReadingJobsCount}</p>
-				<div className="mt-2 max-h-80 overflow-auto rounded-xl border border-slate-200">
-					<table className="min-w-full text-left text-xs">
-						<thead className="sticky top-0 bg-slate-100 text-slate-600">
-							<tr>
-								<th className="px-2 py-2">状态</th>
-								<th className="px-2 py-2">标题</th>
-								<th className="px-2 py-2">订阅源</th>
-								<th className="px-2 py-2">尝试</th>
-								<th className="px-2 py-2">请求/开始</th>
-								<th className="px-2 py-2">错误</th>
-								<th className="px-2 py-2">更新时间</th>
-							</tr>
-						</thead>
-						<tbody>
-							{rssReadingJobs.map((item) => (
-								<tr key={item.id} className="border-t border-slate-200">
-									<td className="px-2 py-2">{formatRssReadingState(item.readingState)}</td>
-									<td className="max-w-[260px] truncate px-2 py-2">
-										{item.link ? (
-											<a href={item.link} target="_blank" rel="noreferrer" className="text-sky-700 hover:underline">
-												{item.title || "（无标题）"}
-											</a>
-										) : (item.title || "（无标题）")}
-									</td>
-									<td className="max-w-[180px] truncate px-2 py-2">{item.feedTitle || "-"}</td>
-									<td className="px-2 py-2">{item.readingAttemptCount}</td>
-									<td className="px-2 py-2 text-slate-500">
-										{item.readingStartedAt ? formatDateTime(item.readingStartedAt) : item.readingRequestedAt ? formatDateTime(item.readingRequestedAt) : "-"}
-									</td>
-									<td className="max-w-[260px] truncate px-2 py-2 text-rose-600">{item.readingError || "-"}</td>
-									<td className="px-2 py-2 text-slate-500">{formatDateTime(item.updatedAt)}</td>
-								</tr>
-							))}
-							{rssReadingJobs.length === 0 ? (
-								<tr>
-									<td className="px-2 py-3 text-slate-500" colSpan={7}>暂无 queued / processing / failed 条目</td>
-								</tr>
-							) : null}
-						</tbody>
-					</table>
-				</div>
-			</section>
-
 			<section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
 				<h2 className="mb-3 text-lg font-semibold text-slate-900">AI 连通性探针</h2>
 				<div className="mb-2 grid gap-2 md:grid-cols-3">
@@ -600,22 +463,6 @@ function formatMs(value: number | null): string {
 		return "-";
 	}
 	return `${Math.round(value)}ms`;
-}
-
-function formatRssReadingState(value: RssItemApiItem["readingState"]): string {
-	if (value === "processing") {
-		return "处理中";
-	}
-	if (value === "queued") {
-		return "排队中";
-	}
-	if (value === "failed") {
-		return "失败";
-	}
-	if (value === "ready") {
-		return "已完成";
-	}
-	return "未开始";
 }
 
 function formatDateTime(value: string): string {
