@@ -47,6 +47,7 @@
 		"cf-typegen": "XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-/tmp/dotnotes-codex-config} wrangler types",
 		"deploy": "XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-/tmp/dotnotes-codex-config} npm run build && XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-/tmp/dotnotes-codex-config} wrangler deploy",
 		"dev": "XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-/tmp/dotnotes-codex-config} react-router dev",
+		"e2e:cutover": "bash ./scripts/e2e/dotnotes-cutover-smoke.sh",
 		"preview": "npm run build && vite preview",
 		"test": "XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-/tmp/dotnotes-codex-config} vitest run",
 		"typecheck": "XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-/tmp/dotnotes-codex-config} npm run cf-typegen && XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-/tmp/dotnotes-codex-config} react-router typegen && tsc -b"
