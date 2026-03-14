@@ -42,6 +42,44 @@ export type NoteLinksApiItem = {
 	outbound: NoteLinkApiItem[];
 	inbound: NoteLinkApiItem[];
 };
+export type NoteRelationTypeApiItem =
+	| "similar"
+	| "complements"
+	| "contrasts"
+	| "same_project"
+	| "same_area"
+	| "related";
+export type NoteRelationStatusApiItem = "suggested" | "accepted" | "rejected" | "all";
+export type NoteRelationSourceApiItem = "ai" | "manual" | "all";
+export type NoteRelationApiItem = {
+	id: string;
+	relationType: NoteRelationTypeApiItem;
+	status: Exclude<NoteRelationStatusApiItem, "all">;
+	source: Exclude<NoteRelationSourceApiItem, "all">;
+	score: number;
+	reason: string;
+	evidenceExcerpt: string | null;
+	provider: string | null;
+	model: string | null;
+	createdAt: string;
+	updatedAt: string;
+	otherNote: {
+		id: string;
+		slug: string;
+		title: string;
+		excerpt: string;
+		updatedAt: string;
+	};
+};
+export type NoteRelationListApiItem = {
+	noteId: string;
+	items: NoteRelationApiItem[];
+	paging: { limit: number; offset: number; count: number };
+	filters: {
+		status: NoteRelationStatusApiItem;
+		source: NoteRelationSourceApiItem;
+	};
+};
 export type NoteAssetApiItem = {
 	id: string;
 	noteId: string;
@@ -70,13 +108,15 @@ export type AiEnhanceRelatedNoteApiItem = {
 	score: number;
 	reason: string;
 };
-export type AiEnhanceLinkSuggestionApiItem = {
-	targetNoteId: string;
+export type AiEnhanceRelationSuggestionApiItem = {
+	noteId: string;
 	slug: string;
 	title: string;
-	anchorText: string;
+	snippet: string;
+	relationType: NoteRelationTypeApiItem;
 	score: number;
 	reason: string;
+	evidenceExcerpt: string | null;
 };
 export type AiEnhanceSummaryMetaApiItem = {
 	mode: "skip" | "mini" | "full";
@@ -93,13 +133,13 @@ export type AiEnhanceResultApiItem = {
 	titleCandidates: AiEnhanceTitleCandidateApiItem[];
 	tagSuggestions: AiEnhanceTagSuggestionApiItem[];
 	semanticSearch: AiEnhanceRelatedNoteApiItem[];
-	linkSuggestions: AiEnhanceLinkSuggestionApiItem[];
+	relationSuggestions: AiEnhanceRelationSuggestionApiItem[];
 	summary: string;
 	outline: string[];
 	summaryMeta: AiEnhanceSummaryMetaApiItem;
 	similarNotes: AiEnhanceRelatedNoteApiItem[];
 };
-export type AiEnhanceTaskApiKey = "title" | "tags" | "semantic" | "links" | "summary" | "similar";
+export type AiEnhanceTaskApiKey = "title" | "tags" | "semantic" | "relations" | "summary" | "similar";
 export type AiEnhanceTaskStreamStage = "prepare" | "generate" | "processing";
 export type AiEnhanceTaskStreamProgress = {
 	task: AiEnhanceTaskApiKey;
@@ -326,6 +366,33 @@ type UpdateFolderInput = {
 type AiEnhanceInput = {
 	query?: string;
 	topK?: number;
+};
+type ListNoteRelationsOptions = {
+	status?: NoteRelationStatusApiItem;
+	source?: NoteRelationSourceApiItem;
+	limit?: number;
+	offset?: number;
+};
+type UpsertNoteRelationInput = {
+	otherNoteId: string;
+	relationType?: NoteRelationTypeApiItem;
+	status?: Exclude<NoteRelationStatusApiItem, "all">;
+	source?: Exclude<NoteRelationSourceApiItem, "all">;
+	score?: number;
+	reason?: string;
+	evidenceExcerpt?: string | null;
+	provider?: string | null;
+	model?: string | null;
+};
+type UpdateNoteRelationInput = {
+	relationType?: NoteRelationTypeApiItem;
+	status?: Exclude<NoteRelationStatusApiItem, "all">;
+	source?: Exclude<NoteRelationSourceApiItem, "all">;
+	score?: number;
+	reason?: string;
+	evidenceExcerpt?: string | null;
+	provider?: string | null;
+	model?: string | null;
 };
 type ListRssItemsOptions = {
 	feedId?: string | null;
@@ -578,6 +645,78 @@ export async function getNoteLinks(noteId: string, status?: NoteStatus): Promise
 		throw new Error("Invalid note links response");
 	}
 	return parsed;
+}
+
+export async function listNoteRelations(
+	noteId: string,
+	options: ListNoteRelationsOptions = {},
+): Promise<NoteRelationListApiItem> {
+	const query = new URLSearchParams();
+	if (options.status) {
+		query.set("status", options.status);
+	}
+	if (options.source) {
+		query.set("source", options.source);
+	}
+	if (typeof options.limit === "number") {
+		query.set("limit", String(options.limit));
+	}
+	if (typeof options.offset === "number") {
+		query.set("offset", String(options.offset));
+	}
+	const suffix = query.toString();
+	const data = await requestApiData<unknown>(
+		`/api/notes/${encodeURIComponent(noteId)}/relations${suffix ? `?${suffix}` : ""}`,
+	);
+	const parsed = toNoteRelationListApiItem(data);
+	if (!parsed) {
+		throw new Error("Invalid note relations response");
+	}
+	return parsed;
+}
+
+export async function upsertNoteRelations(
+	noteId: string,
+	items: UpsertNoteRelationInput[],
+): Promise<NoteRelationApiItem[]> {
+	const data = await requestApiData<unknown>(`/api/notes/${encodeURIComponent(noteId)}/relations/bulk-upsert`, {
+		method: "POST",
+		body: JSON.stringify({ items }),
+	});
+	if (!isRecord(data) || !Array.isArray(data.items)) {
+		throw new Error("Invalid upsert note relations response");
+	}
+	return data.items
+		.map((item) => toNoteRelationApiItem(item))
+		.filter((item): item is NoteRelationApiItem => item !== null);
+}
+
+export async function updateNoteRelation(
+	noteId: string,
+	relationId: string,
+	input: UpdateNoteRelationInput,
+): Promise<NoteRelationApiItem> {
+	const data = await requestApiData<unknown>(
+		`/api/notes/${encodeURIComponent(noteId)}/relations/${encodeURIComponent(relationId)}`,
+		{
+			method: "PATCH",
+			body: JSON.stringify(input),
+		},
+	);
+	const parsed = toNoteRelationApiItem(data);
+	if (!parsed) {
+		throw new Error("Invalid update note relation response");
+	}
+	return parsed;
+}
+
+export async function deleteNoteRelation(noteId: string, relationId: string): Promise<void> {
+	await requestApiData<unknown>(
+		`/api/notes/${encodeURIComponent(noteId)}/relations/${encodeURIComponent(relationId)}`,
+		{
+			method: "DELETE",
+		},
+	);
 }
 
 export async function enhanceNoteWithAi(noteId: string, input: AiEnhanceInput = {}): Promise<AiEnhanceResultApiItem> {
@@ -1208,6 +1347,83 @@ function toNoteLinksApiItem(value: unknown): NoteLinksApiItem | null {
 	};
 }
 
+function toNoteRelationListApiItem(value: unknown): NoteRelationListApiItem | null {
+	if (!isRecord(value) || typeof value.noteId !== "string" || !Array.isArray(value.items)) {
+		return null;
+	}
+	if (
+		!isRecord(value.paging) ||
+		typeof value.paging.limit !== "number" ||
+		typeof value.paging.offset !== "number" ||
+		typeof value.paging.count !== "number" ||
+		!isRecord(value.filters) ||
+		!isNoteRelationStatusApiItem(value.filters.status) ||
+		!isNoteRelationSourceApiItem(value.filters.source)
+	) {
+		return null;
+	}
+	return {
+		noteId: value.noteId,
+		items: value.items
+			.map((item) => toNoteRelationApiItem(item))
+			.filter((item): item is NoteRelationApiItem => item !== null),
+		paging: {
+			limit: value.paging.limit,
+			offset: value.paging.offset,
+			count: value.paging.count,
+		},
+		filters: {
+			status: value.filters.status,
+			source: value.filters.source,
+		},
+	};
+}
+
+function toNoteRelationApiItem(value: unknown): NoteRelationApiItem | null {
+	if (
+		!isRecord(value) ||
+		typeof value.id !== "string" ||
+		!isNoteRelationTypeApiItem(value.relationType) ||
+		!isConcreteNoteRelationStatusApiItem(value.status) ||
+		!isConcreteNoteRelationSourceApiItem(value.source) ||
+		typeof value.score !== "number" ||
+		typeof value.reason !== "string" ||
+		(typeof value.evidenceExcerpt !== "string" && value.evidenceExcerpt !== null) ||
+		(typeof value.provider !== "string" && value.provider !== null) ||
+		(typeof value.model !== "string" && value.model !== null) ||
+		typeof value.createdAt !== "string" ||
+		typeof value.updatedAt !== "string" ||
+		!isRecord(value.otherNote) ||
+		typeof value.otherNote.id !== "string" ||
+		typeof value.otherNote.slug !== "string" ||
+		typeof value.otherNote.title !== "string" ||
+		typeof value.otherNote.excerpt !== "string" ||
+		typeof value.otherNote.updatedAt !== "string"
+	) {
+		return null;
+	}
+	return {
+		id: value.id,
+		relationType: value.relationType,
+		status: value.status,
+		source: value.source,
+		score: value.score,
+		reason: value.reason,
+		evidenceExcerpt: value.evidenceExcerpt,
+		provider: value.provider,
+		model: value.model,
+		createdAt: value.createdAt,
+		updatedAt: value.updatedAt,
+		otherNote: {
+			id: value.otherNote.id,
+			slug: value.otherNote.slug,
+			title: value.otherNote.title,
+			excerpt: value.otherNote.excerpt,
+			updatedAt: value.otherNote.updatedAt,
+		},
+	};
+}
+
 function toAiEnhanceResultApiItem(value: unknown): AiEnhanceResultApiItem | null {
 	if (
 		!isRecord(value) ||
@@ -1252,10 +1468,10 @@ function toAiEnhanceResultApiItem(value: unknown): AiEnhanceResultApiItem | null
 				.map((item) => toAiEnhanceRelatedNoteApiItem(item))
 				.filter((item): item is AiEnhanceRelatedNoteApiItem => item !== null)
 		: [];
-	const linkSuggestions = Array.isArray(value.linkSuggestions)
-		? value.linkSuggestions
-				.map((item) => toAiEnhanceLinkSuggestionApiItem(item))
-				.filter((item): item is AiEnhanceLinkSuggestionApiItem => item !== null)
+	const relationSuggestions = Array.isArray(value.relationSuggestions)
+		? value.relationSuggestions
+				.map((item) => toAiEnhanceRelationSuggestionApiItem(item))
+				.filter((item): item is AiEnhanceRelationSuggestionApiItem => item !== null)
 		: [];
 
 	return {
@@ -1268,7 +1484,7 @@ function toAiEnhanceResultApiItem(value: unknown): AiEnhanceResultApiItem | null
 		titleCandidates,
 		tagSuggestions,
 		semanticSearch,
-		linkSuggestions,
+		relationSuggestions,
 		summary: value.summary,
 		outline,
 		summaryMeta,
@@ -1347,25 +1563,29 @@ function toAiEnhanceRelatedNoteApiItem(value: unknown): AiEnhanceRelatedNoteApiI
 	};
 }
 
-function toAiEnhanceLinkSuggestionApiItem(value: unknown): AiEnhanceLinkSuggestionApiItem | null {
+function toAiEnhanceRelationSuggestionApiItem(value: unknown): AiEnhanceRelationSuggestionApiItem | null {
 	if (
 		!isRecord(value) ||
-		typeof value.targetNoteId !== "string" ||
+		typeof value.noteId !== "string" ||
 		typeof value.slug !== "string" ||
 		typeof value.title !== "string" ||
-		typeof value.anchorText !== "string" ||
+		typeof value.snippet !== "string" ||
+		!isNoteRelationTypeApiItem(value.relationType) ||
 		typeof value.score !== "number" ||
-		typeof value.reason !== "string"
+		typeof value.reason !== "string" ||
+		(typeof value.evidenceExcerpt !== "string" && value.evidenceExcerpt !== null)
 	) {
 		return null;
 	}
 	return {
-		targetNoteId: value.targetNoteId,
+		noteId: value.noteId,
 		slug: value.slug,
 		title: value.title,
-		anchorText: value.anchorText,
+		snippet: value.snippet,
+		relationType: value.relationType,
 		score: value.score,
 		reason: value.reason,
+		evidenceExcerpt: value.evidenceExcerpt,
 	};
 }
 
@@ -1910,6 +2130,33 @@ function toNoteLinkApiItem(value: unknown): NoteLinkApiItem | null {
 		updatedAt: value.updatedAt,
 		anchorText: typeof value.anchorText === "string" ? value.anchorText : null,
 	};
+}
+
+function isNoteRelationTypeApiItem(value: unknown): value is NoteRelationTypeApiItem {
+	return (
+		value === "similar" ||
+		value === "complements" ||
+		value === "contrasts" ||
+		value === "same_project" ||
+		value === "same_area" ||
+		value === "related"
+	);
+}
+
+function isNoteRelationStatusApiItem(value: unknown): value is NoteRelationStatusApiItem {
+	return value === "suggested" || value === "accepted" || value === "rejected" || value === "all";
+}
+
+function isConcreteNoteRelationStatusApiItem(value: unknown): value is Exclude<NoteRelationStatusApiItem, "all"> {
+	return value === "suggested" || value === "accepted" || value === "rejected";
+}
+
+function isNoteRelationSourceApiItem(value: unknown): value is NoteRelationSourceApiItem {
+	return value === "ai" || value === "manual" || value === "all";
+}
+
+function isConcreteNoteRelationSourceApiItem(value: unknown): value is Exclude<NoteRelationSourceApiItem, "all"> {
+	return value === "ai" || value === "manual";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

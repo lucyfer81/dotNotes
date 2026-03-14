@@ -13,6 +13,15 @@ export function buildAiEnhanceDefaultQuery(title: string, bodyText: string): str
 	return joined || "笔记增强";
 }
 
+export function buildAiEnhanceRelationQuery(title: string, bodyText: string): string {
+	const condensedTitle = title.trim();
+	if (condensedTitle) {
+		return condensedTitle;
+	}
+	const bodySnippet = clipTextForAi(bodyText, 48);
+	return bodySnippet || "笔记关系";
+}
+
 export function buildSharedPromptContext(
 	input: AiEnhancePreparedInput,
 	maxInputChars: number,
@@ -121,22 +130,31 @@ export function buildSemanticTaskPrompt(sharedContext: unknown) {
 	};
 }
 
-export function buildLinksTaskPrompt(sharedContext: unknown, linkedSlugs: Set<string>) {
+export function buildRelationsTaskPrompt(sharedContext: unknown, relatedNoteIds: Set<string>) {
 	return {
-		systemPrompt: "你是知识库双链助手。只允许从 candidates 选择目标，并输出推荐锚文本。返回严格 JSON。",
+		systemPrompt: "你是知识库关系发现助手。只允许从 candidates 选择目标，并判断笔记间关系。返回严格 JSON。",
 		userPrompt: [
 			"规则：",
 			"- 仅输出 candidates 中的 noteId。",
-			"- 过滤 already_linked_slugs。",
-			"- 每条建议包含 anchorText、reason、score(0~1)。",
+			"- 过滤 already_related_note_ids。",
+			"- relationType 仅允许: similar, complements, contrasts, same_project, same_area, related。",
+			"- 每条建议包含 reason、score(0~1)、evidenceExcerpt。",
 			"",
 			`input: ${JSON.stringify({
 				...(sharedContext as Record<string, unknown>),
-				already_linked_slugs: [...linkedSlugs],
+				already_related_note_ids: [...relatedNoteIds],
 			})}`,
 			"schema:",
 			JSON.stringify({
-				linkSuggestions: [{ noteId: "string", anchorText: "string", score: 0.8, reason: "string" }],
+				relationSuggestions: [
+					{
+						noteId: "string",
+						relationType: "related",
+						score: 0.8,
+						reason: "string",
+						evidenceExcerpt: "string",
+					},
+				],
 			}),
 		].join("\n"),
 	};

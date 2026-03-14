@@ -7,8 +7,8 @@ import {
 import { normalizeTagName } from "./note-relations-service";
 import type {
 	AiContextNoteItem,
-	AiEnhanceLinkSuggestion,
 	AiEnhancePreparedInput,
+	AiEnhanceRelationSuggestion,
 	AiEnhanceRelatedNoteItem,
 	AiEnhanceResult,
 	AiEnhanceSummaryMeta,
@@ -38,7 +38,7 @@ export function createEmptyAiEnhanceResult(
 		titleCandidates: [],
 		tagSuggestions: [],
 		semanticSearch: [],
-		linkSuggestions: [],
+		relationSuggestions: [],
 		summary: "",
 		outline: [],
 		summaryMeta: {
@@ -115,21 +115,23 @@ export function buildFallbackSemanticSearch(candidates: AiContextNoteItem[], top
 	}));
 }
 
-export function buildFallbackLinkSuggestions(
+export function buildFallbackRelationSuggestions(
 	semanticSearch: AiEnhanceRelatedNoteItem[],
-	linkedSlugs: Set<string>,
+	relatedNoteIds: Set<string>,
 	topK: number,
-): AiEnhanceLinkSuggestion[] {
+): AiEnhanceRelationSuggestion[] {
 	return semanticSearch
-		.filter((item) => !linkedSlugs.has(item.slug))
+		.filter((item) => !relatedNoteIds.has(item.noteId))
 		.slice(0, topK)
 		.map((item) => ({
-			targetNoteId: item.noteId,
+			noteId: item.noteId,
 			slug: item.slug,
 			title: item.title,
-			anchorText: item.slug,
+			snippet: item.snippet,
+			relationType: "related",
 			score: item.score,
-			reason: "基于关键词建议双链",
+			reason: "基于关键词建议建立关系",
+			evidenceExcerpt: item.snippet,
 		}));
 }
 
@@ -175,11 +177,11 @@ export function buildAiEnhanceFallback(
 	if (taskSet.has("semantic")) {
 		result.semanticSearch = buildFallbackSemanticSearch(input.candidates, input.topK);
 	}
-	if (taskSet.has("links")) {
+	if (taskSet.has("relations")) {
 		const base = result.semanticSearch.length > 0
 			? result.semanticSearch
 			: buildFallbackSemanticSearch(input.candidates, input.topK);
-		result.linkSuggestions = buildFallbackLinkSuggestions(base, input.linkedSlugs, input.topK);
+		result.relationSuggestions = buildFallbackRelationSuggestions(base, input.relatedNoteIds, input.topK);
 	}
 	if (taskSet.has("summary")) {
 		const summaryMeta = decideSummaryMode(input.note.bodyText ?? "");

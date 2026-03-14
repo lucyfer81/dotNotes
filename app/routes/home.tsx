@@ -8,17 +8,22 @@ import {
 	createNote,
 	deleteNoteAsset,
 	deleteNote,
+	deleteNoteRelation,
 	enhanceNoteWithAiTaskStream,
 	getNoteLinks,
 	hardDeleteNote,
 	listFolders,
 	listNoteAssets,
 	listNotes,
+	listNoteRelations,
 	listTags,
 	restoreNote,
+	upsertNoteRelations,
 	uploadNoteAsset,
 	updateFolder,
 	updateNote,
+	updateNoteRelation,
+	type AiEnhanceRelationSuggestionApiItem,
 	type AiEnhanceRelatedNoteApiItem,
 	type AiEnhanceResultApiItem,
 	type AiEnhanceTaskStreamProgress,
@@ -27,6 +32,8 @@ import {
 	type NoteAssetApiItem,
 	type NoteLinkApiItem,
 	type NoteLinksApiItem,
+	type NoteRelationApiItem,
+	type NoteRelationTypeApiItem,
 	type NoteApiItem,
 	type NoteStatus,
 	type TagApiItem,
@@ -78,7 +85,7 @@ const AI_TASK_ITEMS: Array<{ key: AiEnhanceTaskApiKey; label: string }> = [
 	{ key: "title", label: "生成标题" },
 	{ key: "tags", label: "生成标签" },
 	{ key: "semantic", label: "语义搜索" },
-	{ key: "links", label: "双链建议" },
+	{ key: "relations", label: "关系建议" },
 	{ key: "summary", label: "摘要大纲" },
 	{ key: "similar", label: "相似笔记" },
 ];
@@ -96,6 +103,14 @@ const PARA_MAIN_ROOT_IDS = new Set([
 	"folder-30-resource",
 	"folder-40-archive",
 ]);
+const RELATION_TYPE_OPTIONS: Array<{ value: NoteRelationTypeApiItem; label: string }> = [
+	{ value: "related", label: "相关" },
+	{ value: "similar", label: "相似" },
+	{ value: "complements", label: "互补" },
+	{ value: "contrasts", label: "对照" },
+	{ value: "same_project", label: "同项目" },
+	{ value: "same_area", label: "同领域" },
+];
 
 export function meta({}: Route.MetaArgs) {
 	return [
@@ -118,7 +133,7 @@ export default function Home() {
 	const [aiErrorMessage, setAiErrorMessage] = useState("");
 	const [isApplyingAiTitle, setIsApplyingAiTitle] = useState(false);
 	const [isApplyingAiTags, setIsApplyingAiTags] = useState(false);
-	const [isApplyingAiLinks, setIsApplyingAiLinks] = useState(false);
+	const [isApplyingAiRelations, setIsApplyingAiRelations] = useState(false);
 	const [folderItems, setFolderItems] = useState<FolderApiItem[]>(defaultRootFolders);
 	const [organizeFolderId, setOrganizeFolderId] = useState<string | null>(null);
 	const [captureFolderId, setCaptureFolderId] = useState<string>(defaultRootFolders[0].id);
@@ -156,7 +171,10 @@ export default function Home() {
 	const [commandActiveIndex, setCommandActiveIndex] = useState(0);
 	const [recentNoteIds, setRecentNoteIds] = useState<string[]>([]);
 	const [noteLinks, setNoteLinks] = useState<NoteLinksApiItem | null>(null);
+	const [noteRelations, setNoteRelations] = useState<NoteRelationApiItem[]>([]);
 	const [isLoadingNoteLinks, setIsLoadingNoteLinks] = useState(false);
+	const [isLoadingNoteRelations, setIsLoadingNoteRelations] = useState(false);
+	const [mutatingRelationId, setMutatingRelationId] = useState("");
 	const [noteAssets, setNoteAssets] = useState<NoteAssetApiItem[]>([]);
 	const [isLoadingAssets, setIsLoadingAssets] = useState(false);
 	const [isUploadingAsset, setIsUploadingAsset] = useState(false);
@@ -180,7 +198,7 @@ export default function Home() {
 		title: 0,
 		tags: 0,
 		semantic: 0,
-		links: 0,
+		relations: 0,
 		summary: 0,
 		similar: 0,
 	});
@@ -346,7 +364,7 @@ export default function Home() {
 			title: 0,
 			tags: 0,
 			semantic: 0,
-			links: 0,
+			relations: 0,
 			summary: 0,
 			similar: 0,
 		};
@@ -725,6 +743,41 @@ export default function Home() {
 
 	useEffect(() => {
 		if (!activeNoteId || !activeNote || activeNote.deletedAt) {
+			setNoteRelations([]);
+			setIsLoadingNoteRelations(false);
+			return;
+		}
+
+		let cancelled = false;
+		setIsLoadingNoteRelations(true);
+		void listNoteRelations(activeNoteId, {
+			status: "all",
+			source: "all",
+			limit: 48,
+		})
+			.then((response) => {
+				if (!cancelled) {
+					setNoteRelations(response.items);
+				}
+			})
+			.catch(() => {
+				if (!cancelled) {
+					setNoteRelations([]);
+				}
+			})
+			.finally(() => {
+				if (!cancelled) {
+					setIsLoadingNoteRelations(false);
+				}
+			});
+
+		return () => {
+			cancelled = true;
+		};
+	}, [activeNoteId, activeNote?.deletedAt]);
+
+	useEffect(() => {
+		if (!activeNoteId || !activeNote || activeNote.deletedAt) {
 			setNoteAssets([]);
 			setIsLoadingAssets(false);
 			setAssetErrorMessage("");
@@ -1021,6 +1074,126 @@ export default function Home() {
 		void syncActiveNoteLinks(nextSlugs);
 	};
 
+	const refreshActiveNoteRelations = async (noteId: string) => {
+		const response = await listNoteRelations(noteId, {
+			status: "all",
+			source: "all",
+			limit: 48,
+		});
+		setNoteRelations(response.items);
+	};
+
+	const handleUpdateRelationType = async (relationId: string, relationType: NoteRelationTypeApiItem) => {
+		if (!activeNote || isActiveNoteDeleted || mutatingRelationId) {
+			return;
+		}
+		setMutatingRelationId(relationId);
+		try {
+			await updateNoteRelation(activeNote.id, relationId, { relationType });
+			await refreshActiveNoteRelations(activeNote.id);
+		} catch (error) {
+			setAiErrorMessage(readErrorMessage(error));
+		} finally {
+			setMutatingRelationId("");
+		}
+	};
+
+	const handleAcceptRelation = async (relationId: string) => {
+		if (!activeNote || isActiveNoteDeleted || mutatingRelationId) {
+			return;
+		}
+		const target = noteRelations.find((item) => item.id === relationId) ?? null;
+		setMutatingRelationId(relationId);
+		try {
+			await updateNoteRelation(activeNote.id, relationId, { status: "accepted" });
+			await refreshActiveNoteRelations(activeNote.id);
+			if (target) {
+				setAiEnhanceResult((prev) => prev
+					? {
+						...prev,
+						relationSuggestions: prev.relationSuggestions.filter((item) => item.noteId !== target.otherNote.id),
+					}
+					: prev);
+			}
+		} catch (error) {
+			setAiErrorMessage(readErrorMessage(error));
+		} finally {
+			setMutatingRelationId("");
+		}
+	};
+
+	const handleRejectRelation = async (relationId: string) => {
+		if (!activeNote || isActiveNoteDeleted || mutatingRelationId) {
+			return;
+		}
+		const target = noteRelations.find((item) => item.id === relationId) ?? null;
+		setMutatingRelationId(relationId);
+		try {
+			await updateNoteRelation(activeNote.id, relationId, { status: "rejected" });
+			await refreshActiveNoteRelations(activeNote.id);
+			if (target) {
+				setAiEnhanceResult((prev) => prev
+					? {
+						...prev,
+						relationSuggestions: prev.relationSuggestions.filter((item) => item.noteId !== target.otherNote.id),
+					}
+					: prev);
+			}
+		} catch (error) {
+			setAiErrorMessage(readErrorMessage(error));
+		} finally {
+			setMutatingRelationId("");
+		}
+	};
+
+	const handleAcceptAiRelationSuggestion = async (otherNoteId: string) => {
+		if (!activeNote || isActiveNoteDeleted || !aiEnhanceResult || mutatingRelationId) {
+			return;
+		}
+		const target = aiEnhanceResult.relationSuggestions.find((item) => item.noteId === otherNoteId);
+		if (!target) {
+			return;
+		}
+		setMutatingRelationId(`suggestion:${otherNoteId}`);
+		try {
+			await upsertNoteRelations(activeNote.id, [{
+				otherNoteId: target.noteId,
+				relationType: target.relationType,
+				status: "accepted",
+				source: "ai",
+				score: target.score,
+				reason: target.reason,
+				evidenceExcerpt: target.evidenceExcerpt,
+			}]);
+			await refreshActiveNoteRelations(activeNote.id);
+			setAiEnhanceResult((prev) => prev
+				? {
+					...prev,
+					relationSuggestions: prev.relationSuggestions.filter((item) => item.noteId !== otherNoteId),
+				}
+				: prev);
+		} catch (error) {
+			setAiErrorMessage(readErrorMessage(error));
+		} finally {
+			setMutatingRelationId("");
+		}
+	};
+
+	const handleDeleteRelation = async (relationId: string) => {
+		if (!activeNote || isActiveNoteDeleted || mutatingRelationId) {
+			return;
+		}
+		setMutatingRelationId(relationId);
+		try {
+			await deleteNoteRelation(activeNote.id, relationId);
+			await refreshActiveNoteRelations(activeNote.id);
+		} catch (error) {
+			setAiErrorMessage(readErrorMessage(error));
+		} finally {
+			setMutatingRelationId("");
+		}
+	};
+
 	const handleRunAiTask = async (task: AiEnhanceTaskApiKey) => {
 		if (!activeNote || activeNote.deletedAt || runningAiTasks.includes(task)) {
 			return;
@@ -1056,6 +1229,21 @@ export default function Home() {
 			});
 			if (aiTaskRunIdRef.current[task] !== runId) {
 				return;
+			}
+			if (task === "relations" && partial.relationSuggestions.length > 0) {
+				await upsertNoteRelations(
+					noteId,
+					partial.relationSuggestions.map((item) => ({
+						otherNoteId: item.noteId,
+						relationType: item.relationType,
+						status: "suggested",
+						source: "ai",
+						score: item.score,
+						reason: item.reason,
+						evidenceExcerpt: item.evidenceExcerpt,
+					})),
+				);
+				await refreshActiveNoteRelations(noteId);
 			}
 			setAiEnhanceResult((prev) => mergeAiEnhanceResult(prev, partial, noteId, query ?? ""));
 		} catch (error) {
@@ -1119,27 +1307,39 @@ export default function Home() {
 		}
 	};
 
-	const handleApplyAiLinks = async () => {
-		if (!activeNote || isActiveNoteDeleted || isApplyingAiLinks || !aiEnhanceResult || isSyncingLinks) {
+	const handleApplyAiRelations = async () => {
+		if (!activeNote || isActiveNoteDeleted || isApplyingAiRelations || !aiEnhanceResult) {
 			return;
 		}
-		const suggestedSlugs = aiEnhanceResult.linkSuggestions.map((item) => item.slug);
-		if (suggestedSlugs.length === 0) {
+		if (aiEnhanceResult.relationSuggestions.length === 0) {
 			return;
 		}
-		setIsApplyingAiLinks(true);
+		setIsApplyingAiRelations(true);
 		setAiErrorMessage("");
 		try {
-			const existingSlugs = noteLinks?.outbound.map((item) => item.slug) ?? [];
-			const updated = await updateNote(activeNote.id, {
-				linkSlugs: [...new Set([...existingSlugs, ...suggestedSlugs])],
-			});
-			const next = toNoteItem(updated);
-			setNoteItems((prev) => prev.map((item) => (item.id === next.id ? { ...item, ...next } : item)));
+			await upsertNoteRelations(
+				activeNote.id,
+				aiEnhanceResult.relationSuggestions.map((item) => ({
+					otherNoteId: item.noteId,
+					relationType: item.relationType,
+					status: "accepted",
+					source: "ai",
+					score: item.score,
+					reason: item.reason,
+					evidenceExcerpt: item.evidenceExcerpt,
+				})),
+			);
+			await refreshActiveNoteRelations(activeNote.id);
+			setAiEnhanceResult((prev) => prev
+				? {
+					...prev,
+					relationSuggestions: [],
+				}
+				: prev);
 		} catch (error) {
 			setAiErrorMessage(readErrorMessage(error));
 		} finally {
-			setIsApplyingAiLinks(false);
+			setIsApplyingAiRelations(false);
 		}
 	};
 
@@ -1632,6 +1832,7 @@ export default function Home() {
 	const canConfirmTitleEdit = titleDraft.trim().length > 0 && !isActiveNoteDeleted;
 	const outboundLinks = noteLinks?.outbound ?? [];
 	const inboundLinks = noteLinks?.inbound ?? [];
+	const acceptedRelations = noteRelations.filter((item) => item.status === "accepted");
 	const canEditLinks = Boolean(activeNote && noteLinks && !isActiveNoteDeleted && !isSyncingLinks && !isLoadingNoteLinks);
 
 	return (
@@ -2238,6 +2439,16 @@ export default function Home() {
 									onRemoveOutbound={handleRemoveOutboundLink}
 									canRemoveOutbound={canEditLinks}
 								/>
+								<div className="mt-3">
+									<RelationSummaryPanel
+										isLoading={isLoadingNoteRelations}
+										items={acceptedRelations}
+										onOpenNote={focusNote}
+										mutatingRelationId={mutatingRelationId}
+										onUpdateRelationType={handleUpdateRelationType}
+										onDeleteRelation={handleDeleteRelation}
+									/>
+								</div>
 							</div>
 							) : null}
 						</section>
@@ -2663,6 +2874,16 @@ export default function Home() {
 									onRemoveOutbound={handleRemoveOutboundLink}
 									canRemoveOutbound={canEditLinks}
 								/>
+								<div className="mt-3">
+									<RelationSummaryPanel
+										isLoading={isLoadingNoteRelations}
+										items={acceptedRelations}
+										onOpenNote={focusNote}
+										mutatingRelationId={mutatingRelationId}
+										onUpdateRelationType={handleUpdateRelationType}
+										onDeleteRelation={handleDeleteRelation}
+									/>
+								</div>
 							</div>
 							) : null}
 						</section>
@@ -2720,12 +2941,20 @@ export default function Home() {
 						taskStages={aiTaskStages}
 						errorMessage={aiErrorMessage}
 						result={aiEnhanceResult}
+						noteRelations={noteRelations}
+						isLoadingRelations={isLoadingNoteRelations}
+						mutatingRelationId={mutatingRelationId}
 						onApplyTitle={handleApplyAiTitle}
 						onApplyTags={handleApplyAiTags}
-						onApplyLinks={handleApplyAiLinks}
+						onApplyRelations={handleApplyAiRelations}
+						onAcceptSuggestion={handleAcceptAiRelationSuggestion}
+						onUpdateRelationType={handleUpdateRelationType}
+						onAcceptRelation={handleAcceptRelation}
+						onRejectRelation={handleRejectRelation}
+						onDeleteRelation={handleDeleteRelation}
 						isApplyingTitle={isApplyingAiTitle}
 						isApplyingTags={isApplyingAiTags}
-						isApplyingLinks={isApplyingAiLinks}
+						isApplyingRelations={isApplyingAiRelations}
 						onOpenNote={focusNote}
 					/>
 				</div>
@@ -2760,12 +2989,20 @@ export default function Home() {
 							taskStages={aiTaskStages}
 							errorMessage={aiErrorMessage}
 							result={aiEnhanceResult}
+							noteRelations={noteRelations}
+							isLoadingRelations={isLoadingNoteRelations}
+							mutatingRelationId={mutatingRelationId}
 							onApplyTitle={handleApplyAiTitle}
 							onApplyTags={handleApplyAiTags}
-							onApplyLinks={handleApplyAiLinks}
+							onApplyRelations={handleApplyAiRelations}
+							onAcceptSuggestion={handleAcceptAiRelationSuggestion}
+							onUpdateRelationType={handleUpdateRelationType}
+							onAcceptRelation={handleAcceptRelation}
+							onRejectRelation={handleRejectRelation}
+							onDeleteRelation={handleDeleteRelation}
 							isApplyingTitle={isApplyingAiTitle}
 							isApplyingTags={isApplyingAiTags}
-							isApplyingLinks={isApplyingAiLinks}
+							isApplyingRelations={isApplyingAiRelations}
 							onOpenNote={focusNote}
 						/>
 					</div>
@@ -3089,6 +3326,128 @@ function LinkSummaryPanel(props: {
 	);
 }
 
+function RelationSummaryPanel(props: {
+	isLoading: boolean;
+	items: NoteRelationApiItem[];
+	onOpenNote: (noteId: string) => void;
+	mutatingRelationId?: string;
+	onUpdateRelationType?: (relationId: string, relationType: NoteRelationTypeApiItem) => void;
+	onAcceptRelation?: (relationId: string) => void;
+	onRejectRelation?: (relationId: string) => void;
+	onDeleteRelation?: (relationId: string) => void;
+	emptyText?: string;
+}) {
+	const {
+		isLoading,
+		items,
+		onOpenNote,
+		mutatingRelationId = "",
+		onUpdateRelationType,
+		onAcceptRelation,
+		onRejectRelation,
+		onDeleteRelation,
+		emptyText = "暂无已保存关系",
+	} = props;
+
+	return (
+		<section className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+			<div className="mb-2 flex items-center justify-between">
+				<p className="text-xs font-semibold uppercase tracking-wide text-slate-500">已保存关系</p>
+				{isLoading ? <span className="text-xs text-slate-400">更新中...</span> : null}
+			</div>
+			<div className="space-y-2">
+				{!isLoading && items.length === 0 ? (
+					<p className="text-xs text-slate-400">{emptyText}</p>
+				) : null}
+				{items.map((item) => (
+					<div key={item.id} className="rounded-lg border border-slate-200 bg-white p-2">
+						<div className="flex items-start justify-between gap-2">
+							<div className="min-w-0 flex-1">
+								<button
+									type="button"
+									onClick={() => onOpenNote(item.otherNote.id)}
+									className="truncate text-left text-xs font-medium text-slate-800 hover:text-sky-700"
+								>
+									{item.otherNote.title}
+								</button>
+								<p className="mt-1 text-[11px] text-slate-500">
+									{formatRelationTypeLabel(item.relationType)} · {Math.round(item.score * 100)}%
+								</p>
+							</div>
+							<span className="shrink-0 rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-600">
+								{item.source === "ai" ? "AI" : "人工"}
+							</span>
+						</div>
+						<p className="mt-2 line-clamp-2 text-[11px] text-slate-600">
+							{item.reason || item.evidenceExcerpt || item.otherNote.excerpt || "已保存关系"}
+						</p>
+						{onUpdateRelationType || onAcceptRelation || onRejectRelation || onDeleteRelation ? (
+							<div className="mt-2 flex items-center gap-2">
+								{onUpdateRelationType ? (
+									<select
+										value={item.relationType}
+										onChange={(event) => onUpdateRelationType(item.id, event.target.value as NoteRelationTypeApiItem)}
+										disabled={mutatingRelationId === item.id}
+										className="min-w-0 flex-1 rounded border border-slate-200 bg-white px-2 py-1 text-[11px] text-slate-600"
+									>
+										{RELATION_TYPE_OPTIONS.map((option) => (
+											<option key={option.value} value={option.value}>
+												{option.label}
+											</option>
+										))}
+									</select>
+								) : null}
+								{onAcceptRelation && item.status === "suggested" ? (
+									<button
+										type="button"
+										onClick={() => onAcceptRelation(item.id)}
+										disabled={mutatingRelationId === item.id}
+										className={`rounded border px-2 py-1 text-[11px] ${
+											mutatingRelationId === item.id
+												? "cursor-not-allowed border-slate-200 text-slate-300"
+												: "border-emerald-200 text-emerald-700 hover:bg-emerald-50"
+										}`}
+									>
+										{mutatingRelationId === item.id ? "处理中..." : "接受"}
+									</button>
+								) : null}
+								{onRejectRelation && item.status === "suggested" ? (
+									<button
+										type="button"
+										onClick={() => onRejectRelation(item.id)}
+										disabled={mutatingRelationId === item.id}
+										className={`rounded border px-2 py-1 text-[11px] ${
+											mutatingRelationId === item.id
+												? "cursor-not-allowed border-slate-200 text-slate-300"
+												: "border-amber-200 text-amber-700 hover:bg-amber-50"
+										}`}
+									>
+										{mutatingRelationId === item.id ? "处理中..." : "忽略"}
+									</button>
+								) : null}
+								{onDeleteRelation ? (
+									<button
+										type="button"
+										onClick={() => onDeleteRelation(item.id)}
+										disabled={mutatingRelationId === item.id}
+										className={`rounded border px-2 py-1 text-[11px] ${
+											mutatingRelationId === item.id
+												? "cursor-not-allowed border-slate-200 text-slate-300"
+												: "border-rose-200 text-rose-600 hover:bg-rose-50"
+										}`}
+									>
+										{mutatingRelationId === item.id ? "处理中..." : "删除"}
+									</button>
+								) : null}
+							</div>
+						) : null}
+					</div>
+				))}
+			</div>
+		</section>
+	);
+}
+
 function LinkNoteList(props: {
 	title: string;
 	items: NoteLinkApiItem[];
@@ -3149,12 +3508,20 @@ function AiPanel(props: {
 	taskStages: Partial<Record<AiEnhanceTaskApiKey, string>>;
 	errorMessage: string;
 	result: AiEnhanceResultApiItem | null;
+	noteRelations: NoteRelationApiItem[];
+	isLoadingRelations: boolean;
+	mutatingRelationId: string;
 	onApplyTitle: (title: string) => void;
 	onApplyTags: () => void;
-	onApplyLinks: () => void;
+	onApplyRelations: () => void;
+	onAcceptSuggestion: (otherNoteId: string) => void;
+	onUpdateRelationType: (relationId: string, relationType: NoteRelationTypeApiItem) => void;
+	onAcceptRelation: (relationId: string) => void;
+	onRejectRelation: (relationId: string) => void;
+	onDeleteRelation: (relationId: string) => void;
 	isApplyingTitle: boolean;
 	isApplyingTags: boolean;
-	isApplyingLinks: boolean;
+	isApplyingRelations: boolean;
 	onOpenNote: (noteId: string) => void;
 }) {
 	const {
@@ -3168,17 +3535,27 @@ function AiPanel(props: {
 		taskStages,
 		errorMessage,
 		result,
+		noteRelations,
+		isLoadingRelations,
+		mutatingRelationId,
 		onApplyTitle,
 		onApplyTags,
-		onApplyLinks,
+		onApplyRelations,
+		onAcceptSuggestion,
+		onUpdateRelationType,
+		onAcceptRelation,
+		onRejectRelation,
+		onDeleteRelation,
 		isApplyingTitle,
 		isApplyingTags,
-		isApplyingLinks,
+		isApplyingRelations,
 		onOpenNote,
 	} = props;
 	const unavailable = !activeNote || Boolean(activeNote.deletedAt);
 	const runningTaskSet = new Set(runningTasks);
 	const tagNames = result?.tagSuggestions.map((item) => item.name) ?? [];
+	const [relationViewStatus, setRelationViewStatus] = useState<"suggested" | "accepted">("suggested");
+	const relationItems = noteRelations.filter((item) => item.status === relationViewStatus);
 
 	return (
 		<div>
@@ -3229,6 +3606,37 @@ function AiPanel(props: {
 				</div>
 				{unavailable ? <p className="mt-2 text-xs text-amber-600">请选中未删除笔记后使用。</p> : null}
 				{errorMessage ? <p className="mt-2 text-xs text-rose-600">{errorMessage}</p> : null}
+			</div>
+
+			<div className="mt-3">
+				<section className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+					<div className="mb-2 flex items-center justify-between">
+						<p className="text-xs font-semibold uppercase tracking-wide text-slate-500">关系状态</p>
+						<div className="inline-flex rounded-lg border border-slate-200 bg-white p-1">
+							<ModeButton
+								label="待确认"
+								active={relationViewStatus === "suggested"}
+								onClick={() => setRelationViewStatus("suggested")}
+							/>
+							<ModeButton
+								label="已确认"
+								active={relationViewStatus === "accepted"}
+								onClick={() => setRelationViewStatus("accepted")}
+							/>
+						</div>
+					</div>
+					<RelationSummaryPanel
+						isLoading={isLoadingRelations}
+						items={relationItems}
+						onOpenNote={onOpenNote}
+						mutatingRelationId={mutatingRelationId}
+						onUpdateRelationType={onUpdateRelationType}
+						onAcceptRelation={onAcceptRelation}
+						onRejectRelation={onRejectRelation}
+						onDeleteRelation={onDeleteRelation}
+						emptyText={relationViewStatus === "suggested" ? "暂无待确认关系" : "暂无已确认关系"}
+					/>
+				</section>
 			</div>
 
 			{result ? (
@@ -3325,34 +3733,29 @@ function AiPanel(props: {
 							</section>
 						) : null}
 
-						{activeTask === "links" ? (
+						{activeTask === "relations" ? (
 							<section className="rounded-lg border border-slate-200 bg-white p-3">
 								<div className="mb-2 flex items-center justify-between">
-									<p className="text-xs font-semibold text-slate-600">双链建议</p>
+									<p className="text-xs font-semibold text-slate-600">关系建议</p>
 									<button
 										type="button"
-										onClick={onApplyLinks}
-										disabled={isApplyingLinks || result.linkSuggestions.length === 0}
+										onClick={onApplyRelations}
+										disabled={isApplyingRelations || result.relationSuggestions.length === 0}
 										className={`rounded border px-2 py-1 text-[11px] ${
-											isApplyingLinks || result.linkSuggestions.length === 0
+											isApplyingRelations || result.relationSuggestions.length === 0
 												? "cursor-not-allowed border-slate-200 text-slate-300"
 												: "border-slate-300 text-slate-700 hover:bg-slate-100"
 										}`}
 									>
-										{isApplyingLinks ? "应用中..." : "应用双链"}
+										{isApplyingRelations ? "保存中..." : "保存关系"}
 									</button>
 								</div>
-								<AiRelatedNoteList
-									items={result.linkSuggestions.map((item) => ({
-										noteId: item.targetNoteId,
-										slug: item.slug,
-										title: item.title,
-										snippet: item.reason,
-										score: item.score,
-										reason: item.reason,
-									}))}
+								<AiRelationSuggestionList
+									items={result.relationSuggestions}
 									onOpenNote={onOpenNote}
-									emptyText="暂无双链建议"
+									onAcceptSuggestion={onAcceptSuggestion}
+									mutatingRelationId={mutatingRelationId}
+									emptyText="暂无关系建议"
 								/>
 							</section>
 						) : null}
@@ -3415,6 +3818,59 @@ function AiRelatedNoteList(props: {
 	);
 }
 
+function AiRelationSuggestionList(props: {
+	items: AiEnhanceRelationSuggestionApiItem[];
+	onOpenNote: (noteId: string) => void;
+	onAcceptSuggestion: (otherNoteId: string) => void;
+	mutatingRelationId: string;
+	emptyText: string;
+}) {
+	const { items, onOpenNote, onAcceptSuggestion, mutatingRelationId, emptyText } = props;
+	return items.length === 0 ? (
+		<p className="text-xs text-slate-400">{emptyText}</p>
+	) : (
+		<div className="space-y-2">
+			{items.map((item) => {
+				const actionId = `suggestion:${item.noteId}`;
+				return (
+					<div key={`${item.noteId}-${item.slug}`} className="rounded-md border border-slate-200 p-2">
+						<div className="flex items-center justify-between gap-2">
+							<button
+								type="button"
+								onClick={() => onOpenNote(item.noteId)}
+								className="truncate text-left text-xs font-medium text-slate-800 hover:text-sky-700"
+							>
+								{item.title}
+							</button>
+							<span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-600">
+								{Math.round(item.score * 100)}%
+							</span>
+						</div>
+						<p className="mt-1 text-[11px] text-slate-500">
+							{formatRelationTypeLabel(item.relationType)} · {item.evidenceExcerpt ?? item.snippet}
+						</p>
+						<p className="mt-1 line-clamp-2 text-[11px] text-slate-600">{item.reason}</p>
+						<div className="mt-2 flex justify-end">
+							<button
+								type="button"
+								onClick={() => onAcceptSuggestion(item.noteId)}
+								disabled={mutatingRelationId === actionId}
+								className={`rounded border px-2 py-1 text-[11px] ${
+									mutatingRelationId === actionId
+										? "cursor-not-allowed border-slate-200 text-slate-300"
+										: "border-emerald-200 text-emerald-700 hover:bg-emerald-50"
+								}`}
+							>
+								{mutatingRelationId === actionId ? "处理中..." : "接受"}
+							</button>
+						</div>
+					</div>
+				);
+			})}
+		</div>
+	);
+}
+
 function formatAiTaskStage(progress: AiEnhanceTaskStreamProgress): string {
 	if (progress.stage === "prepare") {
 		return "准备中";
@@ -3423,6 +3879,25 @@ function formatAiTaskStage(progress: AiEnhanceTaskStreamProgress): string {
 		return "生成中";
 	}
 	return "处理中";
+}
+
+function formatRelationTypeLabel(value: string): string {
+	if (value === "similar") {
+		return "相似";
+	}
+	if (value === "complements") {
+		return "互补";
+	}
+	if (value === "contrasts") {
+		return "对照";
+	}
+	if (value === "same_project") {
+		return "同项目";
+	}
+	if (value === "same_area") {
+		return "同领域";
+	}
+	return "相关";
 }
 
 function buildInitialAiEnhanceResult(noteId: string, query: string): AiEnhanceResultApiItem {
@@ -3436,7 +3911,7 @@ function buildInitialAiEnhanceResult(noteId: string, query: string): AiEnhanceRe
 		titleCandidates: [],
 		tagSuggestions: [],
 		semanticSearch: [],
-		linkSuggestions: [],
+		relationSuggestions: [],
 		summary: "",
 		outline: [],
 		summaryMeta: {
@@ -3464,7 +3939,7 @@ function mergeAiEnhanceResult(
 		titleCandidates: partial.titleCandidates.length > 0 ? partial.titleCandidates : base.titleCandidates,
 		tagSuggestions: partial.tagSuggestions.length > 0 ? partial.tagSuggestions : base.tagSuggestions,
 		semanticSearch: partial.semanticSearch.length > 0 ? partial.semanticSearch : base.semanticSearch,
-		linkSuggestions: partial.linkSuggestions.length > 0 ? partial.linkSuggestions : base.linkSuggestions,
+		relationSuggestions: partial.relationSuggestions.length > 0 ? partial.relationSuggestions : base.relationSuggestions,
 		summary: partial.summary || base.summary,
 		outline: partial.outline.length > 0 ? partial.outline : base.outline,
 		summaryMeta: partial.summaryMeta ?? base.summaryMeta,

@@ -1,5 +1,5 @@
 import type { Context } from "hono";
-import { getNoteById, getTagNameMaxLength } from "./note-query-service";
+import { getNoteById, getTagNameMaxLength, listNotesWithSearchMode } from "./note-query-service";
 import { hydrateNoteBodyFromR2 } from "./note-storage-service";
 import {
 	clampInt,
@@ -18,7 +18,8 @@ import {
 } from "./ai-provider-service";
 import {
 	buildAiEnhanceDefaultQuery,
-	buildLinksTaskPrompt,
+	buildAiEnhanceRelationQuery,
+	buildRelationsTaskPrompt,
 	buildSemanticTaskPrompt,
 	buildSharedPromptContext,
 	buildSimilarTaskPrompt,
@@ -28,7 +29,7 @@ import {
 } from "./ai-enhance-prompts";
 import {
 	buildAiEnhanceFallback,
-	buildFallbackLinkSuggestions,
+	buildFallbackRelationSuggestions,
 	buildFallbackSemanticSearch,
 	buildFallbackTagSuggestions,
 	buildFallbackTitleCandidates,
@@ -39,7 +40,7 @@ import {
 import {
 	isRecord,
 	normalizeSummaryTaskResult,
-	parseLinkSuggestions,
+	parseRelationSuggestions,
 	parseRelatedNoteItems,
 	parseTagSuggestions,
 	parseTitleCandidates,
@@ -57,8 +58,9 @@ type AppContext = Context<{ Bindings: Env }>;
 
 const DEFAULT_AI_ENHANCE_TOP_K = 6;
 const DEFAULT_AI_EXISTING_TAG_LIMIT = 200;
+const DEFAULT_AI_RELATION_CANDIDATE_LIMIT = 12;
 
-export const AI_ENHANCE_TASK_KEYS: AiEnhanceTaskKey[] = ["title", "tags", "semantic", "links", "summary", "similar"];
+export const AI_ENHANCE_TASK_KEYS: AiEnhanceTaskKey[] = ["title", "tags", "semantic", "relations", "summary", "similar"];
 
 export function parseAiEnhanceInput(payload: Record<string, unknown>): AiEnhanceRequestInput {
 	const query = readOptionalString(payload, "query");
@@ -75,7 +77,7 @@ export function parseAiEnhanceInput(payload: Record<string, unknown>): AiEnhance
 }
 
 export function parseAiEnhanceTaskKey(value: string): AiEnhanceTaskKey | null {
-	if (value === "title" || value === "tags" || value === "semantic" || value === "links" || value === "summary" || value === "similar") {
+	if (value === "title" || value === "tags" || value === "semantic" || value === "relations" || value === "summary" || value === "similar") {
 		return value;
 	}
 	return null;
@@ -211,8 +213,8 @@ async function prepareAiEnhanceInput(
 ): Promise<{ prepared: AiEnhancePreparedInput; warnings: string[] }> {
 	const warnings: string[] = [];
 	const taskSet = new Set(tasks);
-	const requiresContext = taskSet.has("semantic") || taskSet.has("links") || taskSet.has("similar");
-	const requiresLinkedSlugs = taskSet.has("links");
+	const requiresContext = taskSet.has("semantic") || taskSet.has("relations") || taskSet.has("similar");
+	const requiresRelatedNoteIds = taskSet.has("relations");
 	const requiresExistingTags = taskSet.has("tags");
 	let hydrated = note;
 	try {
@@ -223,7 +225,10 @@ async function prepareAiEnhanceInput(
 	}
 
 	const sourceBody = hydrated.bodyText ?? note.bodyText ?? "";
-	const query = input.query ?? buildAiEnhanceDefaultQuery(hydrated.title, sourceBody);
+	const query = input.query
+		?? (taskSet.has("relations")
+			? buildAiEnhanceRelationQuery(hydrated.title, sourceBody)
+			: buildAiEnhanceDefaultQuery(hydrated.title, sourceBody));
 	let candidatePool: AiContextNoteItem[] = [];
 	if (requiresContext) {
 		try {
@@ -239,14 +244,22 @@ async function prepareAiEnhanceInput(
 			warnings.push(`context_failed: ${String(error)}`);
 		}
 	}
-
-	let linkedSlugs = new Set<string>();
-	if (requiresLinkedSlugs) {
+	if (taskSet.has("relations")) {
 		try {
-			linkedSlugs = await listOutboundLinkSlugs(env.DB, note.id, 128);
+			candidatePool = await supplementRelationCandidatesFromFolder(env.DB, note, candidatePool, input.topK);
 		} catch (error) {
-			console.error("AI enhance link lookup failed, continue with empty links", error);
-			warnings.push(`link_lookup_failed: ${String(error)}`);
+			console.error("AI enhance same-folder candidate lookup failed, continue with existing candidates", error);
+			warnings.push(`relation_folder_candidates_failed: ${String(error)}`);
+		}
+	}
+
+	let relatedNoteIds = new Set<string>();
+	if (requiresRelatedNoteIds) {
+		try {
+			relatedNoteIds = await listExistingRelationNoteIds(env.DB, note.id, 128);
+		} catch (error) {
+			console.error("AI enhance relation lookup failed, continue with empty relations", error);
+			warnings.push(`relation_lookup_failed: ${String(error)}`);
 		}
 	}
 
@@ -266,28 +279,73 @@ async function prepareAiEnhanceInput(
 			query,
 			topK: input.topK,
 			candidates: candidatePool,
-			linkedSlugs,
+			relatedNoteIds,
 			existingTagNames,
 		},
 		warnings,
 	};
 }
 
-async function listOutboundLinkSlugs(db: D1Database, noteId: string, limit: number): Promise<Set<string>> {
+async function supplementRelationCandidatesFromFolder(
+	db: D1Database,
+	note: NoteRow,
+	candidates: AiContextNoteItem[],
+	topK: number,
+): Promise<AiContextNoteItem[]> {
+	const targetCount = Math.max(topK * 2, DEFAULT_AI_ENHANCE_TOP_K, 4);
+	if (!note.folderId || candidates.length >= targetCount) {
+		return candidates;
+	}
+	const { notes } = await listNotesWithSearchMode(db, {
+		folderId: note.folderId,
+		tagIds: [],
+		tagMode: "any",
+		keyword: "",
+		status: "active",
+		limit: Math.max(DEFAULT_AI_RELATION_CANDIDATE_LIMIT, targetCount * 2),
+		offset: 0,
+	});
+	if (notes.length === 0) {
+		return candidates;
+	}
+	const merged = new Map(candidates.map((item) => [item.noteId, item] as const));
+	for (const item of notes) {
+		if (item.id === note.id || merged.has(item.id)) {
+			continue;
+		}
+		merged.set(item.id, {
+			noteId: item.id,
+			slug: item.slug,
+			title: item.title,
+			snippet: (item.excerpt || "").slice(0, 240),
+			updatedAt: item.updatedAt,
+			searchScore: item.searchScore,
+		});
+		if (merged.size >= DEFAULT_AI_RELATION_CANDIDATE_LIMIT) {
+			break;
+		}
+	}
+	return [...merged.values()].slice(0, DEFAULT_AI_RELATION_CANDIDATE_LIMIT);
+}
+
+async function listExistingRelationNoteIds(db: D1Database, noteId: string, limit: number): Promise<Set<string>> {
 	const { results } = await db.prepare(
-		`SELECT n.slug AS slug
-		 FROM note_links nl
-		 JOIN notes n ON n.id = nl.target_note_id
-		 WHERE nl.source_note_id = ?
-		   AND n.deleted_at IS NULL
-		 ORDER BY n.updated_at DESC
+		`SELECT
+			CASE
+				WHEN nr.note_id_low = ? THEN nr.note_id_high
+				ELSE nr.note_id_low
+			END AS otherNoteId
+		 FROM note_relations nr
+		 WHERE (nr.note_id_low = ? OR nr.note_id_high = ?)
+		   AND nr.status IN ('suggested', 'accepted')
+		 ORDER BY nr.updated_at DESC
 		 LIMIT ?`,
 	)
-		.bind(noteId, limit)
-		.all<{ slug: string }>();
+		.bind(noteId, noteId, noteId, limit)
+		.all<{ otherNoteId: string }>();
 	return new Set(
 		results
-			.map((item) => item.slug)
+			.map((item) => item.otherNoteId)
 			.filter((item): item is string => typeof item === "string" && item.length > 0),
 	);
 }
@@ -380,24 +438,24 @@ async function generateAiEnhanceWithSiliconflow(
 		}));
 	}
 
-	if (taskSet.has("links")) {
+	if (taskSet.has("relations")) {
 		taskPromises.push((async () => {
-			const payload = await callSiliconflowJson(runtime, buildLinksTaskPrompt(sharedContext, input.linkedSlugs), {
-				timeoutMs: getAiTaskTimeoutMs(env, "links"),
-				label: "task:links",
+			const payload = await callSiliconflowJson(runtime, buildRelationsTaskPrompt(sharedContext, input.relatedNoteIds), {
+				timeoutMs: getAiTaskTimeoutMs(env, "relations"),
+				label: "task:relations",
 			});
 			const source = isRecord(payload) ? payload : {};
-			result.linkSuggestions = parseLinkSuggestions(
-				source.linkSuggestions ?? source.forward_links,
+			result.relationSuggestions = parseRelationSuggestions(
+				source.relationSuggestions ?? source.relations,
 				input.topK,
 				candidatesById,
-				input.linkedSlugs,
+				input.relatedNoteIds,
 			);
 		})().catch((error) => {
-			result.warnings.push(`task_failed:links:${String(error)}`);
-			result.linkSuggestions = buildFallbackLinkSuggestions(
+			result.warnings.push(`task_failed:relations:${String(error)}`);
+			result.relationSuggestions = buildFallbackRelationSuggestions(
 				buildFallbackSemanticSearch(input.candidates, input.topK),
-				input.linkedSlugs,
+				input.relatedNoteIds,
 				input.topK,
 			);
 		}));
@@ -465,8 +523,8 @@ async function generateAiEnhanceWithSiliconflow(
 	if (result.semanticSearch.length === 0 && taskSet.has("semantic")) {
 		result.semanticSearch = buildFallbackSemanticSearch(input.candidates, input.topK);
 	}
-	if (result.linkSuggestions.length === 0 && taskSet.has("links")) {
-		result.linkSuggestions = buildFallbackLinkSuggestions(result.semanticSearch, input.linkedSlugs, input.topK);
+	if (result.relationSuggestions.length === 0 && taskSet.has("relations")) {
+		result.relationSuggestions = buildFallbackRelationSuggestions(result.semanticSearch, input.relatedNoteIds, input.topK);
 	}
 	if (taskSet.has("summary") && result.summaryMeta.mode !== "skip" && !result.summary.trim()) {
 		result.summary = buildAiEnhanceFallback(input, ["summary"], "summary-empty").summary;

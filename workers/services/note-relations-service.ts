@@ -9,6 +9,59 @@ type TagRow = {
 	noteCount?: number;
 };
 
+export type NoteRelationType =
+	| "similar"
+	| "complements"
+	| "contrasts"
+	| "same_project"
+	| "same_area"
+	| "related";
+
+export type NoteRelationStatus = "suggested" | "accepted" | "rejected";
+export type NoteRelationStatusFilter = NoteRelationStatus | "all";
+export type NoteRelationSource = "ai" | "manual";
+export type NoteRelationSourceFilter = NoteRelationSource | "all";
+
+export type NoteRelationListItem = {
+	id: string;
+	relationType: NoteRelationType;
+	status: NoteRelationStatus;
+	source: NoteRelationSource;
+	score: number;
+	reason: string;
+	evidenceExcerpt: string | null;
+	provider: string | null;
+	model: string | null;
+	createdAt: string;
+	updatedAt: string;
+	otherNote: {
+		id: string;
+		slug: string;
+		title: string;
+		excerpt: string;
+		updatedAt: string;
+	};
+};
+
+type NoteRelationRow = {
+	id: string;
+	relationType: NoteRelationType;
+	status: NoteRelationStatus;
+	source: NoteRelationSource;
+	score: number;
+	reason: string;
+	evidenceExcerpt: string | null;
+	provider: string | null;
+	model: string | null;
+	createdAt: string;
+	updatedAt: string;
+	otherNoteId: string;
+	otherSlug: string;
+	otherTitle: string;
+	otherExcerpt: string;
+	otherUpdatedAt: string;
+};
+
 const DEFAULT_TAG_NAME_MAX_LENGTH = 48;
 
 export async function fetchTagsForSingleNote(db: D1Database, noteId: string): Promise<TagRow[]> {
@@ -246,4 +299,293 @@ export async function replaceNoteLinks(
 	);
 	await db.batch(statements);
 	return { inserted: targetRows.length, unresolvedSlugs };
+}
+
+export function normalizeNoteRelationType(value: string | null | undefined): NoteRelationType | null {
+	if (
+		value === "similar" ||
+		value === "complements" ||
+		value === "contrasts" ||
+		value === "same_project" ||
+		value === "same_area" ||
+		value === "related"
+	) {
+		return value;
+	}
+	return null;
+}
+
+export function normalizeNoteRelationStatus(value: string | null | undefined): NoteRelationStatus | null {
+	if (value === "suggested" || value === "accepted" || value === "rejected") {
+		return value;
+	}
+	return null;
+}
+
+export function normalizeNoteRelationStatusFilter(value: string | null | undefined): NoteRelationStatusFilter {
+	if (value === "suggested" || value === "accepted" || value === "rejected" || value === "all") {
+		return value;
+	}
+	return "accepted";
+}
+
+export function normalizeNoteRelationSource(value: string | null | undefined): NoteRelationSource | null {
+	if (value === "ai" || value === "manual") {
+		return value;
+	}
+	return null;
+}
+
+export function normalizeNoteRelationSourceFilter(value: string | null | undefined): NoteRelationSourceFilter {
+	if (value === "ai" || value === "manual" || value === "all") {
+		return value;
+	}
+	return "all";
+}
+
+export function normalizeRelationScore(value: number | null | undefined, fallback = 0.5): number {
+	if (!Number.isFinite(value)) {
+		return fallback;
+	}
+	return Math.max(0, Math.min(1, value ?? fallback));
+}
+
+export async function listNoteRelations(
+	db: D1Database,
+	noteId: string,
+	options: {
+		status: NoteRelationStatusFilter;
+		source: NoteRelationSourceFilter;
+		limit: number;
+		offset: number;
+	},
+): Promise<NoteRelationListItem[]> {
+	const conditions = [
+		"(nr.note_id_low = ? OR nr.note_id_high = ?)",
+		"n.deleted_at IS NULL",
+	];
+	const params: Array<string | number> = [noteId, noteId];
+	if (options.status !== "all") {
+		conditions.push("nr.status = ?");
+		params.push(options.status);
+	}
+	if (options.source !== "all") {
+		conditions.push("nr.source = ?");
+		params.push(options.source);
+	}
+	params.push(options.limit, options.offset);
+
+	const { results } = await db.prepare(
+		`SELECT
+			nr.id,
+			nr.relation_type AS relationType,
+			nr.status,
+			nr.source,
+			nr.score,
+			nr.reason,
+			nr.evidence_excerpt AS evidenceExcerpt,
+			nr.provider,
+			nr.model,
+			nr.created_at AS createdAt,
+			nr.updated_at AS updatedAt,
+			n.id AS otherNoteId,
+			n.slug AS otherSlug,
+			n.title AS otherTitle,
+			n.excerpt AS otherExcerpt,
+			n.updated_at AS otherUpdatedAt
+		 FROM note_relations nr
+		 JOIN notes n
+		   ON n.id = CASE
+				WHEN nr.note_id_low = ? THEN nr.note_id_high
+				ELSE nr.note_id_low
+			END
+		 WHERE ${conditions.join(" AND ")}
+		 ORDER BY nr.updated_at DESC, nr.created_at DESC
+		 LIMIT ?
+		 OFFSET ?`,
+	)
+		.bind(noteId, ...params)
+		.all<NoteRelationRow>();
+	return results.map(mapNoteRelationRow);
+}
+
+export async function getNoteRelationById(
+	db: D1Database,
+	noteId: string,
+	relationId: string,
+): Promise<NoteRelationListItem | null> {
+	const row = await db.prepare(
+		`SELECT
+			nr.id,
+			nr.relation_type AS relationType,
+			nr.status,
+			nr.source,
+			nr.score,
+			nr.reason,
+			nr.evidence_excerpt AS evidenceExcerpt,
+			nr.provider,
+			nr.model,
+			nr.created_at AS createdAt,
+			nr.updated_at AS updatedAt,
+			n.id AS otherNoteId,
+			n.slug AS otherSlug,
+			n.title AS otherTitle,
+			n.excerpt AS otherExcerpt,
+			n.updated_at AS otherUpdatedAt
+		 FROM note_relations nr
+		 JOIN notes n
+		   ON n.id = CASE
+				WHEN nr.note_id_low = ? THEN nr.note_id_high
+				ELSE nr.note_id_low
+			END
+		 WHERE nr.id = ?
+		   AND (nr.note_id_low = ? OR nr.note_id_high = ?)
+		   AND n.deleted_at IS NULL
+		 LIMIT 1`,
+	)
+		.bind(noteId, relationId, noteId, noteId)
+		.first<NoteRelationRow>();
+	return row ? mapNoteRelationRow(row) : null;
+}
+
+export async function upsertNoteRelation(
+	db: D1Database,
+	input: {
+		noteId: string;
+		otherNoteId: string;
+		relationType: NoteRelationType;
+		status: NoteRelationStatus;
+		source: NoteRelationSource;
+		score: number;
+		reason: string;
+		evidenceExcerpt?: string | null;
+		provider?: string | null;
+		model?: string | null;
+	},
+): Promise<NoteRelationListItem | null> {
+	const pair = canonicalizeNoteRelationPair(input.noteId, input.otherNoteId);
+	const relationId = crypto.randomUUID();
+	await db.prepare(
+		`INSERT INTO note_relations (
+			id,
+			note_id_low,
+			note_id_high,
+			relation_type,
+			status,
+			source,
+			score,
+			reason,
+			evidence_excerpt,
+			provider,
+			model
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(note_id_low, note_id_high) DO UPDATE SET
+			relation_type = excluded.relation_type,
+			status = excluded.status,
+			source = excluded.source,
+			score = excluded.score,
+			reason = excluded.reason,
+			evidence_excerpt = excluded.evidence_excerpt,
+			provider = excluded.provider,
+			model = excluded.model`,
+	)
+		.bind(
+			relationId,
+			pair.low,
+			pair.high,
+			input.relationType,
+			input.status,
+			input.source,
+			normalizeRelationScore(input.score),
+			input.reason,
+			input.evidenceExcerpt ?? null,
+			input.provider ?? null,
+			input.model ?? null,
+		)
+		.run();
+	return getNoteRelationByPair(db, input.noteId, pair.low, pair.high);
+}
+
+export async function deleteNoteRelation(
+	db: D1Database,
+	noteId: string,
+	relationId: string,
+): Promise<boolean> {
+	const result = await db.prepare(
+		`DELETE FROM note_relations
+		 WHERE id = ?
+		   AND (note_id_low = ? OR note_id_high = ?)`,
+	)
+		.bind(relationId, noteId, noteId)
+		.run();
+	return !!result.success && (result.meta?.changes ?? 0) > 0;
+}
+
+function canonicalizeNoteRelationPair(noteIdA: string, noteIdB: string): { low: string; high: string } {
+	return noteIdA < noteIdB
+		? { low: noteIdA, high: noteIdB }
+		: { low: noteIdB, high: noteIdA };
+}
+
+async function getNoteRelationByPair(
+	db: D1Database,
+	noteId: string,
+	noteIdLow: string,
+	noteIdHigh: string,
+): Promise<NoteRelationListItem | null> {
+	const row = await db.prepare(
+		`SELECT
+			nr.id,
+			nr.relation_type AS relationType,
+			nr.status,
+			nr.source,
+			nr.score,
+			nr.reason,
+			nr.evidence_excerpt AS evidenceExcerpt,
+			nr.provider,
+			nr.model,
+			nr.created_at AS createdAt,
+			nr.updated_at AS updatedAt,
+			n.id AS otherNoteId,
+			n.slug AS otherSlug,
+			n.title AS otherTitle,
+			n.excerpt AS otherExcerpt,
+			n.updated_at AS otherUpdatedAt
+		 FROM note_relations nr
+		 JOIN notes n
+		   ON n.id = CASE
+				WHEN nr.note_id_low = ? THEN nr.note_id_high
+				ELSE nr.note_id_low
+			END
+		 WHERE nr.note_id_low = ?
+		   AND nr.note_id_high = ?
+		   AND n.deleted_at IS NULL
+		 LIMIT 1`,
+	)
+		.bind(noteId, noteIdLow, noteIdHigh)
+		.first<NoteRelationRow>();
+	return row ? mapNoteRelationRow(row) : null;
+}
+
+function mapNoteRelationRow(row: NoteRelationRow): NoteRelationListItem {
+	return {
+		id: row.id,
+		relationType: row.relationType,
+		status: row.status,
+		source: row.source,
+		score: normalizeRelationScore(row.score),
+		reason: row.reason,
+		evidenceExcerpt: row.evidenceExcerpt,
+		provider: row.provider,
+		model: row.model,
+		createdAt: row.createdAt,
+		updatedAt: row.updatedAt,
+		otherNote: {
+			id: row.otherNoteId,
+			slug: row.otherSlug,
+			title: row.otherTitle,
+			excerpt: row.otherExcerpt,
+			updatedAt: row.otherUpdatedAt,
+		},
+	};
 }

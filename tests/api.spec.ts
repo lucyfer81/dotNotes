@@ -509,7 +509,7 @@ describe("ai enhance api", () => {
 			title: "AI Enhance Note",
 			folderId: "folder-10-projects",
 			bodyText:
-				"RAG 检索与总结流程设计，包含 tags 与链接候选。为了验证摘要逻辑，这里补充更多上下文：先定义查询意图，再构建候选池，之后由模型给出标题、标签、双链建议。最后通过摘要提炼关键结论、风险和后续动作，确保输出不是原文复述。并且记录失败回退策略、重试机制与可观测指标，用于后续迭代。",
+				"RAG 检索与总结流程设计，包含 tags 与关系候选。为了验证摘要逻辑，这里补充更多上下文：先定义查询意图，再构建候选池，之后由模型给出标题、标签、关系建议。最后通过摘要提炼关键结论、风险和后续动作，确保输出不是原文复述。并且记录失败回退策略、重试机制与可观测指标，用于后续迭代。",
 		});
 
 		const originalFetch = globalThis.fetch;
@@ -523,7 +523,7 @@ describe("ai enhance api", () => {
 									titleCandidates: [{ title: "RAG 流程设计", confidence: 0.88, reason: "主题聚焦" }],
 									tagSuggestions: [{ name: "ai/rag", confidence: 0.83, reason: "语义命中" }],
 									semanticSearch: [],
-									linkSuggestions: [],
+									relationSuggestions: [],
 									summary: "这是一条关于 RAG 流程设计的笔记。",
 									outline: ["问题定义", "检索链路", "输出策略"],
 									similarNotes: [],
@@ -558,6 +558,98 @@ describe("ai enhance api", () => {
 			expect(enhanced.data.titleCandidates[0]?.title).toBe("RAG 流程设计");
 			expect(enhanced.data.tagSuggestions[0]?.name).toBe("ai-rag");
 			expect(enhanced.data.summary).toContain("RAG");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it("uses same-folder notes as relation candidates when retrieval results are sparse", async () => {
+		const source = await createNote({
+			title: "双链功能必要性探讨",
+			folderId: "folder-10-projects",
+			bodyText: "我不会主动在一篇 note 里提及另一篇 note，更依赖 AI 判断关系。",
+		});
+		const sibling = await createNote({
+			title: "dotNotes：停用全译 + 格式强化改进提案",
+			folderId: "folder-10-projects",
+			bodyText: "讨论 dotNotes 的产品设计、编辑体验和后续演进。",
+		});
+		await createNote({
+			title: "Area Note",
+			folderId: "folder-20-areas",
+			bodyText: "不同 folder 的笔记，不应该作为这条回归测试的唯一候选来源。",
+		});
+
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = vi.fn(async (input, init) => {
+			const url = typeof input === "string" ? input : input instanceof Request ? input.url : "";
+			if (url.includes("/embeddings")) {
+				return new Response(
+					JSON.stringify({
+						data: [{ index: 0, embedding: [1, 0, 0, 0] }],
+					}),
+					{
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					},
+				);
+			}
+			const payload = typeof init?.body === "string"
+				? JSON.parse(init.body) as { messages?: Array<{ role?: string; content?: string }> }
+				: {};
+			const userPrompt = payload.messages?.find((item) => item.role === "user")?.content ?? "";
+			const inputMarker = "input: ";
+			const schemaMarker = "\nschema:";
+			const inputStart = userPrompt.indexOf(inputMarker);
+			const schemaStart = userPrompt.indexOf(schemaMarker, inputStart);
+			expect(inputStart).toBeGreaterThanOrEqual(0);
+			expect(schemaStart).toBeGreaterThan(inputStart);
+			const promptInput = JSON.parse(
+				userPrompt.slice(inputStart + inputMarker.length, schemaStart),
+			) as { candidates?: Array<{ noteId: string }> };
+			expect(promptInput.candidates?.map((item) => item.noteId)).toContain(sibling.id);
+
+			return new Response(
+				JSON.stringify({
+					choices: [
+						{
+							message: {
+								content: JSON.stringify({
+									relationSuggestions: [
+										{
+											noteId: sibling.id,
+											relationType: "same_project",
+											score: 0.87,
+											reason: "同一目录下都在讨论 dotNotes 的产品设计。",
+											evidenceExcerpt: "都围绕 dotFamily / dotNotes 的功能设计展开。",
+										},
+									],
+								}),
+							},
+						},
+					],
+				}),
+				{
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				},
+			);
+		}) as typeof fetch;
+
+		try {
+			const enhanced = await readEnvelope<{
+				relationSuggestions: Array<{ noteId: string; relationType: string }>;
+			}>(await api(`/api/ai/notes/${source.id}/enhance/relations`, {
+				method: "POST",
+				body: JSON.stringify({}),
+			}, {
+				AI_BASE_URL: "https://api.siliconflow.cn/v1",
+				AI_CHAT_MODEL: "Qwen/Qwen2.5-7B-Instruct",
+				SILICONFLOW_API_KEY: "test-key",
+			}));
+
+			expect(enhanced.data.relationSuggestions[0]?.noteId).toBe(sibling.id);
+			expect(enhanced.data.relationSuggestions[0]?.relationType).toBe("same_project");
 		} finally {
 			globalThis.fetch = originalFetch;
 		}

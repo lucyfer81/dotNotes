@@ -50,7 +50,7 @@ export type AiEnhanceRequestInput = {
 	topK: number;
 };
 
-export type AiEnhanceTaskKey = "title" | "tags" | "semantic" | "links" | "summary" | "similar";
+export type AiEnhanceTaskKey = "title" | "tags" | "semantic" | "relations" | "summary" | "similar";
 
 export type AiEnhanceTitleCandidate = {
 	title: string;
@@ -73,13 +73,15 @@ export type AiEnhanceRelatedNoteItem = {
 	reason: string;
 };
 
-export type AiEnhanceLinkSuggestion = {
-	targetNoteId: string;
+export type AiEnhanceRelationSuggestion = {
+	noteId: string;
 	slug: string;
 	title: string;
-	anchorText: string;
+	snippet: string;
+	relationType: "similar" | "complements" | "contrasts" | "same_project" | "same_area" | "related";
 	score: number;
 	reason: string;
+	evidenceExcerpt: string | null;
 };
 
 export type AiEnhanceSummaryMode = "skip" | "mini" | "full";
@@ -100,7 +102,7 @@ export type AiEnhanceResult = {
 	titleCandidates: AiEnhanceTitleCandidate[];
 	tagSuggestions: AiEnhanceTagSuggestion[];
 	semanticSearch: AiEnhanceRelatedNoteItem[];
-	linkSuggestions: AiEnhanceLinkSuggestion[];
+	relationSuggestions: AiEnhanceRelationSuggestion[];
 	summary: string;
 	outline: string[];
 	summaryMeta: AiEnhanceSummaryMeta;
@@ -112,6 +114,6 @@ export type AiEnhancePreparedInput = {
 	query: string;
 	topK: number;
 	candidates: AiContextNoteItem[];
-	linkedSlugs: Set<string>;
+	relatedNoteIds: Set<string>;
 	existingTagNames: string[];
 };

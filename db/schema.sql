@@ -107,6 +107,32 @@ CREATE TABLE IF NOT EXISTS note_links (
 	CHECK (source_note_id <> target_note_id)
 );
 
+-- AI / manual discovered note-to-note relations stored as one undirected edge.
+CREATE TABLE IF NOT EXISTS note_relations (
+	id TEXT PRIMARY KEY,
+	note_id_low TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+	note_id_high TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+	relation_type TEXT NOT NULL DEFAULT 'related' CHECK (
+		relation_type IN ('similar', 'complements', 'contrasts', 'same_project', 'same_area', 'related')
+	),
+	status TEXT NOT NULL DEFAULT 'suggested' CHECK (
+		status IN ('suggested', 'accepted', 'rejected')
+	),
+	source TEXT NOT NULL DEFAULT 'ai' CHECK (
+		source IN ('ai', 'manual')
+	),
+	score REAL NOT NULL DEFAULT 0.5 CHECK (score >= 0 AND score <= 1),
+	reason TEXT NOT NULL DEFAULT '',
+	evidence_excerpt TEXT,
+	provider TEXT,
+	model TEXT,
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	CHECK (note_id_low <> note_id_high),
+	CHECK (note_id_low < note_id_high),
+	UNIQUE (note_id_low, note_id_high)
+);
+
 -- Attachments and images stored in R2.
 CREATE TABLE IF NOT EXISTS assets (
 	id TEXT PRIMARY KEY,
@@ -203,6 +229,12 @@ CREATE INDEX IF NOT EXISTS idx_note_tags_tag_note ON note_tags(tag_id, note_id);
 CREATE INDEX IF NOT EXISTS idx_note_tags_note ON note_tags(note_id);
 CREATE INDEX IF NOT EXISTS idx_note_links_target ON note_links(target_note_id);
 CREATE INDEX IF NOT EXISTS idx_note_links_source ON note_links(source_note_id);
+CREATE INDEX IF NOT EXISTS idx_note_relations_low_status
+	ON note_relations(note_id_low, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_note_relations_high_status
+	ON note_relations(note_id_high, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_note_relations_status_source
+	ON note_relations(status, source, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_assets_note ON assets(note_id);
 CREATE INDEX IF NOT EXISTS idx_note_chunks_note ON note_chunks(note_id, chunk_index);
 CREATE INDEX IF NOT EXISTS idx_note_index_jobs_status_retry
@@ -242,6 +274,14 @@ FOR EACH ROW
 WHEN NEW.updated_at = OLD.updated_at
 BEGIN
 	UPDATE note_index_jobs SET updated_at = CURRENT_TIMESTAMP WHERE note_id = OLD.note_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_note_relations_updated_at
+AFTER UPDATE ON note_relations
+FOR EACH ROW
+WHEN NEW.updated_at = OLD.updated_at
+BEGIN
+	UPDATE note_relations SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
 END;
 
 CREATE TRIGGER IF NOT EXISTS trg_rss_feeds_updated_at

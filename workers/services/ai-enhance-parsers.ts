@@ -1,9 +1,9 @@
 import { buildExcerpt } from "./note-query-service";
-import { normalizeTagName } from "./note-relations-service";
+import { normalizeNoteRelationType, normalizeTagName } from "./note-relations-service";
 import { buildOutlineFallback } from "./ai-enhance-fallback";
 import type {
 	AiContextNoteItem,
-	AiEnhanceLinkSuggestion,
+	AiEnhanceRelationSuggestion,
 	AiEnhanceRelatedNoteItem,
 	AiEnhanceSummaryMode,
 	AiEnhanceTagSuggestion,
@@ -111,16 +111,16 @@ export function parseRelatedNoteItems(
 	return output;
 }
 
-export function parseLinkSuggestions(
+export function parseRelationSuggestions(
 	value: unknown,
 	limit: number,
 	candidatesById: Map<string, AiContextNoteItem>,
-	linkedSlugs: Set<string>,
-): AiEnhanceLinkSuggestion[] {
+	relatedNoteIds: Set<string>,
+): AiEnhanceRelationSuggestion[] {
 	if (!Array.isArray(value)) {
 		return [];
 	}
-	const output: AiEnhanceLinkSuggestion[] = [];
+	const output: AiEnhanceRelationSuggestion[] = [];
 	const seen = new Set<string>();
 	for (const item of value) {
 		if (output.length >= limit || !isRecord(item)) {
@@ -128,20 +128,24 @@ export function parseLinkSuggestions(
 		}
 		const noteId = typeof item.noteId === "string" ? item.noteId.trim() : "";
 		const candidate = noteId ? candidatesById.get(noteId) : null;
-		if (!candidate || linkedSlugs.has(candidate.slug) || seen.has(candidate.noteId)) {
+		if (!candidate || relatedNoteIds.has(candidate.noteId) || seen.has(candidate.noteId)) {
 			continue;
 		}
+		const relationType = normalizeNoteRelationType(
+			typeof item.relationType === "string" ? item.relationType.trim() : null,
+		) ?? "related";
 		seen.add(candidate.noteId);
-		const anchorText = typeof item.anchorText === "string" && item.anchorText.trim()
-			? item.anchorText.trim()
-			: candidate.slug;
 		output.push({
-			targetNoteId: candidate.noteId,
+			noteId: candidate.noteId,
 			slug: candidate.slug,
 			title: candidate.title,
-			anchorText,
+			snippet: candidate.snippet,
+			relationType,
 			score: clampFraction(readFloatValue(item, "score") ?? readFloatValue(item, "confidence") ?? 0.6),
-			reason: typeof item.reason === "string" && item.reason.trim() ? item.reason.trim() : "建议建立双链",
+			reason: typeof item.reason === "string" && item.reason.trim() ? item.reason.trim() : "建议建立关系",
+			evidenceExcerpt: typeof item.evidenceExcerpt === "string" && item.evidenceExcerpt.trim()
+				? item.evidenceExcerpt.trim()
+				: candidate.snippet,
 		});
 	}
 	return output;
