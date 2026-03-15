@@ -10,7 +10,6 @@ import {
 	deleteNote,
 	deleteNoteRelation,
 	enhanceNoteWithAiTaskStream,
-	getNoteLinks,
 	hardDeleteNote,
 	listFolders,
 	listNoteAssets,
@@ -30,8 +29,6 @@ import {
 	type AiEnhanceTaskApiKey,
 	type FolderApiItem,
 	type NoteAssetApiItem,
-	type NoteLinkApiItem,
-	type NoteLinksApiItem,
 	type NoteRelationApiItem,
 	type NoteRelationTypeApiItem,
 	type NoteApiItem,
@@ -159,20 +156,13 @@ export default function Home() {
 	const [isArchivingNote, setIsArchivingNote] = useState(false);
 	const [isRestoringNote, setIsRestoringNote] = useState(false);
 	const [isDeletingNote, setIsDeletingNote] = useState(false);
-	const [linkInsertOpen, setLinkInsertOpen] = useState(false);
-	const [linkInsertQuery, setLinkInsertQuery] = useState("");
-	const [linkInsertResults, setLinkInsertResults] = useState<NoteItem[]>([]);
-	const [isLinkInsertLoading, setIsLinkInsertLoading] = useState(false);
-	const [isSyncingLinks, setIsSyncingLinks] = useState(false);
 	const [commandOpen, setCommandOpen] = useState(false);
 	const [commandQuery, setCommandQuery] = useState("");
 	const [commandResults, setCommandResults] = useState<NoteItem[]>([]);
 	const [isCommandLoading, setIsCommandLoading] = useState(false);
 	const [commandActiveIndex, setCommandActiveIndex] = useState(0);
 	const [recentNoteIds, setRecentNoteIds] = useState<string[]>([]);
-	const [noteLinks, setNoteLinks] = useState<NoteLinksApiItem | null>(null);
 	const [noteRelations, setNoteRelations] = useState<NoteRelationApiItem[]>([]);
-	const [isLoadingNoteLinks, setIsLoadingNoteLinks] = useState(false);
 	const [isLoadingNoteRelations, setIsLoadingNoteRelations] = useState(false);
 	const [mutatingRelationId, setMutatingRelationId] = useState("");
 	const [noteAssets, setNoteAssets] = useState<NoteAssetApiItem[]>([]);
@@ -481,8 +471,6 @@ export default function Home() {
 		if (workspaceMode === "focus") {
 			return;
 		}
-		setLinkInsertOpen(false);
-		setLinkInsertQuery("");
 		setIsFocusFullscreen(false);
 	}, [workspaceMode]);
 
@@ -517,32 +505,6 @@ export default function Home() {
 			document.body.style.overflow = previousOverflow;
 		};
 	}, [isFocusFullscreen]);
-
-	useEffect(() => {
-		setLinkInsertOpen(false);
-		setLinkInsertQuery("");
-	}, [activeNoteId]);
-
-	useEffect(() => {
-		if (!linkInsertOpen || typeof window === "undefined") {
-			return;
-		}
-		const onMouseDown = (event: MouseEvent) => {
-			const target = event.target;
-			if (!(target instanceof HTMLElement)) {
-				return;
-			}
-			if (target.closest("[data-link-panel='true']") || target.closest("[data-link-toggle='true']")) {
-				return;
-			}
-			setLinkInsertOpen(false);
-			setLinkInsertQuery("");
-		};
-		window.addEventListener("mousedown", onMouseDown);
-		return () => {
-			window.removeEventListener("mousedown", onMouseDown);
-		};
-	}, [linkInsertOpen]);
 
 	useEffect(() => {
 		if (typeof window === "undefined") {
@@ -711,37 +673,6 @@ export default function Home() {
 	}, [selectedTagIds, noteStatusFilter]);
 
 	useEffect(() => {
-		if (!activeNoteId || !activeNote) {
-			setNoteLinks(null);
-			setIsLoadingNoteLinks(false);
-			return;
-		}
-
-		let cancelled = false;
-		setIsLoadingNoteLinks(true);
-		void getNoteLinks(activeNoteId, noteStatusFilter)
-			.then((links) => {
-				if (!cancelled) {
-					setNoteLinks(links);
-				}
-			})
-			.catch(() => {
-				if (!cancelled) {
-					setNoteLinks(null);
-				}
-			})
-			.finally(() => {
-				if (!cancelled) {
-					setIsLoadingNoteLinks(false);
-				}
-			});
-
-		return () => {
-			cancelled = true;
-		};
-	}, [activeNoteId, activeNote?.updatedAt, noteStatusFilter]);
-
-	useEffect(() => {
 		if (!activeNoteId || !activeNote || activeNote.deletedAt) {
 			setNoteRelations([]);
 			setIsLoadingNoteRelations(false);
@@ -852,58 +783,6 @@ export default function Home() {
 			window.clearTimeout(timer);
 		};
 	}, [commandOpen, commandQuery, defaultCommandNotes, noteStatusFilter]);
-
-	useEffect(() => {
-		if (workspaceMode !== "focus" || !activeNote || !linkInsertOpen) {
-			setIsLinkInsertLoading(false);
-			setLinkInsertResults([]);
-			return;
-		}
-		const keyword = linkInsertQuery.trim();
-		if (!keyword) {
-			const defaults = noteItems
-				.filter((note) => note.id !== activeNote.id && !note.deletedAt)
-				.slice(0, 12);
-			setIsLinkInsertLoading(false);
-			setLinkInsertResults(defaults);
-			return;
-		}
-
-		let cancelled = false;
-		setIsLinkInsertLoading(true);
-		const timer = window.setTimeout(() => {
-			void listNotes({
-				limit: 20,
-				keyword,
-				status: "all",
-			})
-				.then((notes) => {
-					if (cancelled) {
-						return;
-					}
-					setLinkInsertResults(
-						notes
-							.map((note) => toNoteItem(note))
-							.filter((note) => note.id !== activeNote.id && !note.deletedAt),
-					);
-				})
-				.catch(() => {
-					if (!cancelled) {
-						setLinkInsertResults([]);
-					}
-				})
-				.finally(() => {
-					if (!cancelled) {
-						setIsLinkInsertLoading(false);
-					}
-				});
-		}, 180);
-
-		return () => {
-			cancelled = true;
-			window.clearTimeout(timer);
-		};
-	}, [workspaceMode, activeNote?.id, linkInsertQuery, noteItems, linkInsertOpen]);
 
 	const flushPendingSave = async () => {
 		if (saveInFlightRef.current) {
@@ -1035,43 +914,6 @@ export default function Home() {
 		);
 		setTitleDraft(nextTitle);
 		scheduleAutoSave(activeNote.id, draft);
-	};
-
-	const handleInsertWikiLink = (note: NoteItem) => {
-		if (!activeNote || isActiveNoteDeleted || !noteLinks) {
-			return;
-		}
-		const currentSlugs = new Set(noteLinks.outbound.map((item) => item.slug));
-		currentSlugs.add(note.slug);
-		void syncActiveNoteLinks([...currentSlugs]);
-		setLinkInsertOpen(false);
-		setLinkInsertQuery("");
-	};
-
-	const syncActiveNoteLinks = async (nextSlugs: string[]) => {
-		if (!activeNote || isActiveNoteDeleted || isSyncingLinks) {
-			return;
-		}
-		setIsSyncingLinks(true);
-		try {
-			const updated = await updateNote(activeNote.id, { linkSlugs: nextSlugs });
-			const next = toNoteItem(updated);
-			setNoteItems((prev) => prev.map((note) => (note.id === next.id ? { ...note, ...next } : note)));
-		} catch (error) {
-			console.error("Failed to sync note links", error);
-		} finally {
-			setIsSyncingLinks(false);
-		}
-	};
-
-	const handleRemoveOutboundLink = (noteId: string) => {
-		if (!activeNote || isActiveNoteDeleted || !noteLinks) {
-			return;
-		}
-		const nextSlugs = noteLinks.outbound
-			.filter((item) => item.noteId !== noteId)
-			.map((item) => item.slug);
-		void syncActiveNoteLinks(nextSlugs);
 	};
 
 	const refreshActiveNoteRelations = async (noteId: string) => {
@@ -1393,19 +1235,6 @@ export default function Home() {
 		} finally {
 			setDeletingAssetId("");
 		}
-	};
-
-	const closeLinkInsertPanel = () => {
-		setLinkInsertOpen(false);
-		setLinkInsertQuery("");
-	};
-
-	const toggleLinkInsertPanel = () => {
-		if (linkInsertOpen) {
-			closeLinkInsertPanel();
-			return;
-		}
-		setLinkInsertOpen(true);
 	};
 
 	const handleCaptureSend = async () => {
@@ -1830,10 +1659,7 @@ export default function Home() {
 	const canArchiveActiveNote = Boolean(activeNote && !activeNote.deletedAt);
 	const canRestoreActiveNote = Boolean(activeNote?.deletedAt);
 	const canConfirmTitleEdit = titleDraft.trim().length > 0 && !isActiveNoteDeleted;
-	const outboundLinks = noteLinks?.outbound ?? [];
-	const inboundLinks = noteLinks?.inbound ?? [];
 	const acceptedRelations = noteRelations.filter((item) => item.status === "accepted");
-	const canEditLinks = Boolean(activeNote && noteLinks && !isActiveNoteDeleted && !isSyncingLinks && !isLoadingNoteLinks);
 
 	return (
 		<div className="min-h-screen bg-[#f4f6f8] text-slate-900">
@@ -2302,33 +2128,7 @@ export default function Home() {
 										<span className="text-xs text-slate-400">
 											{isActiveNoteDeleted ? "回收站笔记不可移动" : isMovingNote ? "移动中..." : "切换即移动"}
 										</span>
-										<button
-											type="button"
-											data-link-toggle="true"
-											onClick={toggleLinkInsertPanel}
-											disabled={!activeNote || isActiveNoteDeleted || (!linkInsertOpen && !canEditLinks)}
-											className={`rounded-lg border px-3 py-2 text-xs font-medium ${
-												!activeNote || isActiveNoteDeleted || (!linkInsertOpen && !canEditLinks)
-													? "cursor-not-allowed border-slate-200 text-slate-300"
-													: "border-sky-200 text-sky-700 hover:bg-sky-50"
-											}`}
-										>
-											{linkInsertOpen ? "收起双链" : "添加双链"}
-										</button>
 									</div>
-									{linkInsertOpen ? (
-										<div data-link-panel="true">
-											<WikiLinkInsertPanel
-												query={linkInsertQuery}
-												onQueryChange={setLinkInsertQuery}
-												results={linkInsertResults}
-												isLoading={isLinkInsertLoading}
-												disabled={!canEditLinks}
-												onInsert={handleInsertWikiLink}
-												onClose={closeLinkInsertPanel}
-											/>
-										</div>
-									) : null}
 									<div className="mt-3">
 										<AttachmentPanel
 											assets={noteAssets}
@@ -2430,16 +2230,6 @@ export default function Home() {
 
 							{!isFocusFullscreen ? (
 								<div className="mt-3">
-								<LinkSummaryPanel
-									isLoading={isLoadingNoteLinks}
-									isMutating={isSyncingLinks}
-									outbound={outboundLinks}
-									inbound={inboundLinks}
-									onOpenNote={focusNote}
-									onRemoveOutbound={handleRemoveOutboundLink}
-									canRemoveOutbound={canEditLinks}
-								/>
-								<div className="mt-3">
 									<RelationSummaryPanel
 										isLoading={isLoadingNoteRelations}
 										items={acceptedRelations}
@@ -2449,7 +2239,6 @@ export default function Home() {
 										onDeleteRelation={handleDeleteRelation}
 									/>
 								</div>
-							</div>
 							) : null}
 						</section>
 					) : null}
@@ -2798,33 +2587,7 @@ export default function Home() {
 									<span className="text-xs text-slate-400">
 										{isActiveNoteDeleted ? "回收站笔记不可移动" : isMovingNote ? "移动中" : "切换即移动"}
 									</span>
-									<button
-										type="button"
-										data-link-toggle="true"
-										onClick={toggleLinkInsertPanel}
-										disabled={!activeNote || isActiveNoteDeleted || (!linkInsertOpen && !canEditLinks)}
-										className={`rounded-lg border px-2 py-1 text-xs ${
-											!activeNote || isActiveNoteDeleted || (!linkInsertOpen && !canEditLinks)
-												? "cursor-not-allowed border-slate-200 text-slate-300"
-												: "border-sky-200 text-sky-700"
-										}`}
-									>
-										{linkInsertOpen ? "收起双链" : "添加双链"}
-									</button>
 								</div>
-								{linkInsertOpen ? (
-									<div data-link-panel="true">
-										<WikiLinkInsertPanel
-											query={linkInsertQuery}
-											onQueryChange={setLinkInsertQuery}
-											results={linkInsertResults}
-											isLoading={isLinkInsertLoading}
-											disabled={!canEditLinks}
-											onInsert={handleInsertWikiLink}
-											onClose={closeLinkInsertPanel}
-										/>
-									</div>
-								) : null}
 								<div className="mb-2">
 									<AttachmentPanel
 										assets={noteAssets}
@@ -2865,16 +2628,6 @@ export default function Home() {
 								)}
 							{!isFocusFullscreen ? (
 								<div className="mt-3">
-								<LinkSummaryPanel
-									isLoading={isLoadingNoteLinks}
-									isMutating={isSyncingLinks}
-									outbound={outboundLinks}
-									inbound={inboundLinks}
-									onOpenNote={focusNote}
-									onRemoveOutbound={handleRemoveOutboundLink}
-									canRemoveOutbound={canEditLinks}
-								/>
-								<div className="mt-3">
 									<RelationSummaryPanel
 										isLoading={isLoadingNoteRelations}
 										items={acceptedRelations}
@@ -2884,7 +2637,6 @@ export default function Home() {
 										onDeleteRelation={handleDeleteRelation}
 									/>
 								</div>
-							</div>
 							) : null}
 						</section>
 					) : null}
@@ -3129,84 +2881,6 @@ function ModeButton(props: {
 	);
 }
 
-function WikiLinkInsertPanel(props: {
-	query: string;
-	onQueryChange: (value: string) => void;
-	results: NoteItem[];
-	isLoading: boolean;
-	disabled: boolean;
-	onInsert: (note: NoteItem) => void;
-	onClose: () => void;
-}) {
-	const { query, onQueryChange, results, isLoading, disabled, onInsert, onClose } = props;
-	return (
-		<section className="mt-3 rounded-xl border border-slate-200 bg-slate-50/70 p-2">
-			<div className="mb-2 flex items-center justify-between">
-				<p className="text-xs font-medium text-slate-600">双链管理</p>
-				<button
-					type="button"
-					onClick={onClose}
-					className="rounded-md border border-slate-200 px-2 py-1 text-[11px] text-slate-500 hover:bg-slate-100"
-				>
-					收起
-				</button>
-			</div>
-			<div className="flex items-center gap-2">
-				<input
-					type="text"
-					value={query}
-					onChange={(event) => onQueryChange(event.target.value)}
-					onKeyDown={(event) => {
-						if (event.key === "Escape") {
-							event.preventDefault();
-							onClose();
-							return;
-						}
-						if (event.key === "Enter") {
-							event.preventDefault();
-							const first = results[0];
-							if (first && !disabled) {
-								onInsert(first);
-							}
-						}
-					}}
-					disabled={disabled}
-					placeholder={disabled ? "当前状态不可编辑双链" : "搜索其他笔记并建立出链"}
-					className={`min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-700 ${
-						disabled ? "cursor-not-allowed opacity-60" : ""
-					}`}
-				/>
-				<span className="shrink-0 text-[11px] text-slate-400">Enter 添加首项</span>
-			</div>
-			<p className="mt-2 px-1 text-[11px] text-slate-400">链接仅存储在数据库中，不写入正文。</p>
-			<div className="mt-2 max-h-24 space-y-1 overflow-y-auto pr-1">
-				{isLoading ? (
-					<p className="px-2 py-1 text-xs text-slate-400">搜索中...</p>
-				) : null}
-				{!isLoading && results.length === 0 ? (
-					<p className="px-2 py-1 text-xs text-slate-400">没有可添加的笔记</p>
-				) : null}
-				{!isLoading
-					? results.map((note) => (
-						<button
-							key={`insert-${note.id}`}
-							type="button"
-							onClick={() => onInsert(note)}
-							disabled={disabled}
-							className={`w-full rounded-md border border-slate-200 bg-white px-2 py-1 text-left text-xs ${
-								disabled ? "cursor-not-allowed text-slate-300" : "text-slate-700 hover:bg-slate-100"
-							}`}
-						>
-							<span className="font-medium text-slate-800">{note.title}</span>
-							<span className="ml-2 text-slate-400">→ 添加为出链</span>
-						</button>
-					))
-					: null}
-			</div>
-		</section>
-	);
-}
-
 function AttachmentPanel(props: {
 	assets: NoteAssetApiItem[];
 	isLoading: boolean;
@@ -3290,38 +2964,6 @@ function AttachmentPanel(props: {
 					: null}
 			</div>
 			<p className="mt-2 px-1 text-[11px] text-slate-400">点击文件名可插入 Markdown 链接。</p>
-		</section>
-	);
-}
-
-function LinkSummaryPanel(props: {
-	isLoading: boolean;
-	isMutating: boolean;
-	outbound: NoteLinkApiItem[];
-	inbound: NoteLinkApiItem[];
-	onOpenNote: (noteId: string) => void;
-	onRemoveOutbound: (noteId: string) => void;
-	canRemoveOutbound: boolean;
-}) {
-	const { isLoading, isMutating, outbound, inbound, onOpenNote, onRemoveOutbound, canRemoveOutbound } = props;
-
-	return (
-		<section className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-			<div className="mb-2 flex items-center justify-between">
-				<p className="text-xs font-semibold uppercase tracking-wide text-slate-500">链接概览</p>
-				{isLoading || isMutating ? <span className="text-xs text-slate-400">{isMutating ? "处理中..." : "更新中..."}</span> : null}
-			</div>
-			<div className="grid gap-3 lg:grid-cols-2">
-				<LinkNoteList
-					title="出链"
-					items={outbound}
-					emptyText="暂无出链"
-					onOpenNote={onOpenNote}
-					onRemoveNote={onRemoveOutbound}
-					canRemove={canRemoveOutbound}
-				/>
-				<LinkNoteList title="反链" items={inbound} emptyText="暂无反链" onOpenNote={onOpenNote} />
-			</div>
 		</section>
 	);
 }
@@ -3445,55 +3087,6 @@ function RelationSummaryPanel(props: {
 				))}
 			</div>
 		</section>
-	);
-}
-
-function LinkNoteList(props: {
-	title: string;
-	items: NoteLinkApiItem[];
-	emptyText: string;
-	onOpenNote: (noteId: string) => void;
-	onRemoveNote?: (noteId: string) => void;
-	canRemove?: boolean;
-}) {
-	const { title, items, emptyText, onOpenNote, onRemoveNote, canRemove = false } = props;
-
-	return (
-		<div className="rounded-lg border border-slate-200 bg-white p-2">
-			<p className="text-xs font-medium text-slate-600">{title}</p>
-			<div className="mt-2 max-h-28 space-y-1 overflow-y-auto pr-1">
-				{items.length === 0 ? (
-					<p className="text-xs text-slate-400">{emptyText}</p>
-				) : (
-					items.map((item) => (
-						<div key={`${title}-${item.noteId}`} className="flex items-center gap-1 rounded-md px-1 py-1 hover:bg-slate-100">
-							<button
-								type="button"
-								onClick={() => onOpenNote(item.noteId)}
-								className="min-w-0 flex-1 rounded-md px-2 py-1 text-left text-xs text-slate-700"
-							>
-								<p className="truncate font-medium text-slate-800">{item.title}</p>
-								<p className="mt-0.5 truncate text-[11px] text-slate-500">{formatUpdatedAt(item.updatedAt)}</p>
-							</button>
-							{onRemoveNote ? (
-								<button
-									type="button"
-									onClick={() => onRemoveNote(item.noteId)}
-									disabled={!canRemove}
-									className={`rounded border px-2 py-0.5 text-[11px] ${
-										!canRemove
-											? "cursor-not-allowed border-slate-200 text-slate-300"
-											: "border-rose-200 text-rose-600 hover:bg-rose-50"
-									}`}
-								>
-									删除
-								</button>
-							) : null}
-						</div>
-					))
-				)}
-			</div>
-		</div>
 	);
 }
 
