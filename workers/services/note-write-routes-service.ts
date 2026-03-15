@@ -19,7 +19,6 @@ import {
 } from "./note-storage-service";
 import {
 	fetchTagsForSingleNote,
-	replaceNoteLinks,
 	replaceNoteTags,
 	resolveTagIds,
 } from "./note-relations-service";
@@ -144,11 +143,6 @@ export function registerNoteWriteRoutes(app: Hono<{ Bindings: Env }>): void {
 		await syncNoteFtsContent(c.env.DB, noteId, title, excerpt, resolvedBody.plainBodyText);
 
 		await replaceNoteTags(c.env.DB, noteId, tagIds);
-
-		const desiredLinkSlugs = hasOwn(payload, "linkSlugs")
-			? toStringArray(payload.linkSlugs)
-			: [];
-		const linkResult = await replaceNoteLinks(c.env.DB, noteId, desiredLinkSlugs);
 		const queuedAction = isArchived ? "delete" : "upsert";
 		await enqueueNoteIndexJob(c.env.DB, noteId, queuedAction);
 		scheduleIndexProcessing(c, 1);
@@ -157,15 +151,7 @@ export function registerNoteWriteRoutes(app: Hono<{ Bindings: Env }>): void {
 		const tags = await fetchTagsForSingleNote(c.env.DB, noteId);
 		const hydrated = created ? await hydrateNoteBodyFromR2(c.env, created) : null;
 
-		return jsonOk(
-			c,
-			{
-				...(hydrated ?? {}),
-				tags,
-				links: linkResult,
-			},
-			201,
-		);
+		return jsonOk(c, { ...(hydrated ?? {}), tags }, 201);
 	});
 
 	app.put("/api/notes/:id", async (c) => {
@@ -305,12 +291,6 @@ export function registerNoteWriteRoutes(app: Hono<{ Bindings: Env }>): void {
 			await replaceNoteTags(c.env.DB, noteId, tagIds);
 		}
 
-		let linkResult: { inserted: number; unresolvedSlugs: string[] } | null = null;
-		const shouldSyncLinks = hasOwn(payload, "linkSlugs");
-		if (shouldSyncLinks) {
-			const desired = toStringArray(payload.linkSlugs);
-			linkResult = await replaceNoteLinks(c.env.DB, noteId, desired);
-		}
 		const indexAction = nextIsArchived ? "delete" : "upsert";
 		await enqueueNoteIndexJob(c.env.DB, noteId, indexAction);
 		scheduleIndexProcessing(c, 1);
@@ -318,7 +298,7 @@ export function registerNoteWriteRoutes(app: Hono<{ Bindings: Env }>): void {
 		const updated = await getNoteById(c.env.DB, noteId);
 		const tags = await fetchTagsForSingleNote(c.env.DB, noteId);
 		const hydrated = updated ? await hydrateNoteBodyFromR2(c.env, updated) : null;
-		return jsonOk(c, { ...(hydrated ?? {}), tags, links: linkResult });
+		return jsonOk(c, { ...(hydrated ?? {}), tags });
 	});
 
 	app.delete("/api/notes/:id", async (c) => {

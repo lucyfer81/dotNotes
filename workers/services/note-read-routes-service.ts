@@ -1,9 +1,7 @@
 import type { Hono } from "hono";
 import {
-	buildNoteStatusWhere,
 	getNoteById,
 	listNotesWithSearchMode,
-	matchesNoteStatus,
 	normalizeNoteStatus,
 	normalizeTagMode,
 } from "./note-query-service";
@@ -63,58 +61,5 @@ export function registerNoteReadRoutes(app: Hono<{ Bindings: Env }>): void {
 		const tags = await fetchTagsForSingleNote(c.env.DB, noteId);
 		const hydrated = await hydrateNoteBodyFromR2(c.env, note);
 		return jsonOk(c, { ...hydrated, tags });
-	});
-
-	app.get("/api/notes/:id/links", async (c) => {
-		const noteId = c.req.param("id");
-		const statusParam = c.req.query("status");
-		const status = normalizeNoteStatus(statusParam, c.req.query("includeArchived"));
-		const note = await getNoteById(c.env.DB, noteId);
-		if (!note) {
-			return jsonError(c, 404, "Note not found");
-		}
-		if (!statusParam && note.deletedAt) {
-			return jsonError(c, 404, "Note not found");
-		}
-		if (statusParam && !matchesNoteStatus(note, status)) {
-			return jsonError(c, 404, "Note not found");
-		}
-		const linkNoteWhere = statusParam
-			? buildNoteStatusWhere("n", status)
-			: "n.deleted_at IS NULL";
-
-		const { results: outbound } = await c.env.DB.prepare(
-			`SELECT
-				nl.target_note_id AS noteId,
-				n.slug,
-				n.title,
-				COALESCE(n.deleted_at, n.updated_at) AS updatedAt,
-				nl.anchor_text AS anchorText
-			 FROM note_links nl
-			 JOIN notes n ON n.id = nl.target_note_id
-			 WHERE nl.source_note_id = ?
-			   AND ${linkNoteWhere}
-			 ORDER BY COALESCE(n.deleted_at, n.updated_at) DESC`,
-		)
-			.bind(noteId)
-			.all();
-
-		const { results: inbound } = await c.env.DB.prepare(
-			`SELECT
-				nl.source_note_id AS noteId,
-				n.slug,
-				n.title,
-				COALESCE(n.deleted_at, n.updated_at) AS updatedAt,
-				nl.anchor_text AS anchorText
-			 FROM note_links nl
-			 JOIN notes n ON n.id = nl.source_note_id
-			 WHERE nl.target_note_id = ?
-			   AND ${linkNoteWhere}
-			 ORDER BY COALESCE(n.deleted_at, n.updated_at) DESC`,
-		)
-			.bind(noteId)
-			.all();
-
-		return jsonOk(c, { noteId, outbound, inbound });
 	});
 }

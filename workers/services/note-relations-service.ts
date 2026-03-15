@@ -1,5 +1,5 @@
 import { placeholders } from "./common-service";
-import { getTagNameMaxLength, getTagPerNoteLimit, slugify } from "./note-query-service";
+import { getTagNameMaxLength, getTagPerNoteLimit } from "./note-query-service";
 
 type TagRow = {
 	id: string;
@@ -253,52 +253,6 @@ export async function replaceNoteTags(db: D1Database, noteId: string, tagIds: st
 		db.prepare("INSERT INTO note_tags (note_id, tag_id) VALUES (?, ?)").bind(noteId, tagId),
 	);
 	await db.batch(statements);
-}
-
-export async function replaceNoteLinks(
-	db: D1Database,
-	sourceNoteId: string,
-	linkSlugs: string[],
-): Promise<{ inserted: number; unresolvedSlugs: string[] }> {
-	await db.prepare("DELETE FROM note_links WHERE source_note_id = ?")
-		.bind(sourceNoteId)
-		.run();
-
-	if (linkSlugs.length === 0) {
-		return { inserted: 0, unresolvedSlugs: [] };
-	}
-
-	const uniqueSlugs = [...new Set(linkSlugs.map((slug) => slugify(slug)))];
-	if (uniqueSlugs.length === 0) {
-		return { inserted: 0, unresolvedSlugs: [] };
-	}
-
-	const marks = placeholders(uniqueSlugs.length);
-	const { results } = await db.prepare(
-		`SELECT id, slug
-		 FROM notes
-		 WHERE slug IN (${marks})
-		   AND deleted_at IS NULL`,
-	)
-		.bind(...uniqueSlugs)
-		.all<{ id: string; slug: string }>();
-
-	const foundSlugSet = new Set(results.map((row) => row.slug));
-	const unresolvedSlugs = uniqueSlugs.filter((slug) => !foundSlugSet.has(slug));
-	const targetRows = results.filter((row) => row.id !== sourceNoteId);
-
-	if (targetRows.length === 0) {
-		return { inserted: 0, unresolvedSlugs };
-	}
-
-	const statements = targetRows.map((target) =>
-		db.prepare(
-			"INSERT INTO note_links (source_note_id, target_note_id, anchor_text) VALUES (?, ?, ?)",
-		)
-			.bind(sourceNoteId, target.id, target.slug),
-	);
-	await db.batch(statements);
-	return { inserted: targetRows.length, unresolvedSlugs };
 }
 
 export function normalizeNoteRelationType(value: string | null | undefined): NoteRelationType | null {

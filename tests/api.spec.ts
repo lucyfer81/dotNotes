@@ -111,83 +111,6 @@ describe("search api", () => {
 	});
 });
 
-describe("wiki link behavior with renamed titles", () => {
-	it("stores links in database only and keeps slug-stable links after title rename", async () => {
-		const target = await createNote({
-			title: "dotBlog",
-			folderId: "folder-10-projects",
-			bodyText: "target note body",
-		});
-		const source = await createNote({
-			title: "dotFamily",
-			folderId: "folder-10-projects",
-			bodyText: "ref [[dotBlog]]",
-		});
-
-		const beforeRename = await readEnvelope<NoteLinksPayload>(
-			await api(`/api/notes/${source.id}/links?status=all`),
-		);
-		expect(beforeRename.data.outbound).toEqual([]);
-
-		await readEnvelope<NotePayload>(await api(`/api/notes/${source.id}`, {
-			method: "PUT",
-			body: JSON.stringify({
-				linkSlugs: ["dotblog"],
-			}),
-		}));
-
-		const linked = await readEnvelope<NoteLinksPayload>(
-			await api(`/api/notes/${source.id}/links?status=all`),
-		);
-		expect(linked.data.outbound.map((item) => item.noteId)).toEqual([target.id]);
-		expect(linked.data.outbound[0]?.slug).toBe("dotblog");
-		expect(linked.data.outbound[0]?.title).toBe("dotBlog");
-
-		await readEnvelope<NotePayload>(await api(`/api/notes/${target.id}`, {
-			method: "PUT",
-			body: JSON.stringify({
-				title: "dotWatcher",
-				bodyText: "target note body",
-			}),
-		}));
-
-		const sourceAfterRename = await readEnvelope<NotePayload>(await api(`/api/notes/${source.id}`));
-		expect(sourceAfterRename.data.bodyText).toContain("[[dotBlog]]");
-
-		const linksAfterRename = await readEnvelope<NoteLinksPayload>(
-			await api(`/api/notes/${source.id}/links?status=all`),
-		);
-		expect(linksAfterRename.data.outbound.map((item) => item.noteId)).toEqual([target.id]);
-		expect(linksAfterRename.data.outbound[0]?.slug).toBe("dotblog");
-		expect(linksAfterRename.data.outbound[0]?.title).toBe("dotWatcher");
-
-		await readEnvelope<NotePayload>(await api(`/api/notes/${source.id}`, {
-			method: "PUT",
-			body: JSON.stringify({
-				bodyText: "ref [[dotWatcher|dotblog]]",
-			}),
-		}));
-
-		const linksAfterBodyUpdate = await readEnvelope<NoteLinksPayload>(
-			await api(`/api/notes/${source.id}/links?status=all`),
-		);
-		expect(linksAfterBodyUpdate.data.outbound.map((item) => item.noteId)).toEqual([target.id]);
-		expect(linksAfterBodyUpdate.data.outbound[0]?.slug).toBe("dotblog");
-		expect(linksAfterBodyUpdate.data.outbound[0]?.title).toBe("dotWatcher");
-
-		await readEnvelope<NotePayload>(await api(`/api/notes/${source.id}`, {
-			method: "PUT",
-			body: JSON.stringify({
-				linkSlugs: [],
-			}),
-		}));
-		const linksAfterClear = await readEnvelope<NoteLinksPayload>(
-			await api(`/api/notes/${source.id}/links?status=all`),
-		);
-		expect(linksAfterClear.data.outbound).toEqual([]);
-	});
-});
-
 describe("storage strategy api", () => {
 	it("auto switches oversized body to r2 while keeping body text readable", async () => {
 		const uniqueToken = "r2-body-search-token-991";
@@ -818,12 +741,6 @@ type NotePayload = {
 	bodyText: string | null;
 	isArchived: number;
 	deletedAt: string | null;
-};
-
-type NoteLinksPayload = {
-	noteId: string;
-	outbound: Array<{ noteId: string; slug: string; title: string }>;
-	inbound: Array<{ noteId: string; slug: string; title: string }>;
 };
 
 type TagPayload = {

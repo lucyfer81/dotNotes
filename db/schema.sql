@@ -97,15 +97,7 @@ CREATE TABLE IF NOT EXISTS note_tags (
 	PRIMARY KEY (note_id, tag_id)
 );
 
--- Stored note-to-note links, enables forward and backward links.
-CREATE TABLE IF NOT EXISTS note_links (
-	source_note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
-	target_note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
-	anchor_text TEXT,
-	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-	PRIMARY KEY (source_note_id, target_note_id),
-	CHECK (source_note_id <> target_note_id)
-);
+DROP TABLE IF EXISTS note_links;
 
 -- AI / manual discovered note-to-note relations stored as one undirected edge.
 CREATE TABLE IF NOT EXISTS note_relations (
@@ -227,8 +219,8 @@ CREATE INDEX IF NOT EXISTS idx_notes_folder_updated
 CREATE INDEX IF NOT EXISTS idx_notes_deleted_at ON notes(deleted_at);
 CREATE INDEX IF NOT EXISTS idx_note_tags_tag_note ON note_tags(tag_id, note_id);
 CREATE INDEX IF NOT EXISTS idx_note_tags_note ON note_tags(note_id);
-CREATE INDEX IF NOT EXISTS idx_note_links_target ON note_links(target_note_id);
-CREATE INDEX IF NOT EXISTS idx_note_links_source ON note_links(source_note_id);
+DROP INDEX IF EXISTS idx_note_links_target;
+DROP INDEX IF EXISTS idx_note_links_source;
 CREATE INDEX IF NOT EXISTS idx_note_relations_low_status
 	ON note_relations(note_id_low, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_note_relations_high_status
@@ -300,10 +292,4 @@ BEGIN
 	UPDATE rss_items SET updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id;
 END;
 
-CREATE VIEW IF NOT EXISTS note_backlinks AS
-SELECT
-	target_note_id AS note_id,
-	source_note_id AS linked_from_note_id,
-	anchor_text,
-	created_at
-FROM note_links;
+DROP VIEW IF EXISTS note_backlinks;
