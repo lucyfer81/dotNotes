@@ -413,6 +413,7 @@ async function generateAiEnhanceWithSiliconflow(
 				source.tagSuggestions ?? source.tags,
 				input.topK,
 				getTagNameMaxLength(env),
+				input.existingTagNames,
 			);
 		})().catch((error) => {
 			result.warnings.push(`task_failed:tags:${String(error)}`);

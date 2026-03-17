@@ -50,12 +50,18 @@ export function parseTitleCandidates(value: unknown, limit: number): AiEnhanceTi
 	return output;
 }
 
-export function parseTagSuggestions(value: unknown, limit: number, maxTagLength: number): AiEnhanceTagSuggestion[] {
+export function parseTagSuggestions(
+	value: unknown,
+	limit: number,
+	maxTagLength: number,
+	existingTagNames: string[] = [],
+): AiEnhanceTagSuggestion[] {
 	if (!Array.isArray(value)) {
 		return [];
 	}
 	const output: AiEnhanceTagSuggestion[] = [];
 	const seen = new Set<string>();
+	const existingTags = buildExistingTagCandidates(existingTagNames, maxTagLength);
 	for (const item of value) {
 		if (output.length >= limit) {
 			break;
@@ -64,12 +70,13 @@ export function parseTagSuggestions(value: unknown, limit: number, maxTagLength:
 			? item
 			: (isRecord(item) && typeof item.name === "string" ? item.name : "");
 		const normalizedName = normalizeTagName(rawName, maxTagLength);
-		if (!normalizedName || seen.has(normalizedName.toLowerCase())) {
+		const resolvedName = findExistingTagName(normalizedName, existingTags) ?? normalizedName;
+		if (!resolvedName || seen.has(resolvedName.toLowerCase())) {
 			continue;
 		}
-		seen.add(normalizedName.toLowerCase());
+		seen.add(resolvedName.toLowerCase());
 		output.push({
-			name: normalizedName,
+			name: resolvedName,
 			confidence: clampFraction(isRecord(item) ? (readFloatValue(item, "confidence") ?? 0.6) : 0.6),
 			reason: isRecord(item) && typeof item.reason === "string" && item.reason.trim()
 				? item.reason.trim()
@@ -77,6 +84,68 @@ export function parseTagSuggestions(value: unknown, limit: number, maxTagLength:
 		});
 	}
 	return output;
+}
+
+type ExistingTagCandidate = {
+	name: string;
+	normalizedName: string;
+	collapsedKey: string;
+	tokenSignature: string;
+};
+
+function buildExistingTagCandidates(existingTagNames: string[], maxTagLength: number): ExistingTagCandidate[] {
+	const seen = new Set<string>();
+	const output: ExistingTagCandidate[] = [];
+	for (const value of existingTagNames) {
+		const normalizedName = normalizeTagName(value, maxTagLength);
+		if (!normalizedName || seen.has(normalizedName)) {
+			continue;
+		}
+		seen.add(normalizedName);
+		output.push({
+			name: normalizedName,
+			normalizedName,
+			collapsedKey: toCollapsedTagKey(normalizedName),
+			tokenSignature: toTagTokenSignature(normalizedName),
+		});
+	}
+	return output;
+}
+
+function findExistingTagName(normalizedName: string, existingTags: ExistingTagCandidate[]): string | null {
+	if (!normalizedName) {
+		return null;
+	}
+	const exactMatch = existingTags.find((item) => item.normalizedName === normalizedName);
+	if (exactMatch) {
+		return exactMatch.name;
+	}
+	const collapsedKey = toCollapsedTagKey(normalizedName);
+	if (collapsedKey) {
+		const collapsedMatch = existingTags.find((item) => item.collapsedKey === collapsedKey);
+		if (collapsedMatch) {
+			return collapsedMatch.name;
+		}
+	}
+	const tokenSignature = toTagTokenSignature(normalizedName);
+	if (!tokenSignature) {
+		return null;
+	}
+	const tokenMatch = existingTags.find((item) => item.tokenSignature === tokenSignature);
+	return tokenMatch?.name ?? null;
+}
+
+function toCollapsedTagKey(value: string): string {
+	return value.replace(/[-_/]+/gu, "");
+}
+
+function toTagTokenSignature(value: string): string {
+	return value
+		.split(/[-_/]+/gu)
+		.map((item) => item.trim())
+		.filter((item) => item.length > 0)
+		.sort((left, right) => left.localeCompare(right, "zh-CN"))
+		.join("|");
 }
 
 export function parseRelatedNoteItems(

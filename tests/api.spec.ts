@@ -486,6 +486,58 @@ describe("ai enhance api", () => {
 		}
 	});
 
+	it("reuses existing tags when ai suggestions only differ by hierarchy or token order", async () => {
+		await createNote({
+			title: "Existing Tag Seed",
+			folderId: "folder-10-projects",
+			bodyText: "用于建立 ai-rag 既有标签。",
+			tagNames: ["ai-rag"],
+		});
+		const created = await createNote({
+			title: "AI Enhance Existing Tag Note",
+			folderId: "folder-10-projects",
+			bodyText: "这条笔记讨论 RAG、检索链路与 AI 标签归一化。",
+		});
+
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = vi.fn(async () =>
+			new Response(
+				JSON.stringify({
+					choices: [
+						{
+							message: {
+								content: JSON.stringify({
+									tagSuggestions: [{ name: "rag/ai", confidence: 0.79, reason: "与既有标签语义一致" }],
+								}),
+							},
+						},
+					],
+				}),
+				{
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				},
+			),
+		) as typeof fetch;
+
+		try {
+			const enhanced = await readEnvelope<{
+				tagSuggestions: Array<{ name: string }>;
+			}>(await api(`/api/ai/notes/${created.id}/enhance`, {
+				method: "POST",
+				body: JSON.stringify({ query: "RAG" }),
+			}, {
+				AI_BASE_URL: "https://api.siliconflow.cn/v1",
+				AI_CHAT_MODEL: "Qwen/Qwen2.5-7B-Instruct",
+				SILICONFLOW_API_KEY: "test-key",
+			}));
+
+			expect(enhanced.data.tagSuggestions[0]?.name).toBe("ai-rag");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
 	it("uses same-folder notes as relation candidates when retrieval results are sparse", async () => {
 		const source = await createNote({
 			title: "双链功能必要性探讨",

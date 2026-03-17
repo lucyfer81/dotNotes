@@ -95,6 +95,7 @@ export function buildTagsTaskPrompt(input: {
 		userPrompt: [
 			"规则：",
 			"- 优先复用 existing_tags，仅在必要时创建新标签。",
+			"- 如果候选标签与 existing_tags 仅是分隔符、层级写法或词序不同，必须直接返回 existing_tags 里的原标签名。",
 			"- 层级标签最多 3 层，使用 '/' 作为分隔。",
 			"- 输出 5-12 个标签，不要泛化标签。",
 			"- confidence 范围 0~1。",

@@ -131,6 +131,7 @@ export default function Home() {
 	const [isApplyingAiTitle, setIsApplyingAiTitle] = useState(false);
 	const [isApplyingAiTags, setIsApplyingAiTags] = useState(false);
 	const [isApplyingAiRelations, setIsApplyingAiRelations] = useState(false);
+	const [selectedAiTagNames, setSelectedAiTagNames] = useState<string[]>([]);
 	const [folderItems, setFolderItems] = useState<FolderApiItem[]>(defaultRootFolders);
 	const [organizeFolderId, setOrganizeFolderId] = useState<string | null>(null);
 	const [captureFolderId, setCaptureFolderId] = useState<string>(defaultRootFolders[0].id);
@@ -224,6 +225,10 @@ export default function Home() {
 		return merged.slice(0, RECENT_NOTE_LIMIT);
 	}, [noteItems, recentOpenedNotes]);
 	const recentNoteIdSet = useMemo(() => new Set(recentNoteIds), [recentNoteIds]);
+	const aiSuggestedTagKey = useMemo(
+		() => (aiEnhanceResult?.tagSuggestions ?? []).map((item) => item.name).join("\u0001"),
+		[aiEnhanceResult?.tagSuggestions],
+	);
 	const rootFolderItems = useMemo(
 		() =>
 			folderItems
@@ -350,6 +355,7 @@ export default function Home() {
 		setActiveAiTask(null);
 		setRunningAiTasks([]);
 		setAiTaskStages({});
+		setSelectedAiTagNames([]);
 		aiTaskRunIdRef.current = {
 			title: 0,
 			tags: 0,
@@ -359,6 +365,13 @@ export default function Home() {
 			similar: 0,
 		};
 	}, [activeNoteId]);
+
+	useEffect(() => {
+		const nextSelected = (aiEnhanceResult?.tagSuggestions ?? [])
+			.map((item) => item.name.trim())
+			.filter((item) => item.length > 0);
+		setSelectedAiTagNames(nextSelected);
+	}, [activeNoteId, aiSuggestedTagKey]);
 
 	useEffect(() => {
 		if (import.meta.env.SSR || typeof window === "undefined") {
@@ -1130,11 +1143,17 @@ export default function Home() {
 		if (!activeNote || isActiveNoteDeleted || isApplyingAiTags || !aiEnhanceResult) {
 			return;
 		}
-		const suggestedTags = aiEnhanceResult.tagSuggestions.map((item) => item.name).filter((item) => item.trim().length > 0);
-		if (suggestedTags.length === 0) {
+		const selectedTags = [...new Set(selectedAiTagNames.map((item) => item.trim()).filter((item) => item.length > 0))];
+		if (selectedTags.length === 0) {
 			return;
 		}
-		const mergedTagNames = [...new Set([...activeNote.tags, ...suggestedTags])];
+		const mergedTagNames = [...new Set([...activeNote.tags, ...selectedTags])];
+		if (
+			mergedTagNames.length === activeNote.tags.length &&
+			activeNote.tags.every((item) => mergedTagNames.includes(item))
+		) {
+			return;
+		}
 		setIsApplyingAiTags(true);
 		setAiErrorMessage("");
 		try {
@@ -1147,6 +1166,26 @@ export default function Home() {
 		} finally {
 			setIsApplyingAiTags(false);
 		}
+	};
+
+	const toggleAiTagSelection = (tagName: string) => {
+		setSelectedAiTagNames((prev) =>
+			prev.includes(tagName)
+				? prev.filter((item) => item !== tagName)
+				: [...prev, tagName],
+		);
+	};
+
+	const selectAllAiTags = () => {
+		setSelectedAiTagNames(
+			(aiEnhanceResult?.tagSuggestions ?? [])
+				.map((item) => item.name.trim())
+				.filter((item) => item.length > 0),
+		);
+	};
+
+	const clearAiTagSelection = () => {
+		setSelectedAiTagNames([]);
 	};
 
 	const handleApplyAiRelations = async () => {
@@ -2693,11 +2732,16 @@ export default function Home() {
 						taskStages={aiTaskStages}
 						errorMessage={aiErrorMessage}
 						result={aiEnhanceResult}
+						tagItems={tagItems}
+						selectedAiTagNames={selectedAiTagNames}
 						noteRelations={noteRelations}
 						isLoadingRelations={isLoadingNoteRelations}
 						mutatingRelationId={mutatingRelationId}
 						onApplyTitle={handleApplyAiTitle}
 						onApplyTags={handleApplyAiTags}
+						onToggleTag={toggleAiTagSelection}
+						onSelectAllTags={selectAllAiTags}
+						onClearTagSelection={clearAiTagSelection}
 						onApplyRelations={handleApplyAiRelations}
 						onAcceptSuggestion={handleAcceptAiRelationSuggestion}
 						onUpdateRelationType={handleUpdateRelationType}
@@ -2741,11 +2785,16 @@ export default function Home() {
 							taskStages={aiTaskStages}
 							errorMessage={aiErrorMessage}
 							result={aiEnhanceResult}
+							tagItems={tagItems}
+							selectedAiTagNames={selectedAiTagNames}
 							noteRelations={noteRelations}
 							isLoadingRelations={isLoadingNoteRelations}
 							mutatingRelationId={mutatingRelationId}
 							onApplyTitle={handleApplyAiTitle}
 							onApplyTags={handleApplyAiTags}
+							onToggleTag={toggleAiTagSelection}
+							onSelectAllTags={selectAllAiTags}
+							onClearTagSelection={clearAiTagSelection}
 							onApplyRelations={handleApplyAiRelations}
 							onAcceptSuggestion={handleAcceptAiRelationSuggestion}
 							onUpdateRelationType={handleUpdateRelationType}
@@ -3101,11 +3150,16 @@ function AiPanel(props: {
 	taskStages: Partial<Record<AiEnhanceTaskApiKey, string>>;
 	errorMessage: string;
 	result: AiEnhanceResultApiItem | null;
+	tagItems: TagApiItem[];
+	selectedAiTagNames: string[];
 	noteRelations: NoteRelationApiItem[];
 	isLoadingRelations: boolean;
 	mutatingRelationId: string;
 	onApplyTitle: (title: string) => void;
 	onApplyTags: () => void;
+	onToggleTag: (tagName: string) => void;
+	onSelectAllTags: () => void;
+	onClearTagSelection: () => void;
 	onApplyRelations: () => void;
 	onAcceptSuggestion: (otherNoteId: string) => void;
 	onUpdateRelationType: (relationId: string, relationType: NoteRelationTypeApiItem) => void;
@@ -3128,11 +3182,16 @@ function AiPanel(props: {
 		taskStages,
 		errorMessage,
 		result,
+		tagItems,
+		selectedAiTagNames,
 		noteRelations,
 		isLoadingRelations,
 		mutatingRelationId,
 		onApplyTitle,
 		onApplyTags,
+		onToggleTag,
+		onSelectAllTags,
+		onClearTagSelection,
 		onApplyRelations,
 		onAcceptSuggestion,
 		onUpdateRelationType,
@@ -3146,7 +3205,20 @@ function AiPanel(props: {
 	} = props;
 	const unavailable = !activeNote || Boolean(activeNote.deletedAt);
 	const runningTaskSet = new Set(runningTasks);
-	const tagNames = result?.tagSuggestions.map((item) => item.name) ?? [];
+	const existingTagNameSet = useMemo(
+		() => new Set(tagItems.map((item) => item.name.toLowerCase())),
+		[tagItems],
+	);
+	const activeTagNameSet = useMemo(
+		() => new Set((activeNote?.tags ?? []).map((item) => item.toLowerCase())),
+		[activeNote?.tags],
+	);
+	const tagSuggestions = result?.tagSuggestions ?? [];
+	const selectedAiTagNameSet = useMemo(
+		() => new Set(selectedAiTagNames.map((item) => item.toLowerCase())),
+		[selectedAiTagNames],
+	);
+	const selectedTagCount = tagSuggestions.filter((item) => selectedAiTagNameSet.has(item.name.toLowerCase())).length;
 	const [relationViewStatus, setRelationViewStatus] = useState<"suggested" | "accepted">("suggested");
 	const relationItems = noteRelations.filter((item) => item.status === relationViewStatus);
 
@@ -3275,30 +3347,91 @@ function AiPanel(props: {
 
 						{activeTask === "tags" ? (
 							<section className="rounded-lg border border-slate-200 bg-white p-3">
-								<div className="mb-2 flex items-center justify-between">
-									<p className="text-xs font-semibold text-slate-600">标签建议</p>
-									<button
-										type="button"
-										onClick={onApplyTags}
-										disabled={isApplyingTags || tagNames.length === 0}
-										className={`rounded border px-2 py-1 text-[11px] ${
-											isApplyingTags || tagNames.length === 0
-												? "cursor-not-allowed border-slate-200 text-slate-300"
-												: "border-slate-300 text-slate-700 hover:bg-slate-100"
-										}`}
-									>
-										{isApplyingTags ? "应用中..." : "应用标签"}
-									</button>
+								<div className="mb-2 flex items-start justify-between gap-3">
+									<div>
+										<p className="text-xs font-semibold text-slate-600">标签建议</p>
+										<p className="mt-1 text-[11px] text-slate-400">
+											已选 {selectedTagCount} / {tagSuggestions.length}
+										</p>
+									</div>
+									<div className="flex flex-wrap justify-end gap-1">
+										<button
+											type="button"
+											onClick={onSelectAllTags}
+											disabled={isApplyingTags || tagSuggestions.length === 0}
+											className={`rounded border px-2 py-1 text-[11px] ${
+												isApplyingTags || tagSuggestions.length === 0
+													? "cursor-not-allowed border-slate-200 text-slate-300"
+													: "border-slate-300 text-slate-700 hover:bg-slate-100"
+											}`}
+										>
+											全选
+										</button>
+										<button
+											type="button"
+											onClick={onClearTagSelection}
+											disabled={isApplyingTags || selectedTagCount === 0}
+											className={`rounded border px-2 py-1 text-[11px] ${
+												isApplyingTags || selectedTagCount === 0
+													? "cursor-not-allowed border-slate-200 text-slate-300"
+													: "border-slate-300 text-slate-700 hover:bg-slate-100"
+											}`}
+										>
+											清空
+										</button>
+										<button
+											type="button"
+											onClick={onApplyTags}
+											disabled={isApplyingTags || selectedTagCount === 0}
+											className={`rounded border px-2 py-1 text-[11px] ${
+												isApplyingTags || selectedTagCount === 0
+													? "cursor-not-allowed border-slate-200 text-slate-300"
+													: "border-slate-300 text-slate-700 hover:bg-slate-100"
+											}`}
+										>
+											{isApplyingTags ? "应用中..." : "应用所选"}
+										</button>
+									</div>
 								</div>
-								<div className="flex flex-wrap gap-1">
-									{tagNames.length === 0 ? (
+								<div className="space-y-2">
+									{tagSuggestions.length === 0 ? (
 										<p className="text-xs text-slate-400">暂无建议</p>
 									) : (
-										tagNames.map((name) => (
-											<span key={name} className="rounded-full bg-slate-100 px-2 py-1 text-[11px] text-slate-700">
-												#{name}
-											</span>
-										))
+										tagSuggestions.map((item) => {
+											const isSelected = selectedAiTagNameSet.has(item.name.toLowerCase());
+											const isExistingOnNote = activeTagNameSet.has(item.name.toLowerCase());
+											const existsGlobally = existingTagNameSet.has(item.name.toLowerCase());
+											return (
+												<label
+													key={item.name}
+													className={`flex cursor-pointer gap-2 rounded-lg border px-3 py-2 ${
+														isSelected
+															? "border-sky-300 bg-sky-50"
+															: "border-slate-200 bg-white"
+													}`}
+												>
+													<input
+														type="checkbox"
+														checked={isSelected}
+														onChange={() => onToggleTag(item.name)}
+														disabled={isApplyingTags}
+														className="mt-0.5"
+													/>
+													<div className="min-w-0 flex-1">
+														<div className="flex flex-wrap items-center gap-2">
+															<span className="text-sm text-slate-800">#{item.name}</span>
+															<span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-slate-500">
+																{Math.round(item.confidence * 100)}%
+															</span>
+															<span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] text-slate-500">
+																{isExistingOnNote ? "当前已有" : existsGlobally ? "复用已有" : "新标签"}
+															</span>
+														</div>
+														<p className="mt-1 text-[11px] text-slate-500">{item.reason}</p>
+													</div>
+												</label>
+											);
+										})
 									)}
 								</div>
 							</section>

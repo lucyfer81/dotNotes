@@ -125,8 +125,8 @@ export default function TagsGovernancePage() {
 		if (isPending || !renameTagId) {
 			return;
 		}
-		const nextName = renameValue.trim();
-		if (!nextName) {
+		const rawInput = renameValue.trim();
+		if (!rawInput) {
 			setErrorMessage("标签名不能为空。");
 			return;
 		}
@@ -135,8 +135,17 @@ export default function TagsGovernancePage() {
 			setErrorMessage("请选择有效标签。");
 			return;
 		}
+		const nextName = normalizeGovernanceTagName(rawInput);
+		if (!nextName) {
+			setErrorMessage("标签名无效，请输入标签正文，不要只输入 #。");
+			return;
+		}
 		if (current.name.toLowerCase() === nextName.toLowerCase()) {
-			setErrorMessage("新标签名与当前名称一致。");
+			setErrorMessage(
+				hasLeadingTagMarker(rawInput)
+					? "前导 # 只是 Markdown 标签语法，保存时不会保留；规范化后标签名未变化。"
+					: "规范化后标签名未变化。",
+			);
 			return;
 		}
 		const confirmed = window.confirm(`确认将标签「${current.name}」重命名为「${nextName}」吗？`);
@@ -343,11 +352,14 @@ export default function TagsGovernancePage() {
 							</select>
 							<input
 								value={renameValue}
-								onChange={(event) => setRenameValue(event.target.value)}
+								onChange={(event) => setRenameValue(stripLeadingTagMarker(event.target.value))}
 								disabled={isPending || tags.length === 0}
-								placeholder="输入新标签名"
+								placeholder="输入标签名，可带 #，保存时会自动忽略"
 								className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none focus:border-slate-500"
 							/>
+							<p className="text-xs text-slate-500">
+								展示时会写成 <code>#tag</code>，但标签名本身不包含 <code>#</code>。输入 <code>#agent</code> 会按 <code>agent</code> 处理。
+							</p>
 							<button
 								type="button"
 								onClick={() => void handleRename()}
@@ -537,6 +549,27 @@ function normalizeLimit(value: string): number {
 		return 100;
 	}
 	return Math.min(500, Math.max(1, parsed));
+}
+
+function hasLeadingTagMarker(value: string): boolean {
+	return /^\s*#+/u.test(value);
+}
+
+function stripLeadingTagMarker(value: string): string {
+	return value.replace(/^\s*#+\s*/u, "");
+}
+
+function normalizeGovernanceTagName(value: string, maxLength = 48): string {
+	const trimmed = stripLeadingTagMarker(value).trim().toLowerCase();
+	if (!trimmed) {
+		return "";
+	}
+	return trimmed
+		.replace(/\s+/g, "-")
+		.replace(/[^\p{L}\p{N}_-]+/gu, "-")
+		.replace(/-+/g, "-")
+		.replace(/^[-_]+|[-_]+$/g, "")
+		.slice(0, maxLength);
 }
 
 function readErrorMessage(error: unknown): string {
