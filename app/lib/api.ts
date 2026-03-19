@@ -26,6 +26,12 @@ export type NoteApiItem = {
 	updatedAt: string;
 	tags: TagApiItem[];
 };
+export type ResolveNoteUrlResultApiItem = {
+	note: NoteApiItem;
+	resolved: boolean;
+	sourceUrl: string;
+	fallbackReason: string | null;
+};
 
 export type NoteStatus = "active" | "archived" | "deleted" | "all";
 export type NoteRelationTypeApiItem =
@@ -578,6 +584,30 @@ export async function updateNote(noteId: string, input: UpdateNoteInput): Promis
 		throw new Error("Invalid update note response");
 	}
 	return note;
+}
+
+export async function resolveNoteUrl(noteId: string): Promise<ResolveNoteUrlResultApiItem> {
+	const data = await requestApiData<unknown>(`/api/notes/${encodeURIComponent(noteId)}/resolve-url`, {
+		method: "POST",
+	});
+	if (
+		!isRecord(data) ||
+		typeof data.resolved !== "boolean" ||
+		typeof data.sourceUrl !== "string" ||
+		(typeof data.fallbackReason !== "string" && data.fallbackReason !== null)
+	) {
+		throw new Error("Invalid resolve note url response");
+	}
+	const note = toNoteApiItem(data.note);
+	if (!note) {
+		throw new Error("Invalid resolve note url note payload");
+	}
+	return {
+		note,
+		resolved: data.resolved,
+		sourceUrl: data.sourceUrl,
+		fallbackReason: data.fallbackReason,
+	};
 }
 
 export async function deleteNote(noteId: string): Promise<void> {

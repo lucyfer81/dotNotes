@@ -17,6 +17,7 @@ import {
 	listNoteRelations,
 	listTags,
 	restoreNote,
+	resolveNoteUrl,
 	upsertNoteRelations,
 	uploadNoteAsset,
 	updateFolder,
@@ -153,10 +154,14 @@ export default function Home() {
 	const [isTitleEditing, setIsTitleEditing] = useState(false);
 	const [draft, setDraft] = useState("");
 	const [isCreatingNote, setIsCreatingNote] = useState(false);
+	const [isResolvingCaptureUrl, setIsResolvingCaptureUrl] = useState(false);
+	const [captureActionMessage, setCaptureActionMessage] = useState("");
 	const [isSavingDraft, setIsSavingDraft] = useState(false);
 	const [isArchivingNote, setIsArchivingNote] = useState(false);
 	const [isRestoringNote, setIsRestoringNote] = useState(false);
 	const [isDeletingNote, setIsDeletingNote] = useState(false);
+	const [isResolvingNoteUrl, setIsResolvingNoteUrl] = useState(false);
+	const [noteActionMessage, setNoteActionMessage] = useState("");
 	const [commandOpen, setCommandOpen] = useState(false);
 	const [commandQuery, setCommandQuery] = useState("");
 	const [commandResults, setCommandResults] = useState<NoteItem[]>([]);
@@ -199,6 +204,11 @@ export default function Home() {
 		() => noteItems.find((note) => note.id === activeNoteId) ?? noteItems[0] ?? null,
 		[noteItems, activeNoteId],
 	);
+	const activeNoteSourceUrl = useMemo(
+		() => extractSingleUrl(activeNote?.content ?? ""),
+		[activeNote?.content],
+	);
+	const captureInputSourceUrl = useMemo(() => extractSingleUrl(captureInput), [captureInput]);
 	const recentOpenedNotes = useMemo(() => {
 		const notesById = new Map(noteItems.map((note) => [note.id, note] as const));
 		return recentNoteIds
@@ -289,6 +299,8 @@ export default function Home() {
 	const isActiveNoteDeleted = Boolean(activeNote?.deletedAt);
 	const focusEditorMode = isActiveNoteDeleted ? "preview" : effectiveEditorMode;
 	const mobileEditorMode = focusEditorMode === "split" ? "edit" : focusEditorMode;
+	const canResolveActiveNoteUrl = Boolean(activeNote && !activeNote.deletedAt && activeNoteSourceUrl);
+	const isSubmittingCapture = isCreatingNote || isResolvingCaptureUrl;
 
 	const markdownComponents: Components = useMemo(
 		() => ({
@@ -365,6 +377,14 @@ export default function Home() {
 			similar: 0,
 		};
 	}, [activeNoteId]);
+
+	useEffect(() => {
+		setNoteActionMessage("");
+	}, [activeNoteId]);
+
+	useEffect(() => {
+		setCaptureActionMessage("");
+	}, [captureInput]);
 
 	useEffect(() => {
 		const nextSelected = (aiEnhanceResult?.tagSuggestions ?? [])
@@ -1276,12 +1296,17 @@ export default function Home() {
 		}
 	};
 
-	const handleCaptureSend = async () => {
+	const handleCaptureSubmit = async (options: { resolveUrlAfterCreate: boolean }) => {
 		const content = captureInput.trim();
-		if (!content || isCreatingNote) {
+		if (!content || isSubmittingCapture) {
 			return;
 		}
-		setIsCreatingNote(true);
+		setCaptureActionMessage("");
+		if (options.resolveUrlAfterCreate) {
+			setIsResolvingCaptureUrl(true);
+		} else {
+			setIsCreatingNote(true);
+		}
 		try {
 			const created = await createNote({
 				title: buildTitle(content),
@@ -1289,8 +1314,18 @@ export default function Home() {
 				bodyText: content,
 				tagNames: extractHashTags(content),
 			});
+			let finalNote = created;
+			if (options.resolveUrlAfterCreate && captureInputSourceUrl) {
+				const result = await resolveNoteUrl(created.id);
+				finalNote = result.note;
+				if (!result.resolved) {
+					setCaptureActionMessage(
+						`解析失败，已保留原 URL${result.fallbackReason ? `：${result.fallbackReason}` : ""}`,
+					);
+				}
+			}
 			void refreshTags();
-			const next = toNoteItem(created);
+			const next = toNoteItem(finalNote);
 			const currentTagFilter = selectedTagIdsRef.current;
 			const matchesFilters =
 				(currentTagFilter.length === 0 || matchesTagFilter(next, currentTagFilter)) &&
@@ -1302,10 +1337,22 @@ export default function Home() {
 			}
 			setCaptureInput("");
 		} catch (error) {
-			console.error("Failed to create note", error);
+			setCaptureActionMessage(readErrorMessage(error));
 		} finally {
-			setIsCreatingNote(false);
+			if (options.resolveUrlAfterCreate) {
+				setIsResolvingCaptureUrl(false);
+			} else {
+				setIsCreatingNote(false);
+			}
 		}
+	};
+
+	const handleCaptureSend = async () => {
+		await handleCaptureSubmit({ resolveUrlAfterCreate: false });
+	};
+
+	const handleCaptureResolveSend = async () => {
+		await handleCaptureSubmit({ resolveUrlAfterCreate: true });
 	};
 
 	const toggleTagFilter = (tagId: string) => {
@@ -1438,6 +1485,37 @@ export default function Home() {
 			}
 			return merged.filter((note) => note.id !== next.id);
 		});
+	};
+
+	const handleResolveActiveNoteUrl = async () => {
+		if (!activeNote || activeNote.deletedAt || !activeNoteSourceUrl || isResolvingNoteUrl) {
+			return;
+		}
+		setNoteActionMessage("");
+		setIsResolvingNoteUrl(true);
+		try {
+			if (saveTimerRef.current !== null) {
+				window.clearTimeout(saveTimerRef.current);
+				saveTimerRef.current = null;
+			}
+			if (pendingSaveRef.current?.noteId === activeNote.id) {
+				await flushPendingSave();
+			}
+			const result = await resolveNoteUrl(activeNote.id);
+			const next = toNoteItem(result.note);
+			upsertNoteByFilters(next);
+			setDraft(next.content);
+			setTitleDraft(next.title);
+			setNoteActionMessage(
+				result.resolved
+					? ""
+					: `解析失败，已保留原 URL${result.fallbackReason ? `：${result.fallbackReason}` : ""}`,
+			);
+		} catch (error) {
+			setNoteActionMessage(readErrorMessage(error));
+		} finally {
+			setIsResolvingNoteUrl(false);
+		}
 	};
 
 	const handleToggleArchiveActiveNote = async () => {
@@ -1770,16 +1848,32 @@ export default function Home() {
 												</option>
 											))}
 										</select>
-									<button
-										onClick={handleCaptureSend}
-										disabled={isCreatingNote}
-										className={`rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 ${
-											isCreatingNote ? "cursor-not-allowed opacity-60" : ""
-										}`}
-									>
-										{isCreatingNote ? "发送中..." : "发送"}
-									</button>
+										<div className="flex items-center gap-2">
+											{captureInputSourceUrl ? (
+												<button
+													onClick={handleCaptureResolveSend}
+													disabled={isSubmittingCapture}
+													className={`rounded-xl border border-sky-200 px-4 py-2 text-sm font-medium text-sky-700 hover:bg-sky-50 ${
+														isSubmittingCapture ? "cursor-not-allowed opacity-60" : ""
+													}`}
+												>
+													{isResolvingCaptureUrl ? "解析中..." : "解析并发送"}
+												</button>
+											) : null}
+											<button
+												onClick={handleCaptureSend}
+												disabled={isSubmittingCapture}
+												className={`rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 ${
+													isSubmittingCapture ? "cursor-not-allowed opacity-60" : ""
+												}`}
+											>
+												{isCreatingNote ? "发送中..." : "发送"}
+											</button>
+										</div>
 								</div>
+								{captureActionMessage ? (
+									<p className="mt-3 text-xs text-amber-700">{captureActionMessage}</p>
+								) : null}
 							</section>
 
 							<section className="min-h-0 flex-1 overflow-y-auto rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
@@ -2097,6 +2191,20 @@ export default function Home() {
 										>
 											{isFocusFullscreen ? "退出全屏" : "全屏"}
 										</button>
+										{canResolveActiveNoteUrl ? (
+											<button
+												type="button"
+												onClick={handleResolveActiveNoteUrl}
+												disabled={!activeNote || isResolvingNoteUrl || isDeletingNote || isArchivingNote || isRestoringNote}
+												className={`rounded-lg border px-3 py-2 text-xs font-medium ${
+													!activeNote || isResolvingNoteUrl || isDeletingNote || isArchivingNote || isRestoringNote
+														? "cursor-not-allowed border-slate-200 text-slate-300"
+														: "border-sky-200 text-sky-700 hover:bg-sky-50"
+												}`}
+											>
+												{isResolvingNoteUrl ? "解析中..." : "解析 URL"}
+											</button>
+										) : null}
 										{canArchiveActiveNote ? (
 											<button
 												type="button"
@@ -2139,14 +2247,17 @@ export default function Home() {
 										</button>
 									</div>
 								</div>
-									<div className="mt-2 inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1">
-										<ModeButton label="活跃" active={noteStatusFilter === "active"} onClick={() => setNoteStatusFilter("active")} />
-										<ModeButton label="归档" active={noteStatusFilter === "archived"} onClick={() => setNoteStatusFilter("archived")} />
-										<ModeButton label="回收站" active={noteStatusFilter === "deleted"} onClick={() => setNoteStatusFilter("deleted")} />
-									</div>
-									<div className="mt-2 flex flex-wrap gap-2">
-										{(activeNote?.tags ?? []).map((tag) => (
-											<span key={tag} className="rounded-md bg-slate-100 px-2 py-1 text-xs text-slate-600">
+										<div className="mt-2 inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1">
+											<ModeButton label="活跃" active={noteStatusFilter === "active"} onClick={() => setNoteStatusFilter("active")} />
+											<ModeButton label="归档" active={noteStatusFilter === "archived"} onClick={() => setNoteStatusFilter("archived")} />
+											<ModeButton label="回收站" active={noteStatusFilter === "deleted"} onClick={() => setNoteStatusFilter("deleted")} />
+										</div>
+										{noteActionMessage ? (
+											<p className="mt-2 text-xs text-amber-700">{noteActionMessage}</p>
+										) : null}
+										<div className="mt-2 flex flex-wrap gap-2">
+											{(activeNote?.tags ?? []).map((tag) => (
+												<span key={tag} className="rounded-md bg-slate-100 px-2 py-1 text-xs text-slate-600">
 												{tag}
 											</span>
 										))}
@@ -2313,16 +2424,32 @@ export default function Home() {
 												</option>
 											))}
 										</select>
-									<button
-										onClick={handleCaptureSend}
-										disabled={isCreatingNote}
-										className={`rounded-xl bg-slate-900 px-3 py-2 text-sm font-medium text-white ${
-											isCreatingNote ? "cursor-not-allowed opacity-60" : ""
-										}`}
-									>
-										{isCreatingNote ? "发送中..." : "发送"}
-									</button>
+										<div className="flex items-center gap-2">
+											{captureInputSourceUrl ? (
+												<button
+													onClick={handleCaptureResolveSend}
+													disabled={isSubmittingCapture}
+													className={`rounded-xl border border-sky-200 px-3 py-2 text-sm font-medium text-sky-700 ${
+														isSubmittingCapture ? "cursor-not-allowed opacity-60" : ""
+													}`}
+												>
+													{isResolvingCaptureUrl ? "解析中" : "解析"}
+												</button>
+											) : null}
+											<button
+												onClick={handleCaptureSend}
+												disabled={isSubmittingCapture}
+												className={`rounded-xl bg-slate-900 px-3 py-2 text-sm font-medium text-white ${
+													isSubmittingCapture ? "cursor-not-allowed opacity-60" : ""
+												}`}
+											>
+												{isCreatingNote ? "发送中..." : "发送"}
+											</button>
+										</div>
 								</div>
+								{captureActionMessage ? (
+									<p className="mt-2 text-xs text-amber-700">{captureActionMessage}</p>
+								) : null}
 							</section>
 
 							<section className="max-h-[56dvh] overflow-y-auto rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
@@ -2562,6 +2689,20 @@ export default function Home() {
 									>
 										{isFocusFullscreen ? "退出全屏" : "全屏"}
 									</button>
+									{canResolveActiveNoteUrl ? (
+										<button
+											type="button"
+											onClick={handleResolveActiveNoteUrl}
+											disabled={!activeNote || isResolvingNoteUrl || isDeletingNote || isArchivingNote || isRestoringNote}
+											className={`rounded-lg border px-2 py-1 text-xs ${
+												!activeNote || isResolvingNoteUrl || isDeletingNote || isArchivingNote || isRestoringNote
+													? "cursor-not-allowed border-slate-200 text-slate-300"
+													: "border-sky-200 text-sky-700"
+											}`}
+										>
+											{isResolvingNoteUrl ? "解析中" : "解析 URL"}
+										</button>
+									) : null}
 									{canArchiveActiveNote ? (
 										<button
 											type="button"
@@ -2603,7 +2744,10 @@ export default function Home() {
 										{isDeletingNote ? "处理中" : activeNote?.deletedAt ? "永久删除" : "移入回收站"}
 									</button>
 									</div>
-								</div>
+									</div>
+								{noteActionMessage ? (
+									<p className="mb-2 text-xs text-amber-700">{noteActionMessage}</p>
+								) : null}
 								<p className="mb-2 text-xs text-slate-500">当前状态筛选：{noteStatusLabel}</p>
 								<div className="mb-2 grid grid-cols-3 gap-2">
 									<ModeButton label="活跃" active={noteStatusFilter === "active"} onClick={() => setNoteStatusFilter("active")} />
@@ -2898,6 +3042,22 @@ function collectDescendantFolderIds(rootId: string, childrenByParent: Map<string
 
 function formatFolderOptionLabel(name: string, level: number): string {
 	return level > 0 ? `${"  ".repeat(level)}- ${name}` : name;
+}
+
+function extractSingleUrl(input: string): string | null {
+	const trimmed = input.trim();
+	if (!trimmed || /\s/u.test(trimmed)) {
+		return null;
+	}
+	try {
+		const url = new URL(trimmed);
+		if (url.protocol !== "http:" && url.protocol !== "https:") {
+			return null;
+		}
+		return url.toString();
+	} catch {
+		return null;
+	}
 }
 
 function readErrorMessage(error: unknown): string {

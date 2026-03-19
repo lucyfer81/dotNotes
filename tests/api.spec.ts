@@ -137,6 +137,81 @@ describe("storage strategy api", () => {
 	});
 });
 
+describe("note url resolve api", () => {
+	it("resolves pure url notes via jina reader and updates note body", async () => {
+		const created = await createNote({
+			title: "https://example.com/article",
+			folderId: "folder-00-inbox",
+			bodyText: "https://example.com/article",
+		});
+
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = vi.fn(async (input) => {
+			const url = typeof input === "string" ? input : input instanceof Request ? input.url : "";
+			if (url === "https://r.jina.ai") {
+				return new Response(
+					[
+						"Title: Example Article",
+						"URL Source: https://example.com/article",
+						"Markdown Content:",
+						"# Example Article",
+						"",
+						"Resolved body text.",
+					].join("\n"),
+					{ status: 200 },
+				);
+			}
+			return new Response("not found", { status: 404 });
+		}) as typeof globalThis.fetch;
+
+		try {
+			const resolved = await readEnvelope<{
+				note: NotePayload;
+				resolved: boolean;
+				sourceUrl: string;
+				fallbackReason: string | null;
+			}>(await api(`/api/notes/${created.id}/resolve-url`, {
+				method: "POST",
+			}));
+			expect(resolved.data.resolved).toBe(true);
+			expect(resolved.data.sourceUrl).toBe("https://example.com/article");
+			expect(resolved.data.note.title).toBe("Example Article");
+			expect(resolved.data.note.bodyText).toContain("Resolved body text.");
+			expect(resolved.data.note.bodyText).toContain("Source: https://example.com/article");
+			expect(resolved.data.note.bodyText).toContain("Extractor: jina-reader");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it("keeps original url when jina reader fails", async () => {
+		const created = await createNote({
+			title: "https://example.com/fallback",
+			folderId: "folder-00-inbox",
+			bodyText: "https://example.com/fallback",
+		});
+
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = vi.fn(async () => new Response("upstream error", { status: 500 })) as typeof globalThis.fetch;
+
+		try {
+			const resolved = await readEnvelope<{
+				note: NotePayload;
+				resolved: boolean;
+				sourceUrl: string;
+				fallbackReason: string | null;
+			}>(await api(`/api/notes/${created.id}/resolve-url`, {
+				method: "POST",
+			}));
+			expect(resolved.data.resolved).toBe(false);
+			expect(resolved.data.note.bodyText).toBe("https://example.com/fallback");
+			expect(resolved.data.fallbackReason).toContain("Jina reader request failed");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+});
+
 describe("assets api", () => {
 	it("supports upload, list, download and delete", async () => {
 		const created = await createNote({
