@@ -52,6 +52,11 @@ type NoteItem = {
 	isArchived: boolean;
 	deletedAt: string | null;
 };
+type SavedNoteSnapshot = {
+	noteId: string;
+	title: string;
+	content: string;
+};
 
 type WorkspaceMode = "capture" | "organize" | "focus";
 type EditorMode = "edit" | "preview" | "split";
@@ -87,6 +92,9 @@ const AI_TASK_ITEMS: Array<{ key: AiEnhanceTaskApiKey; label: string }> = [
 	{ key: "summary", label: "摘要大纲" },
 	{ key: "similar", label: "相似笔记" },
 ];
+const FOCUS_EDITOR_EXTRA_VISIBLE_LINES = 4;
+const FOCUS_EDITOR_MIN_VISIBLE_LINES = 6;
+const FOCUS_EDITOR_MAX_VISIBLE_LINES = 10;
 
 const defaultRootFolders: FolderApiItem[] = [
 	{ id: "folder-00-inbox", parentId: null, name: "00-Inbox", sortOrder: 0 },
@@ -157,6 +165,12 @@ export default function Home() {
 	const [isResolvingCaptureUrl, setIsResolvingCaptureUrl] = useState(false);
 	const [captureActionMessage, setCaptureActionMessage] = useState("");
 	const [isSavingDraft, setIsSavingDraft] = useState(false);
+	const [saveErrorMessage, setSaveErrorMessage] = useState("");
+	const [savedNoteSnapshot, setSavedNoteSnapshot] = useState<SavedNoteSnapshot>({
+		noteId: "",
+		title: "",
+		content: "",
+	});
 	const [isArchivingNote, setIsArchivingNote] = useState(false);
 	const [isRestoringNote, setIsRestoringNote] = useState(false);
 	const [isDeletingNote, setIsDeletingNote] = useState(false);
@@ -187,9 +201,11 @@ export default function Home() {
 
 	const noteItemsRef = useRef<NoteItem[]>([]);
 	const selectedTagIdsRef = useRef<string[]>([]);
-	const saveTimerRef = useRef<number | null>(null);
-	const pendingSaveRef = useRef<{ noteId: string; content: string } | null>(null);
-	const saveInFlightRef = useRef(false);
+	const draftRef = useRef(draft);
+	const titleDraftRef = useRef(titleDraft);
+	const draftOverridesRef = useRef<Record<string, string>>({});
+	const titleOverridesRef = useRef<Record<string, string>>({});
+	const titleEditInitialRef = useRef("");
 	const aiTaskRunIdRef = useRef<Record<AiEnhanceTaskApiKey, number>>({
 		title: 0,
 		tags: 0,
@@ -205,8 +221,8 @@ export default function Home() {
 		[noteItems, activeNoteId],
 	);
 	const activeNoteSourceUrl = useMemo(
-		() => extractSingleUrl(activeNote?.content ?? ""),
-		[activeNote?.content],
+		() => extractSingleUrl(draft),
+		[draft],
 	);
 	const captureInputSourceUrl = useMemo(() => extractSingleUrl(captureInput), [captureInput]);
 	const recentOpenedNotes = useMemo(() => {
@@ -352,13 +368,31 @@ export default function Home() {
 	);
 
 	useEffect(() => {
-		setDraft(activeNote?.content ?? "");
-	}, [activeNote]);
-
-	useEffect(() => {
-		setTitleDraft(activeNote?.title ?? "");
+		const nextContent = activeNoteId
+			? (draftOverridesRef.current[activeNoteId] ?? activeNote?.content ?? "")
+			: "";
+		const nextTitle = activeNoteId
+			? (titleOverridesRef.current[activeNoteId] ?? activeNote?.title ?? "")
+			: "";
+		setDraft(nextContent);
+		setTitleDraft(nextTitle);
+		setSavedNoteSnapshot(
+			activeNote
+				? {
+					noteId: activeNote.id,
+					title: activeNote.title,
+					content: activeNote.content,
+				}
+				: {
+					noteId: "",
+					title: "",
+					content: "",
+				},
+		);
+		titleEditInitialRef.current = nextTitle;
 		setIsTitleEditing(false);
-	}, [activeNoteId]);
+		setSaveErrorMessage("");
+	}, [activeNoteId, activeNote?.content, activeNote?.title]);
 
 	useEffect(() => {
 		setAiEnhanceResult(null);
@@ -569,6 +603,14 @@ export default function Home() {
 	}, [selectedTagIds]);
 
 	useEffect(() => {
+		draftRef.current = draft;
+	}, [draft]);
+
+	useEffect(() => {
+		titleDraftRef.current = titleDraft;
+	}, [titleDraft]);
+
+	useEffect(() => {
 		if (!activeNoteId) {
 			return;
 		}
@@ -579,12 +621,23 @@ export default function Home() {
 	}, [activeNoteId]);
 
 	useEffect(() => {
-		return () => {
-			if (saveTimerRef.current !== null) {
-				window.clearTimeout(saveTimerRef.current);
-			}
+		if (typeof window === "undefined" || !activeNoteId || !activeNote) {
+			return;
+		}
+		const hasDraftOverride = draftOverridesRef.current[activeNoteId] !== undefined;
+		const hasTitleOverride = titleOverridesRef.current[activeNoteId] !== undefined;
+		if (!hasDraftOverride && !hasTitleOverride) {
+			return;
+		}
+		const onBeforeUnload = (event: BeforeUnloadEvent) => {
+			event.preventDefault();
+			event.returnValue = "";
 		};
-	}, []);
+		window.addEventListener("beforeunload", onBeforeUnload);
+		return () => {
+			window.removeEventListener("beforeunload", onBeforeUnload);
+		};
+	}, [activeNoteId, activeNote, draft, titleDraft]);
 
 	useEffect(() => {
 		if (!folderItems.some((folder) => folder.id === captureFolderId)) {
@@ -817,109 +870,53 @@ export default function Home() {
 		};
 	}, [commandOpen, commandQuery, defaultCommandNotes, noteStatusFilter]);
 
-	const flushPendingSave = async () => {
-		if (saveInFlightRef.current) {
-			return;
-		}
-		const pending = pendingSaveRef.current;
-		if (!pending) {
-			setIsSavingDraft(false);
-			return;
-		}
-
-		pendingSaveRef.current = null;
-		saveInFlightRef.current = true;
-		const source = noteItemsRef.current.find((note) => note.id === pending.noteId);
-
-		try {
-			if (!source) {
-				return;
-			}
-			const updated = await updateNote(pending.noteId, {
-				title: source.title,
-				folderId: source.folderId,
-				bodyText: pending.content,
-				excerpt: buildSummary(pending.content),
-				tagNames: extractHashTags(pending.content),
-			});
-			void refreshTags();
-			const next = toNoteItem(updated);
-			setNoteItems((prev) => {
-				const updatedList = prev.map((note) => (note.id === next.id ? { ...note, ...next } : note));
-				const currentTagFilter = selectedTagIdsRef.current;
-				const matchesFilters =
-					(currentTagFilter.length === 0 || matchesTagFilter(next, currentTagFilter)) &&
-					matchesStatusFilter(next, noteStatusFilter);
-				if (matchesFilters) {
-					return updatedList;
-				}
-				return updatedList.filter((note) => note.id !== next.id);
-			});
-		} catch (error) {
-			console.error("Failed to auto-save note", error);
-		} finally {
-			saveInFlightRef.current = false;
-			if (pendingSaveRef.current) {
-				void flushPendingSave();
-			} else {
-				setIsSavingDraft(false);
-			}
-		}
-	};
-
-	const scheduleAutoSave = (noteId: string, content: string) => {
-		pendingSaveRef.current = { noteId, content };
-		setIsSavingDraft(true);
-
-		if (saveTimerRef.current !== null) {
-			window.clearTimeout(saveTimerRef.current);
-		}
-		saveTimerRef.current = window.setTimeout(() => {
-			saveTimerRef.current = null;
-			void flushPendingSave();
-		}, 700);
-	};
-
 	const handleDraftChange = (value: string) => {
 		if (isActiveNoteDeleted) {
 			return;
 		}
 		setDraft(value);
+		setSaveErrorMessage("");
 		if (!activeNoteId) {
 			return;
 		}
-		setNoteItems((prev) =>
-			prev.map((note) =>
-				note.id === activeNoteId
-					? {
-						...note,
-						content: value,
-						summary: buildSummary(value),
-					}
-					: note,
-			),
-		);
-		scheduleAutoSave(activeNoteId, value);
+		if (value === (activeNote?.content ?? savedNoteSnapshot.content)) {
+			delete draftOverridesRef.current[activeNoteId];
+			return;
+		}
+		draftOverridesRef.current[activeNoteId] = value;
 	};
 
 	const handleTitleChange = (value: string) => {
 		setTitleDraft(value);
+		setSaveErrorMessage("");
+		if (!activeNoteId) {
+			return;
+		}
+		if (value.trim() === (activeNote?.title ?? savedNoteSnapshot.title)) {
+			delete titleOverridesRef.current[activeNoteId];
+			return;
+		}
+		titleOverridesRef.current[activeNoteId] = value;
 	};
 
 	const startTitleEdit = () => {
 		if (!activeNote || isActiveNoteDeleted) {
 			return;
 		}
-		setTitleDraft(activeNote.title);
+		titleEditInitialRef.current = titleDraft || activeNote.title;
 		setIsTitleEditing(true);
 	};
 
 	const cancelTitleEdit = () => {
-		if (!activeNote) {
-			setIsTitleEditing(false);
-			return;
+		const nextTitle = titleEditInitialRef.current || (activeNote?.title ?? "");
+		setTitleDraft(nextTitle);
+		if (activeNoteId) {
+			if (nextTitle.trim() === (activeNote?.title ?? savedNoteSnapshot.title)) {
+				delete titleOverridesRef.current[activeNoteId];
+			} else {
+				titleOverridesRef.current[activeNoteId] = nextTitle;
+			}
 		}
-		setTitleDraft(activeNote.title);
 		setIsTitleEditing(false);
 	};
 
@@ -932,21 +929,72 @@ export default function Home() {
 			return;
 		}
 		setIsTitleEditing(false);
+		setTitleDraft(nextTitle);
+		titleEditInitialRef.current = nextTitle;
 		if (nextTitle === activeNote.title) {
+			delete titleOverridesRef.current[activeNote.id];
 			return;
 		}
-		setNoteItems((prev) =>
-			prev.map((note) =>
-				note.id === activeNote.id
-					? {
-						...note,
-						title: nextTitle,
-					}
-					: note,
-			),
-		);
-		setTitleDraft(nextTitle);
-		scheduleAutoSave(activeNote.id, draft);
+		titleOverridesRef.current[activeNote.id] = nextTitle;
+	};
+
+	const handleSaveActiveNote = async () => {
+		if (!activeNote || isActiveNoteDeleted || isSavingDraft) {
+			return false;
+		}
+		const nextTitle = titleDraft.trim();
+		const contentToSave = draft;
+		if (!nextTitle) {
+			setSaveErrorMessage("标题不能为空");
+			setIsTitleEditing(true);
+			return false;
+		}
+
+		setIsSavingDraft(true);
+		setSaveErrorMessage("");
+		try {
+			const updated = await updateNote(activeNote.id, {
+				title: nextTitle,
+				folderId: activeNote.folderId,
+				bodyText: contentToSave,
+				excerpt: buildSummary(contentToSave),
+				tagNames: extractHashTags(contentToSave),
+			});
+			void refreshTags();
+			const next = toNoteItem(updated);
+			upsertNoteByFilters(next);
+			if (draftRef.current === contentToSave) {
+				delete draftOverridesRef.current[activeNote.id];
+				setDraft(next.content);
+			}
+			if (titleDraftRef.current.trim() === nextTitle) {
+				delete titleOverridesRef.current[activeNote.id];
+				setTitleDraft(next.title);
+				titleEditInitialRef.current = next.title;
+				setIsTitleEditing(false);
+			}
+			setSavedNoteSnapshot({
+				noteId: next.id,
+				title: next.title,
+				content: next.content,
+			});
+			return true;
+		} catch (error) {
+			console.error("Failed to save note", error);
+			setSaveErrorMessage(readErrorMessage(error));
+			return false;
+		} finally {
+			setIsSavingDraft(false);
+		}
+	};
+
+	const ensureActiveNoteSaved = async () => {
+		const hasDraftOverride = Boolean(activeNoteId && draftOverridesRef.current[activeNoteId] !== undefined);
+		const hasTitleOverride = Boolean(activeNoteId && titleOverridesRef.current[activeNoteId] !== undefined);
+		if (!hasDraftOverride && !hasTitleOverride) {
+			return true;
+		}
+		return handleSaveActiveNote();
 	};
 
 	const refreshActiveNoteRelations = async (noteId: string) => {
@@ -1073,6 +1121,10 @@ export default function Home() {
 		if (!activeNote || activeNote.deletedAt || runningAiTasks.includes(task)) {
 			return;
 		}
+		const saved = await ensureActiveNoteSaved();
+		if (!saved) {
+			return;
+		}
 		setActiveAiTask(task);
 		const noteId = activeNote.id;
 		const query = aiQuery.trim() || undefined;
@@ -1141,6 +1193,10 @@ export default function Home() {
 		if (!activeNote || isActiveNoteDeleted || isApplyingAiTitle) {
 			return;
 		}
+		const saved = await ensureActiveNoteSaved();
+		if (!saved) {
+			return;
+		}
 		const nextTitle = title.trim();
 		if (!nextTitle || nextTitle === activeNote.title) {
 			return;
@@ -1152,6 +1208,8 @@ export default function Home() {
 			const next = toNoteItem(updated);
 			setNoteItems((prev) => prev.map((item) => (item.id === next.id ? { ...item, ...next } : item)));
 			setTitleDraft(nextTitle);
+			titleEditInitialRef.current = nextTitle;
+			setSavedNoteSnapshot((prev) => (prev.noteId === next.id ? { ...prev, title: next.title } : prev));
 		} catch (error) {
 			setAiErrorMessage(readErrorMessage(error));
 		} finally {
@@ -1161,6 +1219,10 @@ export default function Home() {
 
 	const handleApplyAiTags = async () => {
 		if (!activeNote || isActiveNoteDeleted || isApplyingAiTags || !aiEnhanceResult) {
+			return;
+		}
+		const saved = await ensureActiveNoteSaved();
+		if (!saved) {
 			return;
 		}
 		const selectedTags = [...new Set(selectedAiTagNames.map((item) => item.trim()).filter((item) => item.length > 0))];
@@ -1210,6 +1272,10 @@ export default function Home() {
 
 	const handleApplyAiRelations = async () => {
 		if (!activeNote || isActiveNoteDeleted || isApplyingAiRelations || !aiEnhanceResult) {
+			return;
+		}
+		const saved = await ensureActiveNoteSaved();
+		if (!saved) {
 			return;
 		}
 		if (aiEnhanceResult.relationSuggestions.length === 0) {
@@ -1430,7 +1496,7 @@ export default function Home() {
 	};
 
 	const handleMoveActiveNote = async (folderId: string) => {
-		if (!activeNote || !folderId || folderId === activeNote.folderId || isMovingNote) {
+		if (!activeNote || !folderId || folderId === activeNote.folderId || isMovingNote || isSavingDraft) {
 			return;
 		}
 		setIsMovingNote(true);
@@ -1488,24 +1554,29 @@ export default function Home() {
 	};
 
 	const handleResolveActiveNoteUrl = async () => {
-		if (!activeNote || activeNote.deletedAt || !activeNoteSourceUrl || isResolvingNoteUrl) {
+		if (!activeNote || activeNote.deletedAt || !activeNoteSourceUrl || isResolvingNoteUrl || isSavingDraft) {
 			return;
 		}
 		setNoteActionMessage("");
 		setIsResolvingNoteUrl(true);
 		try {
-			if (saveTimerRef.current !== null) {
-				window.clearTimeout(saveTimerRef.current);
-				saveTimerRef.current = null;
-			}
-			if (pendingSaveRef.current?.noteId === activeNote.id) {
-				await flushPendingSave();
+			const saved = await ensureActiveNoteSaved();
+			if (!saved) {
+				return;
 			}
 			const result = await resolveNoteUrl(activeNote.id);
 			const next = toNoteItem(result.note);
 			upsertNoteByFilters(next);
+			delete draftOverridesRef.current[activeNote.id];
+			delete titleOverridesRef.current[activeNote.id];
 			setDraft(next.content);
 			setTitleDraft(next.title);
+			titleEditInitialRef.current = next.title;
+			setSavedNoteSnapshot({
+				noteId: next.id,
+				title: next.title,
+				content: next.content,
+			});
 			setNoteActionMessage(
 				result.resolved
 					? ""
@@ -1519,7 +1590,7 @@ export default function Home() {
 	};
 
 	const handleToggleArchiveActiveNote = async () => {
-		if (!activeNote || activeNote.deletedAt || isArchivingNote) {
+		if (!activeNote || activeNote.deletedAt || isArchivingNote || isSavingDraft) {
 			return;
 		}
 		const nextArchived = !activeNote.isArchived;
@@ -1546,7 +1617,7 @@ export default function Home() {
 	};
 
 	const handleRestoreActiveNote = async () => {
-		if (!activeNote || !activeNote.deletedAt || isRestoringNote) {
+		if (!activeNote || !activeNote.deletedAt || isRestoringNote || isSavingDraft) {
 			return;
 		}
 		if (typeof window !== "undefined") {
@@ -1568,7 +1639,7 @@ export default function Home() {
 	};
 
 	const handleDeleteActiveNote = async () => {
-		if (!activeNote || isDeletingNote) {
+		if (!activeNote || isDeletingNote || isSavingDraft) {
 			return;
 		}
 		const isHardDelete = Boolean(activeNote.deletedAt);
@@ -1584,14 +1655,6 @@ export default function Home() {
 		}
 
 		const deletingId = activeNote.id;
-		if (saveTimerRef.current !== null) {
-			window.clearTimeout(saveTimerRef.current);
-			saveTimerRef.current = null;
-		}
-		if (pendingSaveRef.current?.noteId === deletingId) {
-			pendingSaveRef.current = null;
-			setIsSavingDraft(false);
-		}
 
 		setIsDeletingNote(true);
 		try {
@@ -1600,6 +1663,8 @@ export default function Home() {
 			} else {
 				await deleteNote(deletingId);
 			}
+			delete draftOverridesRef.current[deletingId];
+			delete titleOverridesRef.current[deletingId];
 			removeNoteFromListById(deletingId);
 			await refreshTags();
 		} catch (error) {
@@ -1764,7 +1829,24 @@ export default function Home() {
 	const activeFolderName = folderItems.find((folder) => folder.id === captureFolderId)?.name ?? "00-Inbox";
 	const activeNoteFolderId = activeNote?.folderId ?? "";
 	const MarkdownEditorComponent = markdownEditorComponent;
-	const saveStateText = isSavingDraft ? "自动保存中..." : "已保存";
+	const normalizedTitleDraft = titleDraft.trim();
+	const hasUnsavedChanges = Boolean(
+		activeNote &&
+		(draft !== savedNoteSnapshot.content || normalizedTitleDraft !== savedNoteSnapshot.title),
+	);
+	const canSaveActiveNote = Boolean(
+		activeNote &&
+		!isActiveNoteDeleted &&
+		!isSavingDraft &&
+		!isDeletingNote &&
+		!isArchivingNote &&
+		!isRestoringNote &&
+		!isResolvingNoteUrl &&
+		normalizedTitleDraft.length > 0 &&
+		hasUnsavedChanges,
+	);
+	const saveStateText = isSavingDraft ? "保存中..." : saveErrorMessage ? "保存失败" : hasUnsavedChanges ? "未保存" : "已保存";
+	const focusEditorMinHeight = getFocusEditorMinHeight(draft);
 	const hasTagFilters = selectedTagIds.length > 0;
 	const noteStatusLabel = noteStatusFilter === "active"
 		? "活跃"
@@ -2142,7 +2224,7 @@ export default function Home() {
 													</>
 												) : (
 													<>
-														<p className="truncate text-lg font-semibold tracking-tight">{activeNote.title}</p>
+														<p className="truncate text-lg font-semibold tracking-tight">{titleDraft || activeNote.title}</p>
 														<button
 															type="button"
 															onClick={startTitleEdit}
@@ -2186,6 +2268,18 @@ export default function Home() {
 										</div>
 										<button
 											type="button"
+											onClick={() => void handleSaveActiveNote()}
+											disabled={!canSaveActiveNote}
+											className={`rounded-lg border px-3 py-2 text-xs font-medium ${
+												!canSaveActiveNote
+													? "cursor-not-allowed border-slate-200 text-slate-300"
+													: "border-emerald-200 text-emerald-700 hover:bg-emerald-50"
+											}`}
+										>
+											{isSavingDraft ? "保存中..." : hasUnsavedChanges ? "保存" : "已保存"}
+										</button>
+										<button
+											type="button"
 											onClick={toggleFocusFullscreen}
 											className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-medium text-slate-600 hover:bg-slate-100"
 										>
@@ -2195,9 +2289,9 @@ export default function Home() {
 											<button
 												type="button"
 												onClick={handleResolveActiveNoteUrl}
-												disabled={!activeNote || isResolvingNoteUrl || isDeletingNote || isArchivingNote || isRestoringNote}
+												disabled={!activeNote || isResolvingNoteUrl || isDeletingNote || isArchivingNote || isRestoringNote || isSavingDraft}
 												className={`rounded-lg border px-3 py-2 text-xs font-medium ${
-													!activeNote || isResolvingNoteUrl || isDeletingNote || isArchivingNote || isRestoringNote
+													!activeNote || isResolvingNoteUrl || isDeletingNote || isArchivingNote || isRestoringNote || isSavingDraft
 														? "cursor-not-allowed border-slate-200 text-slate-300"
 														: "border-sky-200 text-sky-700 hover:bg-sky-50"
 												}`}
@@ -2209,9 +2303,9 @@ export default function Home() {
 											<button
 												type="button"
 												onClick={handleToggleArchiveActiveNote}
-												disabled={!activeNote || isArchivingNote || isDeletingNote || isRestoringNote}
+												disabled={!activeNote || isArchivingNote || isDeletingNote || isRestoringNote || isSavingDraft}
 												className={`rounded-lg border px-3 py-2 text-xs font-medium ${
-													!activeNote || isArchivingNote || isDeletingNote || isRestoringNote
+													!activeNote || isArchivingNote || isDeletingNote || isRestoringNote || isSavingDraft
 														? "cursor-not-allowed border-slate-200 text-slate-300"
 														: "border-amber-200 text-amber-700 hover:bg-amber-50"
 												}`}
@@ -2223,9 +2317,9 @@ export default function Home() {
 											<button
 												type="button"
 												onClick={handleRestoreActiveNote}
-												disabled={!activeNote || isRestoringNote || isDeletingNote}
+												disabled={!activeNote || isRestoringNote || isDeletingNote || isSavingDraft}
 												className={`rounded-lg border px-3 py-2 text-xs font-medium ${
-													!activeNote || isRestoringNote || isDeletingNote
+													!activeNote || isRestoringNote || isDeletingNote || isSavingDraft
 														? "cursor-not-allowed border-slate-200 text-slate-300"
 														: "border-emerald-200 text-emerald-700 hover:bg-emerald-50"
 												}`}
@@ -2236,9 +2330,9 @@ export default function Home() {
 										<button
 											type="button"
 											onClick={handleDeleteActiveNote}
-											disabled={!activeNote || isDeletingNote || isArchivingNote || isRestoringNote}
+											disabled={!activeNote || isDeletingNote || isArchivingNote || isRestoringNote || isSavingDraft}
 											className={`rounded-lg border px-3 py-2 text-xs font-medium ${
-												!activeNote || isDeletingNote || isArchivingNote || isRestoringNote
+												!activeNote || isDeletingNote || isArchivingNote || isRestoringNote || isSavingDraft
 													? "cursor-not-allowed border-slate-200 text-slate-300"
 													: "border-rose-200 text-rose-600 hover:bg-rose-50"
 											}`}
@@ -2255,6 +2349,9 @@ export default function Home() {
 										{noteActionMessage ? (
 											<p className="mt-2 text-xs text-amber-700">{noteActionMessage}</p>
 										) : null}
+										{saveErrorMessage ? (
+											<p className="mt-2 text-xs text-rose-600">{saveErrorMessage}</p>
+										) : null}
 										<div className="mt-2 flex flex-wrap gap-2">
 											{(activeNote?.tags ?? []).map((tag) => (
 												<span key={tag} className="rounded-md bg-slate-100 px-2 py-1 text-xs text-slate-600">
@@ -2266,7 +2363,7 @@ export default function Home() {
 										<select
 											value={activeNoteFolderId}
 											onChange={(event) => void handleMoveActiveNote(event.target.value)}
-											disabled={!activeNote || isMovingNote || isActiveNoteDeleted}
+											disabled={!activeNote || isMovingNote || isActiveNoteDeleted || isSavingDraft}
 											className="max-w-[18rem] rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-600"
 										>
 											{folderFilterItems.map((item) => (
@@ -2298,7 +2395,8 @@ export default function Home() {
 								{focusEditorMode === "edit" ? (
 									isClientReady && MarkdownEditorComponent ? (
 										<div
-											className={`min-h-0 flex-1 overflow-hidden bg-white [&_.cm-editor]:h-full [&_.cm-scroller]:overflow-auto [&_.cm-theme]:h-full ${
+											style={{ minHeight: focusEditorMinHeight }}
+											className={`min-h-0 flex-1 overflow-hidden bg-white [&_.cm-content]:min-h-full [&_.cm-editor]:h-full [&_.cm-editor]:min-h-full [&_.cm-scroller]:min-h-full [&_.cm-scroller]:overflow-auto [&_.cm-theme]:h-full ${
 												isFocusFullscreen ? "" : "rounded-xl border border-slate-200"
 											}`}
 										>
@@ -2313,6 +2411,7 @@ export default function Home() {
 										<textarea
 											value={draft}
 											onChange={(event) => handleDraftChange(event.target.value)}
+											style={{ minHeight: focusEditorMinHeight }}
 											className={`min-h-0 h-full flex-1 resize-none bg-white text-sm ${
 												isFocusFullscreen ? "border-0 p-0" : "rounded-xl border border-slate-200 p-3"
 											}`}
@@ -2344,7 +2443,8 @@ export default function Home() {
 									>
 										{isClientReady && MarkdownEditorComponent ? (
 											<div
-												className={`min-h-0 overflow-hidden bg-white [&_.cm-editor]:h-full [&_.cm-scroller]:overflow-auto [&_.cm-theme]:h-full ${
+												style={{ minHeight: focusEditorMinHeight }}
+												className={`min-h-0 overflow-hidden bg-white [&_.cm-content]:min-h-full [&_.cm-editor]:h-full [&_.cm-editor]:min-h-full [&_.cm-scroller]:min-h-full [&_.cm-scroller]:overflow-auto [&_.cm-theme]:h-full ${
 													isFocusFullscreen ? "" : "rounded-xl border border-slate-200"
 												}`}
 											>
@@ -2359,6 +2459,7 @@ export default function Home() {
 											<textarea
 												value={draft}
 												onChange={(event) => handleDraftChange(event.target.value)}
+												style={{ minHeight: focusEditorMinHeight }}
 												className={`min-h-0 h-full w-full resize-none bg-white text-sm ${
 													isFocusFullscreen ? "border-0 p-0" : "rounded-xl border border-slate-200 p-3"
 												}`}
@@ -2650,7 +2751,7 @@ export default function Home() {
 												</>
 											) : (
 												<>
-													<p className="truncate text-sm font-semibold">{activeNote.title}</p>
+													<p className="truncate text-sm font-semibold">{titleDraft || activeNote.title}</p>
 													<button
 														type="button"
 														onClick={startTitleEdit}
@@ -2684,6 +2785,18 @@ export default function Home() {
 									</div>
 									<button
 										type="button"
+										onClick={() => void handleSaveActiveNote()}
+										disabled={!canSaveActiveNote}
+										className={`rounded-lg border px-2 py-1 text-xs ${
+											!canSaveActiveNote
+												? "cursor-not-allowed border-slate-200 text-slate-300"
+												: "border-emerald-200 text-emerald-700"
+										}`}
+									>
+										{isSavingDraft ? "保存中" : hasUnsavedChanges ? "保存" : "已保存"}
+									</button>
+									<button
+										type="button"
 										onClick={toggleFocusFullscreen}
 										className="rounded-lg border border-slate-200 px-2 py-1 text-xs text-slate-600"
 									>
@@ -2693,9 +2806,9 @@ export default function Home() {
 										<button
 											type="button"
 											onClick={handleResolveActiveNoteUrl}
-											disabled={!activeNote || isResolvingNoteUrl || isDeletingNote || isArchivingNote || isRestoringNote}
+											disabled={!activeNote || isResolvingNoteUrl || isDeletingNote || isArchivingNote || isRestoringNote || isSavingDraft}
 											className={`rounded-lg border px-2 py-1 text-xs ${
-												!activeNote || isResolvingNoteUrl || isDeletingNote || isArchivingNote || isRestoringNote
+												!activeNote || isResolvingNoteUrl || isDeletingNote || isArchivingNote || isRestoringNote || isSavingDraft
 													? "cursor-not-allowed border-slate-200 text-slate-300"
 													: "border-sky-200 text-sky-700"
 											}`}
@@ -2707,9 +2820,9 @@ export default function Home() {
 										<button
 											type="button"
 											onClick={handleToggleArchiveActiveNote}
-											disabled={!activeNote || isArchivingNote || isDeletingNote || isRestoringNote}
+											disabled={!activeNote || isArchivingNote || isDeletingNote || isRestoringNote || isSavingDraft}
 											className={`rounded-lg border px-2 py-1 text-xs ${
-												!activeNote || isArchivingNote || isDeletingNote || isRestoringNote
+												!activeNote || isArchivingNote || isDeletingNote || isRestoringNote || isSavingDraft
 													? "cursor-not-allowed border-slate-200 text-slate-300"
 													: "border-amber-200 text-amber-700"
 											}`}
@@ -2721,9 +2834,9 @@ export default function Home() {
 										<button
 											type="button"
 											onClick={handleRestoreActiveNote}
-											disabled={!activeNote || isRestoringNote || isDeletingNote}
+											disabled={!activeNote || isRestoringNote || isDeletingNote || isSavingDraft}
 											className={`rounded-lg border px-2 py-1 text-xs ${
-												!activeNote || isRestoringNote || isDeletingNote
+												!activeNote || isRestoringNote || isDeletingNote || isSavingDraft
 													? "cursor-not-allowed border-slate-200 text-slate-300"
 													: "border-emerald-200 text-emerald-700"
 											}`}
@@ -2734,9 +2847,9 @@ export default function Home() {
 									<button
 										type="button"
 										onClick={handleDeleteActiveNote}
-										disabled={!activeNote || isDeletingNote || isArchivingNote || isRestoringNote}
+										disabled={!activeNote || isDeletingNote || isArchivingNote || isRestoringNote || isSavingDraft}
 										className={`rounded-lg border px-2 py-1 text-xs ${
-											!activeNote || isDeletingNote || isArchivingNote || isRestoringNote
+											!activeNote || isDeletingNote || isArchivingNote || isRestoringNote || isSavingDraft
 												? "cursor-not-allowed border-slate-200 text-slate-300"
 												: "border-rose-200 text-rose-600"
 										}`}
@@ -2748,6 +2861,12 @@ export default function Home() {
 								{noteActionMessage ? (
 									<p className="mb-2 text-xs text-amber-700">{noteActionMessage}</p>
 								) : null}
+								{saveErrorMessage ? (
+									<p className="mb-2 text-xs text-rose-600">{saveErrorMessage}</p>
+								) : null}
+								<p className="mb-2 text-xs text-slate-500">
+									{activeNote?.updatedAt ? formatUpdatedAt(activeNote.updatedAt) : ""} · {saveStateText} · {noteStatusLabel}
+								</p>
 								<p className="mb-2 text-xs text-slate-500">当前状态筛选：{noteStatusLabel}</p>
 								<div className="mb-2 grid grid-cols-3 gap-2">
 									<ModeButton label="活跃" active={noteStatusFilter === "active"} onClick={() => setNoteStatusFilter("active")} />
@@ -2758,7 +2877,7 @@ export default function Home() {
 									<select
 										value={activeNoteFolderId}
 										onChange={(event) => void handleMoveActiveNote(event.target.value)}
-										disabled={!activeNote || isMovingNote || isActiveNoteDeleted}
+										disabled={!activeNote || isMovingNote || isActiveNoteDeleted || isSavingDraft}
 										className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-600"
 									>
 										{folderFilterItems.map((item) => (
@@ -2790,6 +2909,7 @@ export default function Home() {
 									<textarea
 										value={draft}
 										onChange={(e) => handleDraftChange(e.target.value)}
+										style={{ minHeight: focusEditorMinHeight }}
 										className={`w-full text-sm ${
 											isFocusFullscreen
 												? "h-[calc(100dvh-1.5rem)] resize-none border-0 bg-white p-0"
@@ -3912,6 +4032,15 @@ function buildSummary(content: string): string {
 		return "空白笔记";
 	}
 	return normalized.length > 88 ? `${normalized.slice(0, 88)}...` : normalized;
+}
+
+function getFocusEditorMinHeight(value: string): string {
+	const lineCount = Math.max(value.split(/\r?\n/).length, 1);
+	const visibleLines = Math.max(
+		FOCUS_EDITOR_MIN_VISIBLE_LINES,
+		Math.min(lineCount + FOCUS_EDITOR_EXTRA_VISIBLE_LINES, FOCUS_EDITOR_MAX_VISIBLE_LINES),
+	);
+	return `calc(${visibleLines} * 1.5rem + 1.5rem)`;
 }
 
 function buildTitle(content: string): string {
