@@ -556,6 +556,15 @@ export async function listNotes(options: ListNotesOptions = {}): Promise<NoteApi
 		.filter((item): item is NoteApiItem => item !== null);
 }
 
+export async function getNote(noteId: string): Promise<NoteApiItem> {
+	const data = await requestApiData<unknown>(`/api/notes/${encodeURIComponent(noteId)}`);
+	const note = toNoteApiItem(data);
+	if (!note) {
+		throw new Error("Invalid note response");
+	}
+	return note;
+}
+
 export async function createNote(input: CreateNoteInput): Promise<NoteApiItem> {
 	const data = await requestApiData<unknown>("/api/notes", {
 		method: "POST",

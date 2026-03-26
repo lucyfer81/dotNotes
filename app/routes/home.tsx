@@ -5,6 +5,7 @@ import { Link } from "react-router";
 import {
 	archiveNote,
 	createFolder,
+	getNote,
 	createNote,
 	deleteNoteAsset,
 	deleteNote,
@@ -1495,6 +1496,27 @@ export default function Home() {
 		setWorkspaceMode("focus");
 	};
 
+	const openNoteFromRelation = async (noteId: string) => {
+		const existing = noteItemsRef.current.find((note) => note.id === noteId) ?? null;
+		if (existing) {
+			setNoteActionMessage("");
+			focusNote(noteId);
+			return;
+		}
+
+		try {
+			const fetched = toNoteItem(await getNote(noteId));
+			const openedOutsideFilters =
+				selectedTagIdsRef.current.length > 0 || !matchesStatusFilter(fetched, noteStatusFilter);
+
+			setNoteItems((prev) => [fetched, ...prev.filter((note) => note.id !== fetched.id)]);
+			setNoteActionMessage(openedOutsideFilters ? "已在当前标签打开关联笔记；它当前不在筛选结果里。" : "");
+			focusNote(fetched.id);
+		} catch (error) {
+			setNoteActionMessage(readErrorMessage(error));
+		}
+	};
+
 	const handleMoveActiveNote = async (folderId: string) => {
 		if (!activeNote || !folderId || folderId === activeNote.folderId || isMovingNote || isSavingDraft) {
 			return;
@@ -2484,7 +2506,7 @@ export default function Home() {
 									<RelationSummaryPanel
 										isLoading={isLoadingNoteRelations}
 										items={acceptedRelations}
-										onOpenNote={focusNote}
+										onOpenNote={openNoteFromRelation}
 										mutatingRelationId={mutatingRelationId}
 										onUpdateRelationType={handleUpdateRelationType}
 										onDeleteRelation={handleDeleteRelation}
@@ -2934,7 +2956,7 @@ export default function Home() {
 									<RelationSummaryPanel
 										isLoading={isLoadingNoteRelations}
 										items={acceptedRelations}
-										onOpenNote={focusNote}
+										onOpenNote={openNoteFromRelation}
 										mutatingRelationId={mutatingRelationId}
 										onUpdateRelationType={handleUpdateRelationType}
 										onDeleteRelation={handleDeleteRelation}
@@ -3015,7 +3037,7 @@ export default function Home() {
 						isApplyingTitle={isApplyingAiTitle}
 						isApplyingTags={isApplyingAiTags}
 						isApplyingRelations={isApplyingAiRelations}
-						onOpenNote={focusNote}
+						onOpenNote={openNoteFromRelation}
 					/>
 				</div>
 			</div>
@@ -3068,7 +3090,7 @@ export default function Home() {
 							isApplyingTitle={isApplyingAiTitle}
 							isApplyingTags={isApplyingAiTags}
 							isApplyingRelations={isApplyingAiRelations}
-							onOpenNote={focusNote}
+							onOpenNote={openNoteFromRelation}
 						/>
 					</div>
 				</div>
@@ -3334,13 +3356,14 @@ function RelationSummaryPanel(props: {
 					<div key={item.id} className="rounded-lg border border-slate-200 bg-white p-2">
 						<div className="flex items-start justify-between gap-2">
 							<div className="min-w-0 flex-1">
-								<button
-									type="button"
-									onClick={() => onOpenNote(item.otherNote.id)}
-									className="truncate text-left text-xs font-medium text-slate-800 hover:text-sky-700"
+								<a
+									href={buildNotePreviewPath(item.otherNote.id)}
+									target="_blank"
+									rel="noreferrer"
+									className="block truncate text-left text-xs font-medium text-slate-800 hover:text-sky-700"
 								>
 									{item.otherNote.title}
-								</button>
+								</a>
 								<p className="mt-1 text-[11px] text-slate-500">
 									{formatRelationTypeLabel(item.relationType)} · {Math.round(item.score * 100)}%
 								</p>
@@ -3368,6 +3391,13 @@ function RelationSummaryPanel(props: {
 										))}
 									</select>
 								) : null}
+								<button
+									type="button"
+									onClick={() => onOpenNote(item.otherNote.id)}
+									className="rounded border border-sky-200 px-2 py-1 text-[11px] text-sky-700 hover:bg-sky-50"
+								>
+									当前标签跳转
+								</button>
 								{onAcceptRelation && item.status === "suggested" ? (
 									<button
 										type="button"
@@ -4108,4 +4138,8 @@ function escapeRegExp(value: string): string {
 
 function formatUpdatedAt(value: string): string {
 	return formatMonthDayTime(value);
+}
+
+function buildNotePreviewPath(noteId: string): string {
+	return `/preview/${encodeURIComponent(noteId)}`;
 }
