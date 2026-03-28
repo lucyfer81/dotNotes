@@ -155,6 +155,7 @@ export default function Home() {
 	const [isMovingNote, setIsMovingNote] = useState(false);
 	const [folderErrorMessage, setFolderErrorMessage] = useState("");
 	const [captureInput, setCaptureInput] = useState("");
+	const [captureTagNames, setCaptureTagNames] = useState<string[]>([]);
 	const [noteItems, setNoteItems] = useState<NoteItem[]>([]);
 	const [noteStatusFilter, setNoteStatusFilter] = useState<NoteStatus>("active");
 	const [tagItems, setTagItems] = useState<TagApiItem[]>([]);
@@ -423,7 +424,7 @@ export default function Home() {
 
 	useEffect(() => {
 		setCaptureActionMessage("");
-	}, [captureInput]);
+	}, [captureInput, captureTagNames]);
 
 	useEffect(() => {
 		const nextSelected = (aiEnhanceResult?.tagSuggestions ?? [])
@@ -1425,6 +1426,7 @@ export default function Home() {
 				title: buildTitle(content),
 				folderId: captureFolderId,
 				bodyText: content,
+				tagNames: captureTagNames,
 			});
 			let finalNote = created;
 			if (options.resolveUrlAfterCreate && captureInputSourceUrl) {
@@ -1448,6 +1450,7 @@ export default function Home() {
 				setDraft(next.content);
 			}
 			setCaptureInput("");
+			setCaptureTagNames([]);
 		} catch (error) {
 			setCaptureActionMessage(readErrorMessage(error));
 		} finally {
@@ -1465,6 +1468,24 @@ export default function Home() {
 
 	const handleCaptureResolveSend = async () => {
 		await handleCaptureSubmit({ resolveUrlAfterCreate: true });
+	};
+
+	const handleAddCaptureTag = (rawTagName: string): boolean => {
+		const normalized = normalizeTagNamePreview(rawTagName, FRONTEND_TAG_NAME_MAX_LENGTH);
+		if (!normalized) {
+			return false;
+		}
+		let added = false;
+		setCaptureTagNames((prev) => {
+			const next = dedupeTagNames([...prev, normalized]);
+			added = next.length > prev.length;
+			return next;
+		});
+		return added;
+	};
+
+	const handleRemoveCaptureTag = (tagName: string) => {
+		setCaptureTagNames((prev) => prev.filter((item) => item.toLowerCase() !== tagName.toLowerCase()));
 	};
 
 	const toggleTagFilter = (tagId: string) => {
@@ -1985,6 +2006,15 @@ export default function Home() {
 									placeholder="随手记一条"
 									className="h-28 w-full resize-none rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm outline-none focus:ring"
 								/>
+								<div className="mt-3">
+									<CaptureTagEditor
+										tagNames={captureTagNames}
+										tagItems={tagItems}
+										disabled={isSubmittingCapture}
+										onAddTag={handleAddCaptureTag}
+										onRemoveTag={handleRemoveCaptureTag}
+									/>
+								</div>
 									<div className="mt-3 flex items-center justify-between">
 										<select
 											value={captureFolderId}
@@ -2585,6 +2615,15 @@ export default function Home() {
 									placeholder="快速记录..."
 									className="h-24 w-full resize-none rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm"
 								/>
+								<div className="mt-2">
+									<CaptureTagEditor
+										tagNames={captureTagNames}
+										tagItems={tagItems}
+										disabled={isSubmittingCapture}
+										onAddTag={handleAddCaptureTag}
+										onRemoveTag={handleRemoveCaptureTag}
+									/>
+								</div>
 									<div className="mt-2 flex items-center justify-between">
 										<select
 											value={captureFolderId}
@@ -3442,6 +3481,158 @@ function NoteTagEditor(props: {
 				</div>
 			) : null}
 			{errorMessage ? <p className="mt-2 text-xs text-rose-600">{errorMessage}</p> : null}
+		</div>
+	);
+}
+
+function CaptureTagEditor(props: {
+	tagNames: string[];
+	tagItems: TagApiItem[];
+	disabled: boolean;
+	onAddTag: (tagName: string) => boolean;
+	onRemoveTag: (tagName: string) => void;
+}) {
+	const { tagNames, tagItems, disabled, onAddTag, onRemoveTag } = props;
+	const [inputValue, setInputValue] = useState("");
+	const activeTagNameSet = useMemo(
+		() => new Set(tagNames.map((item) => item.toLowerCase())),
+		[tagNames],
+	);
+	const existingTagNameSet = useMemo(
+		() => new Set(tagItems.map((item) => item.name.toLowerCase())),
+		[tagItems],
+	);
+	const normalizedInputValue = useMemo(
+		() => normalizeTagNamePreview(inputValue, FRONTEND_TAG_NAME_MAX_LENGTH),
+		[inputValue],
+	);
+	const normalizedInputState = useMemo(() => {
+		const rawValue = inputValue.trim();
+		if (!rawValue) {
+			return "可在发送前先补标签，回车即可加入。";
+		}
+		if (!normalizedInputValue) {
+			return "当前输入在归一化后为空，无法加入";
+		}
+		if (activeTagNameSet.has(normalizedInputValue.toLowerCase())) {
+			return `本次记录已选 #${normalizedInputValue}`;
+		}
+		if (normalizedInputValue !== rawValue) {
+			return `加入后将保存为 #${normalizedInputValue}`;
+		}
+		if (existingTagNameSet.has(normalizedInputValue.toLowerCase())) {
+			return `加入后将复用已有标签 #${normalizedInputValue}`;
+		}
+		return `加入后将创建新标签 #${normalizedInputValue}`;
+	}, [activeTagNameSet, existingTagNameSet, inputValue, normalizedInputValue]);
+	const filteredSuggestions = useMemo(() => {
+		const keyword = inputValue.trim().toLowerCase();
+		if (!keyword) {
+			return [];
+		}
+		return tagItems
+			.filter((tag) => !activeTagNameSet.has(tag.name.toLowerCase()))
+			.filter((tag) => tag.name.toLowerCase().includes(keyword))
+			.slice(0, 6);
+	}, [activeTagNameSet, inputValue, tagItems]);
+
+	const submitTag = (rawTagName: string) => {
+		const nextTagName = rawTagName.trim();
+		if (!nextTagName || !normalizeTagNamePreview(nextTagName, FRONTEND_TAG_NAME_MAX_LENGTH) || disabled) {
+			return;
+		}
+		const added = onAddTag(nextTagName);
+		if (added) {
+			setInputValue("");
+		}
+	};
+
+	return (
+		<div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+			<div className="flex items-center justify-between gap-3">
+				<p className="text-xs font-semibold uppercase tracking-wide text-slate-500">标签</p>
+				<span className="text-[11px] text-slate-400">{tagNames.length} 个待发送</span>
+			</div>
+			<div className="mt-2 flex flex-wrap gap-2">
+				{tagNames.length === 0 ? (
+					<span className="rounded-md bg-white px-2 py-1 text-xs text-slate-400">未选择标签</span>
+				) : (
+					tagNames.map((tag) => (
+						<span
+							key={tag}
+							className="inline-flex items-center gap-1 rounded-full bg-white px-2 py-1 text-xs text-slate-700"
+						>
+							<span>#{tag}</span>
+							<button
+								type="button"
+								onClick={() => onRemoveTag(tag)}
+								disabled={disabled}
+								aria-label={`删除标签 ${tag}`}
+								className={`rounded-full px-1 leading-none ${
+									disabled
+										? "cursor-not-allowed text-slate-300"
+										: "text-slate-400 hover:bg-slate-100 hover:text-rose-600"
+								}`}
+							>
+								×
+							</button>
+						</span>
+					))
+				)}
+			</div>
+			<div className="mt-3 flex gap-2">
+				<input
+					type="text"
+					value={inputValue}
+					onChange={(event) => setInputValue(event.target.value)}
+					onKeyDown={(event) => {
+						if (event.key === "Enter") {
+							event.preventDefault();
+							submitTag(inputValue);
+							return;
+						}
+						if (event.key === "Backspace" && inputValue.length === 0 && tagNames.length > 0) {
+							event.preventDefault();
+							onRemoveTag(tagNames[tagNames.length - 1]);
+						}
+					}}
+					placeholder="输入标签后回车"
+					disabled={disabled}
+					className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-slate-400 disabled:cursor-not-allowed disabled:bg-slate-100"
+				/>
+				<button
+					type="button"
+					onClick={() => submitTag(inputValue)}
+					disabled={disabled || inputValue.trim().length === 0 || normalizedInputValue.length === 0}
+					className={`rounded-lg border px-3 py-2 text-xs font-medium ${
+						disabled || inputValue.trim().length === 0 || normalizedInputValue.length === 0
+							? "cursor-not-allowed border-slate-200 text-slate-300"
+							: "border-slate-300 text-slate-700 hover:bg-white"
+					}`}
+				>
+					加入
+				</button>
+			</div>
+			<p className="mt-2 text-[11px] text-slate-500">{normalizedInputState}</p>
+			{filteredSuggestions.length > 0 ? (
+				<div className="mt-2 flex flex-wrap gap-2">
+					{filteredSuggestions.map((tag) => (
+						<button
+							key={tag.id}
+							type="button"
+							onClick={() => submitTag(tag.name)}
+							disabled={disabled}
+							className={`rounded-full border px-2 py-1 text-xs ${
+								disabled
+									? "cursor-not-allowed border-slate-200 text-slate-300"
+									: "border-slate-200 bg-white text-slate-600 hover:border-slate-300 hover:text-slate-900"
+							}`}
+						>
+							加入 #{tag.name}
+						</button>
+					))}
+				</div>
+			) : null}
 		</div>
 	);
 }
