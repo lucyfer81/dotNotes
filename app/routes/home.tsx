@@ -96,6 +96,7 @@ const AI_TASK_ITEMS: Array<{ key: AiEnhanceTaskApiKey; label: string }> = [
 const FOCUS_EDITOR_EXTRA_VISIBLE_LINES = 4;
 const FOCUS_EDITOR_MIN_VISIBLE_LINES = 6;
 const FOCUS_EDITOR_MAX_VISIBLE_LINES = 10;
+const FRONTEND_TAG_NAME_MAX_LENGTH = 48;
 
 const defaultRootFolders: FolderApiItem[] = [
 	{ id: "folder-00-inbox", parentId: null, name: "00-Inbox", sortOrder: 0 },
@@ -177,6 +178,8 @@ export default function Home() {
 	const [isDeletingNote, setIsDeletingNote] = useState(false);
 	const [isResolvingNoteUrl, setIsResolvingNoteUrl] = useState(false);
 	const [noteActionMessage, setNoteActionMessage] = useState("");
+	const [isUpdatingNoteTags, setIsUpdatingNoteTags] = useState(false);
+	const [tagErrorMessage, setTagErrorMessage] = useState("");
 	const [commandOpen, setCommandOpen] = useState(false);
 	const [commandQuery, setCommandQuery] = useState("");
 	const [commandResults, setCommandResults] = useState<NoteItem[]>([]);
@@ -415,6 +418,7 @@ export default function Home() {
 
 	useEffect(() => {
 		setNoteActionMessage("");
+		setTagErrorMessage("");
 	}, [activeNoteId]);
 
 	useEffect(() => {
@@ -959,7 +963,6 @@ export default function Home() {
 				folderId: activeNote.folderId,
 				bodyText: contentToSave,
 				excerpt: buildSummary(contentToSave),
-				tagNames: extractHashTags(contentToSave),
 			});
 			void refreshTags();
 			const next = toNoteItem(updated);
@@ -996,6 +999,52 @@ export default function Home() {
 			return true;
 		}
 		return handleSaveActiveNote();
+	};
+
+	const persistActiveNoteTags = async (nextTagNamesInput: string[]) => {
+		if (!activeNote || isActiveNoteDeleted || isUpdatingNoteTags) {
+			return false;
+		}
+		const nextTagNames = dedupeTagNames(nextTagNamesInput);
+		if (areTagNameListsEqual(activeNote.tags, nextTagNames)) {
+			setTagErrorMessage("");
+			return true;
+		}
+
+		setIsUpdatingNoteTags(true);
+		setTagErrorMessage("");
+		try {
+			const updated = await updateNote(activeNote.id, { tagNames: nextTagNames });
+			const next = toNoteItem(updated);
+			upsertNoteByFilters(next);
+			await refreshTags();
+			return true;
+		} catch (error) {
+			setTagErrorMessage(readErrorMessage(error));
+			return false;
+		} finally {
+			setIsUpdatingNoteTags(false);
+		}
+	};
+
+	const handleAddTagToActiveNote = async (rawTagName: string) => {
+		if (!activeNote) {
+			return false;
+		}
+		const nextTagName = rawTagName.trim();
+		if (!nextTagName) {
+			return false;
+		}
+		return persistActiveNoteTags([...activeNote.tags, nextTagName]);
+	};
+
+	const handleRemoveTagFromActiveNote = async (tagName: string) => {
+		if (!activeNote) {
+			return false;
+		}
+		return persistActiveNoteTags(
+			activeNote.tags.filter((item) => item.toLowerCase() !== tagName.toLowerCase()),
+		);
 	};
 
 	const refreshActiveNoteRelations = async (noteId: string) => {
@@ -1230,20 +1279,17 @@ export default function Home() {
 		if (selectedTags.length === 0) {
 			return;
 		}
-		const mergedTagNames = [...new Set([...activeNote.tags, ...selectedTags])];
-		if (
-			mergedTagNames.length === activeNote.tags.length &&
-			activeNote.tags.every((item) => mergedTagNames.includes(item))
-		) {
+		const mergedTagNames = dedupeTagNames([...activeNote.tags, ...selectedTags]);
+		if (areTagNameListsEqual(activeNote.tags, mergedTagNames)) {
 			return;
 		}
 		setIsApplyingAiTags(true);
 		setAiErrorMessage("");
 		try {
-			const updated = await updateNote(activeNote.id, { tagNames: mergedTagNames });
-			const next = toNoteItem(updated);
-			setNoteItems((prev) => prev.map((item) => (item.id === next.id ? { ...item, ...next } : item)));
-			await refreshTags();
+			const savedTags = await persistActiveNoteTags(mergedTagNames);
+			if (!savedTags) {
+				return;
+			}
 		} catch (error) {
 			setAiErrorMessage(readErrorMessage(error));
 		} finally {
@@ -1379,7 +1425,6 @@ export default function Home() {
 				title: buildTitle(content),
 				folderId: captureFolderId,
 				bodyText: content,
-				tagNames: extractHashTags(content),
 			});
 			let finalNote = created;
 			if (options.resolveUrlAfterCreate && captureInputSourceUrl) {
@@ -1937,7 +1982,7 @@ export default function Home() {
 								<textarea
 									value={captureInput}
 									onChange={(e) => setCaptureInput(e.target.value)}
-									placeholder="随手记一条，支持 #tag"
+									placeholder="随手记一条"
 									className="h-28 w-full resize-none rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm outline-none focus:ring"
 								/>
 									<div className="mt-3 flex items-center justify-between">
@@ -2374,13 +2419,18 @@ export default function Home() {
 										{saveErrorMessage ? (
 											<p className="mt-2 text-xs text-rose-600">{saveErrorMessage}</p>
 										) : null}
-										<div className="mt-2 flex flex-wrap gap-2">
-											{(activeNote?.tags ?? []).map((tag) => (
-												<span key={tag} className="rounded-md bg-slate-100 px-2 py-1 text-xs text-slate-600">
-												{tag}
-											</span>
-										))}
-									</div>
+										<div className="mt-3">
+											<NoteTagEditor
+												key={`desktop-${activeNote?.id ?? "empty"}`}
+												note={activeNote}
+												tagItems={tagItems}
+												disabled={!activeNote || isActiveNoteDeleted || isDeletingNote || isArchivingNote || isRestoringNote || isSavingDraft}
+												isSaving={isUpdatingNoteTags}
+												errorMessage={tagErrorMessage}
+												onAddTag={handleAddTagToActiveNote}
+												onRemoveTag={handleRemoveTagFromActiveNote}
+											/>
+										</div>
 									<div className="mt-3 flex items-center gap-2">
 										<select
 											value={activeNoteFolderId}
@@ -2889,6 +2939,18 @@ export default function Home() {
 								<p className="mb-2 text-xs text-slate-500">
 									{activeNote?.updatedAt ? formatUpdatedAt(activeNote.updatedAt) : ""} · {saveStateText} · {noteStatusLabel}
 								</p>
+								<div className="mb-2">
+									<NoteTagEditor
+										key={`mobile-${activeNote?.id ?? "empty"}`}
+										note={activeNote}
+										tagItems={tagItems}
+										disabled={!activeNote || isActiveNoteDeleted || isDeletingNote || isArchivingNote || isRestoringNote || isSavingDraft}
+										isSaving={isUpdatingNoteTags}
+										errorMessage={tagErrorMessage}
+										onAddTag={handleAddTagToActiveNote}
+										onRemoveTag={handleRemoveTagFromActiveNote}
+									/>
+								</div>
 								<p className="mb-2 text-xs text-slate-500">当前状态筛选：{noteStatusLabel}</p>
 								<div className="mb-2 grid grid-cols-3 gap-2">
 									<ModeButton label="活跃" active={noteStatusFilter === "active"} onClick={() => setNoteStatusFilter("active")} />
@@ -3229,6 +3291,158 @@ function ModeButton(props: {
 		>
 			{label}
 		</button>
+	);
+}
+
+function NoteTagEditor(props: {
+	note: NoteItem | null;
+	tagItems: TagApiItem[];
+	disabled: boolean;
+	isSaving: boolean;
+	errorMessage: string;
+	onAddTag: (tagName: string) => Promise<boolean>;
+	onRemoveTag: (tagName: string) => Promise<boolean>;
+}) {
+	const { note, tagItems, disabled, isSaving, errorMessage, onAddTag, onRemoveTag } = props;
+	const [inputValue, setInputValue] = useState("");
+	const activeTagNameSet = useMemo(
+		() => new Set((note?.tags ?? []).map((item) => item.toLowerCase())),
+		[note?.tags],
+	);
+	const existingTagNameSet = useMemo(
+		() => new Set(tagItems.map((item) => item.name.toLowerCase())),
+		[tagItems],
+	);
+	const normalizedInputValue = useMemo(
+		() => normalizeTagNamePreview(inputValue, FRONTEND_TAG_NAME_MAX_LENGTH),
+		[inputValue],
+	);
+	const normalizedInputState = useMemo(() => {
+		const rawValue = inputValue.trim();
+		if (!rawValue) {
+			return "";
+		}
+		if (!normalizedInputValue) {
+			return "当前输入在归一化后为空，无法保存";
+		}
+		if (activeTagNameSet.has(normalizedInputValue.toLowerCase())) {
+			return `当前笔记已有 #${normalizedInputValue}`;
+		}
+		if (normalizedInputValue !== rawValue) {
+			return `将保存为 #${normalizedInputValue}`;
+		}
+		if (existingTagNameSet.has(normalizedInputValue.toLowerCase())) {
+			return `将复用已有标签 #${normalizedInputValue}`;
+		}
+		return `将创建新标签 #${normalizedInputValue}`;
+	}, [activeTagNameSet, existingTagNameSet, inputValue, normalizedInputValue]);
+	const filteredSuggestions = useMemo(() => {
+		const keyword = inputValue.trim().toLowerCase();
+		if (!keyword) {
+			return [];
+		}
+		return tagItems
+			.filter((tag) => !activeTagNameSet.has(tag.name.toLowerCase()))
+			.filter((tag) => tag.name.toLowerCase().includes(keyword))
+			.slice(0, 6);
+	}, [activeTagNameSet, inputValue, tagItems]);
+
+	const submitTag = async (rawTagName: string) => {
+		const nextTagName = rawTagName.trim();
+		if (!nextTagName || !normalizeTagNamePreview(nextTagName, FRONTEND_TAG_NAME_MAX_LENGTH) || disabled || isSaving) {
+			return;
+		}
+		const saved = await onAddTag(nextTagName);
+		if (saved) {
+			setInputValue("");
+		}
+	};
+
+	return (
+		<div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+			<div className="flex items-center justify-between gap-3">
+				<p className="text-xs font-semibold uppercase tracking-wide text-slate-500">标签</p>
+				<span className="text-[11px] text-slate-400">{isSaving ? "保存中..." : `${note?.tags.length ?? 0} 个`}</span>
+			</div>
+			<div className="mt-2 flex flex-wrap gap-2">
+				{!note || note.tags.length === 0 ? (
+					<span className="rounded-md bg-white px-2 py-1 text-xs text-slate-400">暂无标签</span>
+				) : (
+					note.tags.map((tag) => (
+						<span
+							key={tag}
+							className="inline-flex items-center gap-1 rounded-full bg-white px-2 py-1 text-xs text-slate-700"
+						>
+							<span>#{tag}</span>
+							<button
+								type="button"
+								onClick={() => void onRemoveTag(tag)}
+								disabled={disabled || isSaving}
+								aria-label={`删除标签 ${tag}`}
+								className={`rounded-full px-1 leading-none ${
+									disabled || isSaving
+										? "cursor-not-allowed text-slate-300"
+										: "text-slate-400 hover:bg-slate-100 hover:text-rose-600"
+								}`}
+							>
+								×
+							</button>
+						</span>
+					))
+				)}
+			</div>
+			<div className="mt-3 flex gap-2">
+				<input
+					type="text"
+					value={inputValue}
+					onChange={(event) => setInputValue(event.target.value)}
+					onKeyDown={(event) => {
+						if (event.key === "Enter") {
+							event.preventDefault();
+							void submitTag(inputValue);
+						}
+					}}
+					placeholder="输入标签后回车"
+					disabled={disabled || isSaving || !note}
+					className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-slate-400 disabled:cursor-not-allowed disabled:bg-slate-100"
+				/>
+				<button
+					type="button"
+					onClick={() => void submitTag(inputValue)}
+					disabled={disabled || isSaving || !note || inputValue.trim().length === 0 || normalizedInputValue.length === 0}
+					className={`rounded-lg border px-3 py-2 text-xs font-medium ${
+						disabled || isSaving || !note || inputValue.trim().length === 0 || normalizedInputValue.length === 0
+							? "cursor-not-allowed border-slate-200 text-slate-300"
+							: "border-slate-300 text-slate-700 hover:bg-white"
+					}`}
+				>
+					添加
+				</button>
+			</div>
+			{normalizedInputState ? (
+				<p className="mt-2 text-[11px] text-slate-500">{normalizedInputState}</p>
+			) : null}
+			{filteredSuggestions.length > 0 ? (
+				<div className="mt-2 flex flex-wrap gap-2">
+					{filteredSuggestions.map((tag) => (
+						<button
+							key={tag.id}
+							type="button"
+							onClick={() => void submitTag(tag.name)}
+							disabled={disabled || isSaving}
+							className={`rounded-full border px-2 py-1 text-xs ${
+								disabled || isSaving
+									? "cursor-not-allowed border-slate-200 text-slate-300"
+									: "border-slate-200 bg-white text-slate-600 hover:border-slate-300 hover:text-slate-900"
+							}`}
+						>
+							使用 #{tag.name}
+						</button>
+					))}
+				</div>
+			) : null}
+			{errorMessage ? <p className="mt-2 text-xs text-rose-600">{errorMessage}</p> : null}
+		</div>
 	);
 }
 
@@ -4084,15 +4298,40 @@ function buildTitle(content: string): string {
 	return firstLine.length > 32 ? `${firstLine.slice(0, 32)}...` : firstLine;
 }
 
-function extractHashTags(content: string): string[] {
-	const tags = new Set<string>();
-	for (const match of content.matchAll(/#([^\s#]+)/g)) {
-		const value = match[1]?.trim();
-		if (value) {
-			tags.add(value);
+function dedupeTagNames(values: string[]): string[] {
+	const unique = new Set<string>();
+	const next: string[] = [];
+	for (const value of values) {
+		const trimmed = value.trim();
+		const key = trimmed.toLowerCase();
+		if (!trimmed || unique.has(key)) {
+			continue;
 		}
+		unique.add(key);
+		next.push(trimmed);
 	}
-	return [...tags].slice(0, 6);
+	return next;
+}
+
+function normalizeTagNamePreview(value: string, maxLength: number): string {
+	const trimmed = value.trim().toLowerCase();
+	if (!trimmed) {
+		return "";
+	}
+	return trimmed
+		.replace(/\s+/g, "-")
+		.replace(/[^\p{L}\p{N}_-]+/gu, "-")
+		.replace(/-+/g, "-")
+		.replace(/^[-_]+|[-_]+$/g, "")
+		.slice(0, maxLength);
+}
+
+function areTagNameListsEqual(left: string[], right: string[]): boolean {
+	if (left.length !== right.length) {
+		return false;
+	}
+	const rightSet = new Set(right.map((item) => item.toLowerCase()));
+	return left.every((item) => rightSet.has(item.toLowerCase()));
 }
 
 function renderHighlightedText(value: string, query: string, isActiveRow: boolean): ReactNode {
