@@ -205,3 +205,7 @@ dist
 ### Local QA Artifacts ###
 .playwright-cli/
 /output/
+
+### Python Cache ###
+__pycache__/
+*.py[cod]
