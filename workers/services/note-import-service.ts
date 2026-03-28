@@ -1,15 +1,18 @@
 import { isRecord } from "./common-service";
 import { enqueueNoteIndexJob } from "./index-core-service";
+import { fetchTagsForSingleNote, replaceNoteTags, resolveTagIds } from "./note-relations-service";
 import {
 	buildExcerpt,
 	buildTitle,
 	ensurePresetFolders,
 	ensureUniqueSlug,
+	getTagPerNoteLimit,
 	slugify,
 	syncNoteFtsContent,
 } from "./note-query-service";
 import { resolveBodyStorageForCreate } from "./note-storage-service";
 
+const INBOX_FOLDER_ID = "folder-00-inbox";
 const READING_PARENT_FOLDER_ID = "folder-20-areas";
 const READING_FOLDER_SLUG = "reading";
 const READING_FOLDER_NAME = "Reading";
@@ -40,6 +43,35 @@ export type RssImportedNoteInput = {
 	title?: string | null;
 	bodyText: string;
 };
+
+export type AppImportedNoteInput = {
+	title: string;
+	bodyText: string;
+	tags?: string[];
+	folder?: string | null;
+	folderId?: string | null;
+};
+
+export type AppImportedNoteCreateResult = ImportedNoteCreateResult & {
+	tags: Array<{ id: string; name: string }>;
+};
+
+type FolderLookupRow = {
+	id: string;
+	parentId: string | null;
+	name: string;
+	slug: string;
+};
+
+export class ImportedNoteInputError extends Error {
+	readonly details?: string;
+
+	constructor(message: string, details?: string) {
+		super(message);
+		this.name = "ImportedNoteInputError";
+		this.details = details;
+	}
+}
 
 export async function createImportedNote(
 	env: Env,
@@ -102,6 +134,38 @@ export async function createRssImportedNote(
 	});
 }
 
+export async function createAppImportedNote(
+	env: Env,
+	input: AppImportedNoteInput,
+): Promise<AppImportedNoteCreateResult> {
+	const folderId = await resolveImportedFolderId(env.DB, input.folderId ?? input.folder ?? null);
+	const { tagIds, ignoredTagNames } = await resolveTagIds(env, env.DB, [], input.tags ?? []);
+	if (ignoredTagNames.length > 0) {
+		throw new ImportedNoteInputError(
+			`Too many tag names, max ${getTagPerNoteLimit(env)}`,
+			ignoredTagNames.join(","),
+		);
+	}
+
+	const created = await createImportedNote(env, {
+		title: input.title,
+		bodyText: input.bodyText,
+		folderId,
+		requestedStorageType: "d1",
+		indexAction: "upsert",
+	});
+	await replaceNoteTags(env.DB, created.noteId, tagIds);
+	const tags = (await fetchTagsForSingleNote(env.DB, created.noteId)).map((tag) => ({
+		id: tag.id,
+		name: tag.name,
+	}));
+
+	return {
+		...created,
+		tags,
+	};
+}
+
 export async function requestRssImportedNote(
 	env: Env,
 	input: RssImportedNoteInput,
@@ -144,6 +208,10 @@ export async function requestRssImportedNote(
 
 export function getNotesImportSharedTokenHeaderName(): string {
 	return NOTES_IMPORT_SHARED_TOKEN_HEADER;
+}
+
+export function getNotesAppImportPath(): string {
+	return "/api/internal/notes/imports";
 }
 
 function parseImportedNoteEnvelope(value: unknown): ImportedNoteCreateResult | null {
@@ -193,4 +261,100 @@ async function ensureReadingFolder(db: D1Database): Promise<string> {
 		.bind(READING_FOLDER_ID, READING_PARENT_FOLDER_ID, READING_FOLDER_NAME, READING_FOLDER_SLUG, 20)
 		.run();
 	return READING_FOLDER_ID;
+}
+
+async function resolveImportedFolderId(db: D1Database, folderRef: string | null): Promise<string> {
+	await ensurePresetFolders(db);
+	const normalizedRef = folderRef?.trim() ?? "";
+	if (!normalizedRef) {
+		return INBOX_FOLDER_ID;
+	}
+
+	const byId = await db.prepare("SELECT id FROM folders WHERE id = ? LIMIT 1")
+		.bind(normalizedRef)
+		.first<{ id: string }>();
+	if (byId?.id) {
+		return byId.id;
+	}
+
+	const pathSegments = normalizedRef
+		.split("/")
+		.map((segment) => segment.trim())
+		.filter((segment) => segment.length > 0);
+	if (pathSegments.length > 1) {
+		return resolveFolderPath(db, pathSegments);
+	}
+
+	const slug = slugify(normalizedRef);
+	const { results } = await db.prepare(
+		`SELECT
+			id,
+			parent_id AS parentId,
+			name,
+			slug
+		 FROM folders
+		 WHERE slug = ?
+		    OR LOWER(name) = LOWER(?)
+		 ORDER BY COALESCE(parent_id, ''), name ASC`,
+	)
+		.bind(slug, normalizedRef)
+		.all<FolderLookupRow>();
+
+	if (results.length === 1) {
+		return results[0]!.id;
+	}
+	if (results.length > 1) {
+		throw new ImportedNoteInputError(
+			"Folder is ambiguous, please use folderId or full folder path",
+			results.map((folder) => buildFolderLabel(folder)).join(", "),
+		);
+	}
+
+	throw new ImportedNoteInputError("Folder does not exist", normalizedRef);
+}
+
+async function resolveFolderPath(db: D1Database, segments: string[]): Promise<string> {
+	let parentId: string | null = null;
+	let current: FolderLookupRow | null = null;
+
+	for (const segment of segments) {
+		const slug = slugify(segment);
+		const queryResult = await db.prepare(
+			`SELECT
+				id,
+				parent_id AS parentId,
+				name,
+				slug
+			 FROM folders
+			 WHERE COALESCE(parent_id, '__root__') = COALESCE(?, '__root__')
+			   AND (slug = ? OR LOWER(name) = LOWER(?))
+			 ORDER BY name ASC`,
+		)
+			.bind(parentId, slug, segment)
+			.all<FolderLookupRow>();
+		const results: FolderLookupRow[] = queryResult.results;
+
+		if (results.length === 0) {
+			throw new ImportedNoteInputError("Folder path does not exist", segments.join("/"));
+		}
+		if (results.length > 1) {
+			throw new ImportedNoteInputError(
+				"Folder path is ambiguous, please use folderId",
+				segments.join("/"),
+			);
+		}
+
+		const matchedFolder = results[0]!;
+		current = matchedFolder;
+		parentId = matchedFolder.id;
+	}
+
+	if (!current) {
+		throw new ImportedNoteInputError("Folder path does not exist", segments.join("/"));
+	}
+	return current.id;
+}
+
+function buildFolderLabel(folder: FolderLookupRow): string {
+	return folder.parentId ? `${folder.name} (${folder.slug})` : `${folder.name}`;
 }

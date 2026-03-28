@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import app from "../workers/app";
+import { getNotesImportSharedTokenHeaderName } from "../workers/services/note-import-service";
 import { FakeD1Database } from "./helpers/fake-d1";
 import { FakeR2Bucket } from "./helpers/fake-r2";
 import { FakeVectorIndex } from "./helpers/fake-vectorize";
@@ -60,6 +61,83 @@ describe("notes lifecycle api", () => {
 
 		const gone = await api(`/api/notes/${noteId}`);
 		expect(gone.status).toBe(404);
+	});
+});
+
+describe("internal note import api", () => {
+	it("requires shared token for generic app imports", async () => {
+		const response = await api("/api/internal/notes/imports", {
+			method: "POST",
+			body: JSON.stringify({
+				title: "Unauthorized Import",
+				content: "should fail",
+			}),
+		}, {
+			NOTES_API_SHARED_TOKEN: "shared-secret",
+		});
+
+		expect(response.status).toBe(401);
+		const payload = await response.json() as { ok: boolean; error?: string };
+		expect(payload.ok).toBe(false);
+		expect(payload.error).toContain("Unauthorized");
+	});
+
+	it("imports notes with default inbox, folder path resolution, and tag reuse", async () => {
+		const tokenHeader = getNotesImportSharedTokenHeaderName();
+
+		await readEnvelope(await api("/api/tags", {
+			method: "POST",
+			body: JSON.stringify({ name: "shared-tag" }),
+		}));
+		const createdFolder = await readEnvelope<{
+			id: string;
+			parentId: string;
+			name: string;
+			slug: string;
+		}>(await api("/api/folders", {
+			method: "POST",
+			body: JSON.stringify({
+				parentId: "folder-10-projects",
+				name: "Client A",
+			}),
+		}));
+
+		const importedInbox = await readEnvelope<ImportedNotePayload>(await api("/api/internal/notes/imports", {
+			method: "POST",
+			headers: {
+				[tokenHeader]: "shared-secret",
+			},
+			body: JSON.stringify({
+				title: "Inbox Import",
+				content: "imported into default inbox",
+				tags: ["shared-tag", "new-tag"],
+			}),
+		}, {
+			NOTES_API_SHARED_TOKEN: "shared-secret",
+		}));
+		expect(importedInbox.data.folderId).toBe("folder-00-inbox");
+		expect(importedInbox.data.tags.map((item) => item.name)).toEqual(["new-tag", "shared-tag"]);
+
+		const importedFolder = await readEnvelope<ImportedNotePayload>(await api("/api/internal/notes/imports", {
+			method: "POST",
+			headers: {
+				[tokenHeader]: "shared-secret",
+			},
+			body: JSON.stringify({
+				title: "Folder Path Import",
+				content: "imported into client folder",
+				folder: `10-Projects/${createdFolder.data.slug}`,
+				tagNames: ["shared-tag"],
+			}),
+		}, {
+			NOTES_API_SHARED_TOKEN: "shared-secret",
+		}));
+		expect(importedFolder.data.folderId).toBe(createdFolder.data.id);
+		expect(importedFolder.data.tags.map((item) => item.name)).toEqual(["shared-tag"]);
+
+		const tags = await readEnvelope<TagPayload[]>(await api("/api/tags?status=all"));
+		expect(tags.data.filter((item) => item.name === "shared-tag")).toHaveLength(1);
+		expect(tags.data.some((item) => item.name === "new-tag")).toBe(true);
 	});
 });
 
@@ -885,4 +963,13 @@ type AssetPayload = {
 	noteId: string;
 	fileName: string | null;
 	downloadUrl: string;
+};
+
+type ImportedNotePayload = {
+	noteId: string;
+	title: string;
+	slug: string;
+	folderId: string;
+	created: true;
+	tags: Array<{ id: string; name: string }>;
 };

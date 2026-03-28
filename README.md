@@ -47,3 +47,36 @@ A perfect starting point for building interactive, styled, and edge-deployed SPA
 - 🎨 [shadcn/ui](https://ui.shadcn.com)
 - 💨 [Tailwind CSS Documentation](https://tailwindcss.com/)
 - 🔀 [React Router Docs](https://reactrouter.com/)
+
+## Internal Note Import API
+
+For other dotFamily apps, dotNotes now exposes a shared-token protected import endpoint:
+
+- `POST /api/internal/notes/imports`
+- Header: `x-dotfamily-internal-token: <NOTES_API_SHARED_TOKEN>`
+- The `NOTES_API_SHARED_TOKEN` secret must be configured before this route can be used
+
+Example request body:
+
+```json
+{
+  "title": "My imported note",
+  "content": "note body here",
+  "tags": ["clip", "todo"],
+  "folder": "10-Projects/Client A"
+}
+```
+
+Supported fields:
+
+- `title`: required
+- `content`: required, `bodyText` is also accepted as an alias
+- `tags` / `tagNames`: optional, array of strings; `tags` also accepts a comma-separated string
+- `folderId`: optional, exact folder id
+- `folder`: optional, can be folder `slug`, `name`, or a path like `10-Projects/Client A`
+
+Behavior:
+
+- If no `folder` / `folderId` is provided, the note is stored in `00-Inbox`
+- Existing tags are reused and missing tags are created automatically
+- The response returns `noteId`, `slug`, resolved `folderId`, and attached tags

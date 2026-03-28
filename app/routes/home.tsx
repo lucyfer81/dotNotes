@@ -61,6 +61,7 @@ type SavedNoteSnapshot = {
 
 type WorkspaceMode = "capture" | "organize" | "focus";
 type EditorMode = "edit" | "preview" | "split";
+type CopyState = "idle" | "copying" | "copied" | "failed";
 type CommandAction = {
 	id: string;
 	label: string;
@@ -179,6 +180,7 @@ export default function Home() {
 	const [isDeletingNote, setIsDeletingNote] = useState(false);
 	const [isResolvingNoteUrl, setIsResolvingNoteUrl] = useState(false);
 	const [noteActionMessage, setNoteActionMessage] = useState("");
+	const [copyState, setCopyState] = useState<CopyState>("idle");
 	const [isUpdatingNoteTags, setIsUpdatingNoteTags] = useState(false);
 	const [tagErrorMessage, setTagErrorMessage] = useState("");
 	const [commandOpen, setCommandOpen] = useState(false);
@@ -420,7 +422,20 @@ export default function Home() {
 	useEffect(() => {
 		setNoteActionMessage("");
 		setTagErrorMessage("");
+		setCopyState("idle");
 	}, [activeNoteId]);
+
+	useEffect(() => {
+		if (copyState === "idle" || copyState === "copying" || typeof window === "undefined") {
+			return;
+		}
+		const timer = window.setTimeout(() => {
+			setCopyState("idle");
+		}, 1800);
+		return () => {
+			window.clearTimeout(timer);
+		};
+	}, [copyState]);
 
 	useEffect(() => {
 		setCaptureActionMessage("");
@@ -1762,6 +1777,20 @@ export default function Home() {
 		}
 	};
 
+	const handleCopyActiveNoteContent = async () => {
+		if (!activeNote || copyState === "copying") {
+			return;
+		}
+		setCopyState("copying");
+		try {
+			await writeTextToClipboard(draftRef.current);
+			setCopyState("copied");
+		} catch (error) {
+			console.error("Failed to copy note content", error);
+			setCopyState("failed");
+		}
+	};
+
 	const toggleFocusFullscreen = () => {
 		setIsFocusFullscreen((prev) => !prev);
 	};
@@ -1933,6 +1962,14 @@ export default function Home() {
 		normalizedTitleDraft.length > 0 &&
 		hasUnsavedChanges,
 	);
+	const canCopyActiveNote = Boolean(activeNote) && copyState !== "copying";
+	const copyButtonLabel = copyState === "copying"
+		? "复制中..."
+		: copyState === "copied"
+			? "已复制"
+			: copyState === "failed"
+				? "复制失败"
+				: "复制正文";
 	const saveStateText = isSavingDraft ? "保存中..." : saveErrorMessage ? "保存失败" : hasUnsavedChanges ? "未保存" : "已保存";
 	const focusEditorMinHeight = getFocusEditorMinHeight(draft);
 	const hasTagFilters = selectedTagIds.length > 0;
@@ -2374,6 +2411,22 @@ export default function Home() {
 											}`}
 										>
 											{isSavingDraft ? "保存中..." : hasUnsavedChanges ? "保存" : "已保存"}
+										</button>
+										<button
+											type="button"
+											onClick={() => void handleCopyActiveNoteContent()}
+											disabled={!canCopyActiveNote}
+											className={`rounded-lg border px-3 py-2 text-xs font-medium ${
+												!canCopyActiveNote
+													? "cursor-not-allowed border-slate-200 text-slate-300"
+													: copyState === "copied"
+														? "border-emerald-200 text-emerald-700 hover:bg-emerald-50"
+														: copyState === "failed"
+															? "border-rose-200 text-rose-600 hover:bg-rose-50"
+															: "border-slate-200 text-slate-600 hover:bg-slate-100"
+											}`}
+										>
+											{copyButtonLabel}
 										</button>
 										<button
 											type="button"
@@ -2905,6 +2958,22 @@ export default function Home() {
 										}`}
 									>
 										{isSavingDraft ? "保存中" : hasUnsavedChanges ? "保存" : "已保存"}
+									</button>
+									<button
+										type="button"
+										onClick={() => void handleCopyActiveNoteContent()}
+										disabled={!canCopyActiveNote}
+										className={`rounded-lg border px-2 py-1 text-xs ${
+											!canCopyActiveNote
+												? "cursor-not-allowed border-slate-200 text-slate-300"
+												: copyState === "copied"
+													? "border-emerald-200 text-emerald-700"
+													: copyState === "failed"
+														? "border-rose-200 text-rose-600"
+														: "border-slate-200 text-slate-600"
+										}`}
+									>
+										{copyButtonLabel}
 									</button>
 									<button
 										type="button"
@@ -4467,6 +4536,32 @@ function buildSummary(content: string): string {
 		return "空白笔记";
 	}
 	return normalized.length > 88 ? `${normalized.slice(0, 88)}...` : normalized;
+}
+
+async function writeTextToClipboard(value: string): Promise<void> {
+	if (typeof navigator !== "undefined" && typeof navigator.clipboard?.writeText === "function") {
+		await navigator.clipboard.writeText(value);
+		return;
+	}
+	if (typeof document === "undefined") {
+		throw new Error("Clipboard API is unavailable");
+	}
+	const textarea = document.createElement("textarea");
+	textarea.value = value;
+	textarea.setAttribute("readonly", "true");
+	textarea.style.position = "fixed";
+	textarea.style.opacity = "0";
+	textarea.style.pointerEvents = "none";
+	document.body.appendChild(textarea);
+	try {
+		textarea.focus();
+		textarea.select();
+		if (!document.execCommand("copy")) {
+			throw new Error("execCommand copy failed");
+		}
+	} finally {
+		document.body.removeChild(textarea);
+	}
 }
 
 function getFocusEditorMinHeight(value: string): string {
