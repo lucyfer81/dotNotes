@@ -60,7 +60,7 @@ type SavedNoteSnapshot = {
 };
 
 type WorkspaceMode = "capture" | "organize" | "focus";
-type EditorMode = "edit" | "preview" | "split";
+type EditorMode = "edit" | "preview";
 type CopyState = "idle" | "copying" | "copied" | "failed";
 type CommandAction = {
 	id: string;
@@ -80,6 +80,21 @@ type WikiLinkCandidate = {
 	label: string;
 	slug: string;
 };
+type MarkdownEditorComponentType = ComponentType<{
+	value: string;
+	onChange: (value: string) => void;
+	height?: string;
+	className?: string;
+}>;
+
+let markdownEditorImportPromise: Promise<MarkdownEditorComponentType> | null = null;
+
+function loadMarkdownEditorComponent(): Promise<MarkdownEditorComponentType> {
+	if (!markdownEditorImportPromise) {
+		markdownEditorImportPromise = import("../components/markdown-editor.client").then((module) => module.default);
+	}
+	return markdownEditorImportPromise;
+}
 
 const WORKSPACE_MODE_STORAGE_KEY = "dotnotes.workspace.mode";
 const EDITOR_MODE_STORAGE_KEY = "dotnotes.editor.mode";
@@ -132,7 +147,6 @@ export default function Home() {
 	const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("capture");
 	const [editorMode, setEditorMode] = useState<EditorMode>("edit");
 	const [isFocusFullscreen, setIsFocusFullscreen] = useState(false);
-	const [viewportWidth, setViewportWidth] = useState(0);
 	const [aiOpen, setAiOpen] = useState(false);
 	const [aiQuery, setAiQuery] = useState("");
 	const [activeAiTask, setActiveAiTask] = useState<AiEnhanceTaskApiKey | null>(null);
@@ -197,14 +211,7 @@ export default function Home() {
 	const [isUploadingAsset, setIsUploadingAsset] = useState(false);
 	const [deletingAssetId, setDeletingAssetId] = useState("");
 	const [assetErrorMessage, setAssetErrorMessage] = useState("");
-	const [isClientReady, setIsClientReady] = useState(false);
-	const [markdownEditorComponent, setMarkdownEditorComponent] =
-		useState<ComponentType<{
-			value: string;
-			onChange: (value: string) => void;
-			height?: string;
-			className?: string;
-		}> | null>(null);
+	const [markdownEditorComponent, setMarkdownEditorComponent] = useState<MarkdownEditorComponentType | null>(null);
 
 	const noteItemsRef = useRef<NoteItem[]>([]);
 	const selectedTagIdsRef = useRef<string[]>([]);
@@ -316,12 +323,8 @@ export default function Home() {
 		[noteItems],
 	);
 	const previewMarkdown = useMemo(() => toMarkdownWithWikiLinks(draft), [draft]);
-	const canUseSplit = viewportWidth >= 1280;
-	const useHorizontalSplit = viewportWidth >= 1600;
-	const effectiveEditorMode = editorMode === "split" && !canUseSplit ? "edit" : editorMode;
 	const isActiveNoteDeleted = Boolean(activeNote?.deletedAt);
-	const focusEditorMode = isActiveNoteDeleted ? "preview" : effectiveEditorMode;
-	const mobileEditorMode = focusEditorMode === "split" ? "edit" : focusEditorMode;
+	const focusEditorMode = isActiveNoteDeleted ? "preview" : editorMode;
 	const canResolveActiveNoteUrl = Boolean(activeNote && !activeNote.deletedAt && activeNoteSourceUrl);
 	const isSubmittingCapture = isCreatingNote || isResolvingCaptureUrl;
 
@@ -449,37 +452,47 @@ export default function Home() {
 	}, [activeNoteId, aiSuggestedTagKey]);
 
 	useEffect(() => {
-		if (import.meta.env.SSR || typeof window === "undefined") {
+		if (typeof window === "undefined" || markdownEditorComponent || !window.matchMedia("(min-width: 768px)").matches) {
 			return;
 		}
-		const updateViewportWidth = () => {
-			setViewportWidth(window.innerWidth);
-		};
-		updateViewportWidth();
-		window.addEventListener("resize", updateViewportWidth);
-		return () => {
-			window.removeEventListener("resize", updateViewportWidth);
-		};
-	}, []);
-
-	useEffect(() => {
-		setIsClientReady(true);
 		let cancelled = false;
-		if (typeof window !== "undefined") {
-			void import("../components/markdown-editor.client")
-				.then((module) => {
-					if (!cancelled) {
-						setMarkdownEditorComponent(() => module.default);
-					}
-				})
-				.catch((error) => {
-					console.error("Failed to load markdown editor component", error);
-				});
+		let idleCallbackId: number | null = null;
+		let timeoutId: ReturnType<typeof globalThis.setTimeout> | null = null;
+		const loadEditor = () => {
+			void loadMarkdownEditorComponent()
+			.then((module) => {
+				if (!cancelled) {
+					setMarkdownEditorComponent(() => module);
+				}
+			})
+			.catch((error) => {
+				console.error("Failed to load markdown editor component", error);
+			});
+		};
+		if (workspaceMode === "focus" && focusEditorMode === "edit") {
+			loadEditor();
+		} else if ("requestIdleCallback" in window) {
+			idleCallbackId = window.requestIdleCallback(
+				() => {
+					loadEditor();
+				},
+				{ timeout: 1500 },
+			);
+		} else {
+			timeoutId = globalThis.setTimeout(() => {
+				loadEditor();
+			}, 1200);
 		}
 		return () => {
 			cancelled = true;
+			if (idleCallbackId !== null) {
+				window.cancelIdleCallback(idleCallbackId);
+			}
+			if (timeoutId !== null) {
+				globalThis.clearTimeout(timeoutId);
+			}
 		};
-	}, []);
+	}, [focusEditorMode, markdownEditorComponent, workspaceMode]);
 
 	useEffect(() => {
 		if (typeof window === "undefined") {
@@ -494,8 +507,10 @@ export default function Home() {
 			setWorkspaceMode(storedWorkspaceMode);
 		}
 		const storedEditorMode = window.localStorage.getItem(EDITOR_MODE_STORAGE_KEY);
-		if (storedEditorMode === "edit" || storedEditorMode === "preview" || storedEditorMode === "split") {
+		if (storedEditorMode === "edit" || storedEditorMode === "preview") {
 			setEditorMode(storedEditorMode);
+		} else if (storedEditorMode === "split") {
+			setEditorMode("edit");
 		}
 		const storedRecentIds = window.localStorage.getItem(RECENT_NOTE_IDS_STORAGE_KEY);
 		if (!storedRecentIds) {
@@ -2393,12 +2408,6 @@ export default function Home() {
 												onClick={() => setEditorMode("edit")}
 											/>
 											<ModeButton label="预览" active={focusEditorMode === "preview"} onClick={() => setEditorMode("preview")} />
-											<ModeButton
-												label="分屏"
-												active={focusEditorMode === "split"}
-												disabled={!canUseSplit || isActiveNoteDeleted}
-												onClick={() => setEditorMode("split")}
-											/>
 										</div>
 										<button
 											type="button"
@@ -2548,7 +2557,7 @@ export default function Home() {
 							) : null}
 
 								{focusEditorMode === "edit" ? (
-									isClientReady && MarkdownEditorComponent ? (
+									MarkdownEditorComponent ? (
 										<div
 											style={{ minHeight: focusEditorMinHeight }}
 											className={`min-h-0 flex-1 overflow-hidden bg-white [&_.cm-content]:min-h-full [&_.cm-editor]:h-full [&_.cm-editor]:min-h-full [&_.cm-scroller]:min-h-full [&_.cm-scroller]:overflow-auto [&_.cm-theme]:h-full ${
@@ -2585,52 +2594,6 @@ export default function Home() {
 									<ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
 										{previewMarkdown || "*（空白笔记）*"}
 									</ReactMarkdown>
-								</div>
-							) : null}
-
-								{focusEditorMode === "split" ? (
-									<div
-										className={`grid min-h-0 flex-1 gap-3 ${
-											useHorizontalSplit
-												? "grid-cols-[minmax(0,3fr)_minmax(0,2fr)]"
-												: "grid-rows-[minmax(0,1fr)_minmax(0,1fr)]"
-										}`}
-									>
-										{isClientReady && MarkdownEditorComponent ? (
-											<div
-												style={{ minHeight: focusEditorMinHeight }}
-												className={`min-h-0 overflow-hidden bg-white [&_.cm-content]:min-h-full [&_.cm-editor]:h-full [&_.cm-editor]:min-h-full [&_.cm-scroller]:min-h-full [&_.cm-scroller]:overflow-auto [&_.cm-theme]:h-full ${
-													isFocusFullscreen ? "" : "rounded-xl border border-slate-200"
-												}`}
-											>
-												<MarkdownEditorComponent
-													value={draft}
-													height="100%"
-													onChange={(value) => handleDraftChange(value)}
-													className="h-full text-sm"
-												/>
-											</div>
-										) : (
-											<textarea
-												value={draft}
-												onChange={(event) => handleDraftChange(event.target.value)}
-												style={{ minHeight: focusEditorMinHeight }}
-												className={`min-h-0 h-full w-full resize-none bg-white text-sm ${
-													isFocusFullscreen ? "border-0 p-0" : "rounded-xl border border-slate-200 p-3"
-												}`}
-											/>
-										)}
-										<div
-											className={`min-h-0 overflow-y-auto ${
-												isFocusFullscreen
-													? "bg-white p-0"
-													: "rounded-xl border border-slate-200 bg-slate-50 p-4"
-											}`}
-										>
-											<ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-												{previewMarkdown || "*（空白笔记）*"}
-										</ReactMarkdown>
-									</div>
 								</div>
 							) : null}
 
@@ -2941,11 +2904,11 @@ export default function Home() {
 									<div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1">
 										<ModeButton
 											label="编辑"
-											active={mobileEditorMode === "edit"}
+											active={focusEditorMode === "edit"}
 											disabled={isActiveNoteDeleted}
 											onClick={() => setEditorMode("edit")}
 										/>
-										<ModeButton label="预览" active={mobileEditorMode === "preview"} onClick={() => setEditorMode("preview")} />
+										<ModeButton label="预览" active={focusEditorMode === "preview"} onClick={() => setEditorMode("preview")} />
 									</div>
 									<button
 										type="button"
@@ -3097,7 +3060,7 @@ export default function Home() {
 								</div>
 								</>
 								) : null}
-								{mobileEditorMode === "edit" ? (
+								{focusEditorMode === "edit" ? (
 									<textarea
 										value={draft}
 										onChange={(e) => handleDraftChange(e.target.value)}
