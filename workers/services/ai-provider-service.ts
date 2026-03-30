@@ -146,6 +146,7 @@ export async function callSiliconflowJson(
 			body: JSON.stringify({
 				model: runtime.model,
 				temperature: 0.2,
+				enable_thinking: false,
 				response_format: { type: "json_object" },
 				messages: [
 					{

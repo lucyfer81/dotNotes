@@ -23,7 +23,7 @@
 		"TAG_NAME_MAX_LENGTH": "48",
 		"TAG_PER_NOTE_LIMIT": "12",
 		"AI_BASE_URL": "https://api.siliconflow.cn/v1",
-		"AI_CHAT_MODEL": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+		"AI_CHAT_MODEL": "Qwen/Qwen3.5-27B",
 		"AI_EMBEDDING_MODEL": "Qwen/Qwen3-Embedding-0.6B",
 		"AI_EMBED_BATCH_SIZE": "8",
 		"AI_TIMEOUT_MS": "30000",
